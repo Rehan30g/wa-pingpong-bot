@@ -1,0 +1,17 @@
+{
+  "name": "wa-pingpong-bot",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp game ping-pong (Baileys) dengan verifikasi owner via kode terminal",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/bot.test.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.24",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "sharp": "^0.35.4"
+  }
+}
