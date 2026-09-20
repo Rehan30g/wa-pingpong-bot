@@ -5,10 +5,16 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/bot.test.js"
+    "test": "node --test test/bot.test.js test/ai.test.js",
+    "simulate:ai": "node scripts/simulate-ai.js",
+    "simulate:burst": "node scripts/simulate-burst.js",
+    "simulate:memory": "node scripts/simulate-memory.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.24",
+    "axios": "^1.20.0",
+    "dotenv": "^18.0.1",
+    "https-proxy-agent": "^9.1.0",
     "pino": "^9.4.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",

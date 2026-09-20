@@ -1,3 +1,5 @@
+require("dotenv").config({ quiet: true });
+
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -15,6 +17,7 @@ const pino = require("pino");
 const readline = require("readline");
 const childProcess = require("child_process");
 const fs = require("fs");
+const groupAgent = require("./ai/group-agent");
 
 const DATA_FILE = process.env.BOT_DATA_FILE || "./data.json";
 let data = { owner: null, allowedGroups: [] };
@@ -79,6 +82,24 @@ function initReadline() {
 }
 
 let sock = null;
+let presenceKeepAlive = null;
+
+// Jaga status bot tetap "online": presence available dikirim ulang berkala.
+function startPresenceKeepAlive() {
+  clearInterval(presenceKeepAlive);
+  presenceKeepAlive = setInterval(async () => {
+    try {
+      await sock?.sendPresenceUpdate("available");
+    } catch (error) {
+      console.warn("[i] Gagal kirim presence available:", error.message);
+    }
+  }, 4 * 60_000);
+}
+
+function stopPresenceKeepAlive() {
+  clearInterval(presenceKeepAlive);
+  presenceKeepAlive = null;
+}
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
@@ -90,6 +111,9 @@ async function startBot() {
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
     browser: ["PingPong Bot", "Chrome", "1.0.0"],
+    // Bot terlihat online supaya receipt "delivered" aktif:
+    // pesan pengguna mendapat centang abu-abu begitu diterima bot.
+    markOnlineOnConnect: true,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -103,8 +127,10 @@ async function startBot() {
     if (connection === "open") {
       console.log("[+] Bot terhubung!");
       console.log("[i] Kirim /verify dari WhatsApp untuk menjadi owner.");
+      startPresenceKeepAlive();
     }
     if (connection === "close") {
+      stopPresenceKeepAlive();
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
       console.log(`[!] Koneksi terputus (code=${code}, reason=${DisconnectReason[code] ?? lastDisconnect?.error?.message})`);
       if (code === DisconnectReason.loggedOut) {
@@ -129,36 +155,145 @@ async function startBot() {
   });
 }
 
+// Buka pembungkus viewOnceMessage/viewOnceMessageV2 (foto/video "sekali lihat").
+function unwrapMediaWrappers(message) {
+  let current = message;
+  while (current) {
+    const wrapper = current.viewOnceMessage || current.viewOnceMessageV2;
+    if (!wrapper?.message || wrapper.message === current) break;
+    current = wrapper.message;
+  }
+  return current || message;
+}
+
 function getText(m) {
+  const content = unwrapMediaWrappers(m.message) || {};
   return (
-    m.message?.conversation ||
-    m.message?.extendedTextMessage?.text ||
-    m.message?.imageMessage?.caption ||
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
     ""
   ).trim();
 }
 
+function normalizeJid(jid = "") {
+  return String(jid).split(":")[0].split("@")[0];
+}
+
+function getSenderNumber(m, isGroup, chatJid) {
+  const candidates = isGroup
+    ? [m.key?.participantPn, m.key?.senderPn, m.key?.participant, chatJid]
+    : [m.key?.senderPn, chatJid];
+  const phoneJid = candidates.find((value) => /@(s\.whatsapp\.net|c\.us)$/i.test(String(value || "")));
+  return normalizeJid(phoneJid || candidates.find(Boolean) || "");
+}
+
+function phoneIdentity(number) {
+  const digits = String(number || "").replace(/\D/g, "");
+  if (digits.startsWith("62")) return `+${digits} (0${digits.slice(2)})`;
+  return digits ? `+${digits}` : "nomor-tidak-diketahui";
+}
+
+async function sendTextChunks(jid, text, maxLength = 3_500) {
+  const value = String(text || "");
+  for (let offset = 0; offset < value.length; offset += maxLength) {
+    await sock.sendMessage(jid, { text: value.slice(offset, offset + maxLength) });
+  }
+}
+
+function getContextInfo(m) {
+  return (
+    m.message?.extendedTextMessage?.contextInfo ||
+    m.message?.imageMessage?.contextInfo ||
+    m.message?.videoMessage?.contextInfo ||
+    {}
+  );
+}
+
+function getQuotedText(m) {
+  const quoted = unwrapMediaWrappers(getContextInfo(m).quotedMessage);
+  if (!quoted) return "";
+  return (
+    quoted.conversation ||
+    quoted.extendedTextMessage?.text ||
+    quoted.imageMessage?.caption ||
+    quoted.videoMessage?.caption ||
+    ""
+  ).trim();
+}
+
+function botIdentities() {
+  return [...new Set([normalizeJid(sock?.user?.id), normalizeJid(sock?.user?.lid)].filter(Boolean))];
+}
+
+function isReplyToBot(contextInfo) {
+  if (!contextInfo?.quotedMessage) return false;
+  const quotedParticipant = normalizeJid(contextInfo.participant);
+  return Boolean(quotedParticipant && botIdentities().includes(quotedParticipant));
+}
+
 // ---- helper download media (untuk stiker dll) ----
 async function downloadMedia(m) {
-  const msg = m.message;
+  const msg = unwrapMediaWrappers(m.message) || {};
   const type = getContentType(msg);
-  if (!msg[type] || !msg[type].url) return null;
+  if (!msg[type] || !(msg[type].url || msg[type].directPath)) return null;
   const stream = await downloadContentFromMessage(msg[type], type.replace("Message", "").replace("DocumentWithCaption", "document"));
   let buf = Buffer.alloc(0);
   for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
   return buf;
 }
 
+// Unduh gambar/video (langsung atau yang dikutip) sebagai data URL untuk GLM multimodal.
+function maxMediaBytes() {
+  return Math.max(1, Number(process.env.AI_MAX_MEDIA_MB || 20)) * 1_048_576;
+}
+
+async function getAiMedia(m) {
+  try {
+    const direct = unwrapMediaWrappers(m.message) || {};
+    const quoted = unwrapMediaWrappers(getContextInfo(m)?.quotedMessage) || {};
+    const candidates = [
+      direct.imageMessage && { type: "image", msg: direct.imageMessage, source: m },
+      direct.videoMessage && { type: "video", msg: direct.videoMessage, source: m },
+      quoted?.imageMessage && { type: "image", msg: quoted.imageMessage, source: { message: { imageMessage: quoted.imageMessage } } },
+      quoted?.videoMessage && { type: "video", msg: quoted.videoMessage, source: { message: { videoMessage: quoted.videoMessage } } },
+    ].filter(Boolean);
+    // WhatsApp modern kadang hanya mengirim directPath tanpa url; keduanya bisa diunduh.
+    const media = candidates.find((candidate) => candidate.msg?.url || candidate.msg?.directPath);
+    if (!media) return null;
+    const buffer = await downloadMedia(media.source);
+    if (!buffer?.length) return null;
+    if (buffer.length > maxMediaBytes()) {
+      console.warn(`[AI] Media ${(buffer.length / 1_048_576).toFixed(1)}MB melebihi batas, diabaikan`);
+      return null;
+    }
+    const mime = media.type === "video"
+      ? (String(media.msg.mimetype || "").startsWith("video/") ? media.msg.mimetype : "video/mp4")
+      : (media.msg.mimetype || "image/jpeg");
+    return { type: media.type, dataUrl: `data:${mime};base64,${buffer.toString("base64")}` };
+  } catch (error) {
+    console.warn("[AI] Gagal mengunduh media:", error.message);
+    return null;
+  }
+}
+
 async function handleMessage(m) {
   const jid = m.key.remoteJid;
   const isGroup = jid.endsWith("@g.us");
   const text = getText(m);
-  if (!text) return;
+  const isAllowedGroup = isGroup && data.allowedGroups.includes(jid);
+  let earlyMedia = null;
+  if (!text) {
+    // Media tanpa caption tetap diproses AI (GLM multimodal); media lain dibuang.
+    if (!isAllowedGroup) return;
+    earlyMedia = await getAiMedia(m);
+    if (!earlyMedia) return;
+  }
 
   // identitas pengirim
-  let senderJid = isGroup ? m.key.participant : jid;
-  senderJid = senderJid.split(":")[0].split("@")[0]; // nomor saja
-  const senderTag = `+${senderJid}`;
+  const senderJid = getSenderNumber(m, isGroup, jid);
+  const senderTag = phoneIdentity(senderJid);
 
   const cmd = text.toLowerCase();
   const fromOwner = data.owner && senderJid === data.owner;
@@ -226,6 +361,24 @@ async function handleMessage(m) {
 
   // ===== Semua perintah di bawah hanya aktif di grup yang diizinkan =====
   if (!isGroup || !data.allowedGroups.includes(jid)) return;
+
+  // ===== MANAJEMEN KONTEKS AI =====
+  if (cmd === "/clear") {
+    groupAgent.clearConversation(jid);
+    await sock.sendMessage(jid, { text: "Percakapan aktif sudah dibersihkan. Memori compact tetap disimpan." });
+    return;
+  }
+
+  if (cmd === "/reset") {
+    groupAgent.resetGroupContext(jid);
+    await sock.sendMessage(jid, { text: "Konteks percakapan dan seluruh memori Grad untuk grup ini sudah direset." });
+    return;
+  }
+
+  if (cmd === "/memory") {
+    await sendTextChunks(jid, groupAgent.getMemoryDisplay(jid));
+    return;
+  }
 
   // ===== COMMAND MODULAR (/menu, /react, /qr, /s, dst.) =====
   const ctx = { sock, m, jid, text: cmd, senderTag, fromOwner, data, downloadMedia };
@@ -301,6 +454,30 @@ async function handleMessage(m) {
     await sock.sendMessage(jid, { text: `${tricks[Math.floor(Math.random() * tricks.length)]} *POK!* rally ke-${g.rally} oleh ${name}` });
     return;
   }
+
+  // ----- AI GROUP AGENT -----
+  // Jev memilih diam/react/jawab; GLM hanya dipanggil untuk menulis jawaban.
+  const aiMedia = earlyMedia || (await getAiMedia(m));
+  if (!text && !aiMedia) return;
+  const contextInfo = getContextInfo(m);
+  const mentioned = (contextInfo.mentionedJid || []).map(normalizeJid);
+  const metadataMention = Boolean(botIdentities().some((id) => mentioned.includes(id)));
+  const nameMention = groupAgent.textMentionsBotName(text);
+  const explicitMention = metadataMention || nameMention;
+  const replyToBot = isReplyToBot(contextInfo);
+
+  await groupAgent.processGroupMessage({
+    sock,
+    message: m,
+    groupId: jid,
+    senderId: senderJid,
+    senderName: m.pushName || senderTag,
+    text: text || (aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+    explicitMention,
+    replyToBot,
+    media: aiMedia,
+    quotedText: getQuotedText(m),
+  });
 }
 
 module.exports = {
@@ -309,9 +486,14 @@ module.exports = {
   startBot,
   initReadline,
   getPendingVerify: () => pendingVerify,
+  getSenderNumber,
+  phoneIdentity,
   setPendingVerify: (v) => { pendingVerify = v; },
   getData: () => data,
   setData: (d) => { data = d; saveData(); },
+  isReplyToBot,
+  botIdentities,
+  unwrapMediaWrappers,
   resetData: () => { data = { owner: null, allowedGroups: [] }; saveData(); },
   setSock: (s) => { sock = s; },
   games,
@@ -322,6 +504,9 @@ module.exports = {
 
 if (require.main === module) {
   console.log("[*] Memulai WA Ping-Pong Bot (Baileys)...");
+  console.log(groupAgent.isConfigured()
+    ? `[AI] Aktif: ${groupAgent.config().jevModel} -> ${groupAgent.config().chatModel}`
+    : "[AI] Nonaktif: ganti OPENROUTER_API_KEY di file .env");
   initReadline();
   startBot();
 }

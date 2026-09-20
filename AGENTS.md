@@ -83,6 +83,28 @@ Kalau WARP disconnect: `warp-cli --accept-tos connect`
 - OpenRouter key tersimpan di `~/.local/share/opencode/auth.json` (chmod 600)
 - Jangan pernah commit/print key ke log atau chat
 
+## Arsitektur AI Grup
+
+- `ai/group-agent.js` mengelola buffer percakapan, keputusan Jev, balasan GLM, reaction, read receipt, presence mengetik, identitas peserta, dan auto-compact.
+- Jev (`typesafe/jev-1.13`) hanya memilih tindakan. GLM (`z-ai/glm-5.3-flash`) menulis balasan dan compact memory dengan reasoning `low`.
+- Gambar dan video (langsung atau yang dikutip) diunduh sebagai data URL dan dikirim ke GLM sebagai konten multimodal (`image_url`/`video_url`); media tanpa caption diproses dengan teks `[mengirim gambar]`/`[mengirim video]`. Jev tetap berbasis teks dan hanya menerima sinyal `has_image`/`has_video`. Batas ukuran media diatur `AI_MAX_MEDIA_MB` (default 20 MB).
+- Pesan cepat memakai debounce per grup. Pesan dalam jendela debounce yang sama digabung (`superseded`), tetapi evaluasi yang sedang berjalan TIDAK dibatalkan pesan baru — pesan baru mengantri dan diproses setelahnya, dan evaluasi antrean yang basi (ada pesan lebih baru) dilewati.
+- Read receipt (centang biru) dikirim setelah Jev menghasilkan keputusan untuk pesan itu, termasuk saat keputusannya ignore/ditolak. Pesan yang belum pernah dievaluasi (masih di debounce atau basi/superseded) tetap belum terbaca (centang 1).
+- Bot memakai `markOnlineOnConnect` plus heartbeat presence `available` berkala (4 menit) agar status bot selalu tampil online dan receipt delivered aktif: pesan pengguna mendapat centang abu-abu begitu diterima perangkat bot, terlepas dari keputusan Jev.
+- Lanjutan percakapan langsung dengan bot (entri riwayat sebelum pesan terbaru berasal dari bot) dianggap diarahkan ke bot untuk threshold reply dan reaction, sehingga balasan tidak hilang hanya karena confidence Jev rendah. Konfirmasi singkat ("iyap", "sip") dalam dialog bot diberi reaction ack, bukan diabaikan; reaction heart tetap khusus apresiasi yang ditujukan ke bot.
+- Identitas peserta harus memakai `participantPn`/`senderPn` sebelum `participant`, karena `participant` dapat berupa JID `@lid`. Nomor sama berarti orang sama; nama sama dengan nomor berbeda berarti orang berbeda.
+- Riwayat aktif dan memori compact berbeda. `/clear` hanya membersihkan riwayat aktif; `/reset` membersihkan keduanya; `/memory` menampilkan konteks GLM, konteks Jev, riwayat aktif, dan timestamp WIT.
+- Auto-compact tidak boleh diumumkan ke grup dan tidak boleh menghidupkan kembali konteks setelah `/clear` atau `/reset`.
+- `.env` adalah rahasia dan tidak boleh di-commit. `.env.example` harus selalu memakai placeholder.
+
+## Checklist Perubahan AI
+
+1. Jalankan `node --check index.js` dan `node --check ai/group-agent.js`.
+2. Jalankan `npm test`.
+3. Untuk perubahan alur pesan, wajib ada tes yang memanggil `processGroupMessage` langsung dengan mock socket; tes helper saja tidak cukup.
+4. Pastikan parameter yang dipakai saat menyimpan riwayat (`senderId`, `senderName`, `text`, mention/reply) diambil dari object argumen atau dideklarasikan lokal—jangan mengandalkan variabel yang tidak berada dalam scope.
+5. Untuk validasi API nyata gunakan `npm run simulate:ai`, `npm run simulate:burst`, atau `npm run simulate:memory`; jangan mencetak API key.
+
 ## Env
 
 `~/.bashrc` berisi: PATH opencode (`~/.opencode/bin`), `HTTP_PROXY`/`HTTPS_PROXY` → 8118, alias `oc` (chat lanjut sesi), `ocn` (chat baru), `oct` (TUI).

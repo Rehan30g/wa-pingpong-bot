@@ -1,4 +1,5 @@
 process.env.BOT_DATA_FILE = "./test/data.json";
+process.env.AI_MEMORY_FILE = "./test/ai-memory.json";
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("fs");
@@ -10,12 +11,16 @@ const PLAYER = "628222222222";
 
 function makeSock() {
   const sent = [];
+  const reads = [];
   return {
     sent,
+    reads,
     sendMessage: async (jid, content) => {
       sent.push({ jid, text: content.text });
       return { key: { id: "x" } };
     },
+    readMessages: async (keys) => reads.push(...keys),
+    sendPresenceUpdate: async () => {},
     groupMetadata: async (jid) => ({ subject: "Grup Test" }),
   };
 }
@@ -282,4 +287,159 @@ test("pesan tanpa teks diabaikan", async () => {
   bot.setSock(sock);
   await bot.handleMessage({ key: { remoteJid: GROUP, fromMe: false, participant: `${PLAYER}@s.whatsapp.net` }, message: { imageMessage: {} } });
   assert.equal(sock.sent.length, 0);
+  assert.equal(sock.reads.length, 0, "read receipt hanya saat Jev merespons");
+});
+
+test("nomor PN diprioritaskan daripada participant LID", () => {
+  const m = {
+    key: {
+      participant: "123456789012345@lid",
+      participantPn: "6285212345678@s.whatsapp.net",
+    },
+  };
+  assert.equal(bot.getSenderNumber(m, true, GROUP), "6285212345678");
+  assert.equal(bot.phoneIdentity("6285212345678"), "+6285212345678 (085212345678)");
+});
+
+function setBotUser(user) {
+  const sock = makeSock();
+  sock.user = user;
+  bot.setSock(sock);
+  return sock;
+}
+
+test("reply ke pesan bot terdeteksi walau participant kutipan memakai LID", () => {
+  setBotUser({ id: `${OWNER}@s.whatsapp.net`, lid: "111222333444555@lid" });
+
+  const contextInfo = {
+    quotedMessage: { conversation: "Kamu makan apa hari ini?" },
+    participant: "111222333444555@lid",
+  };
+  assert.equal(bot.isReplyToBot(contextInfo), true, "LID bot harus cocok");
+
+  const contextInfoPn = {
+    quotedMessage: { conversation: "Kamu makan apa hari ini?" },
+    participant: `${OWNER}@s.whatsapp.net:12`,
+  };
+  assert.equal(bot.isReplyToBot(contextInfoPn), true, "PN bot harus cocok");
+
+  assert.equal(bot.isReplyToBot({ quotedMessage: { conversation: "x" }, participant: "999888777@lid" }), false);
+  assert.equal(bot.isReplyToBot({ participant: "111222333444555@lid" }), false, "tanpa quotedMessage bukan reply ke bot");
+  assert.equal(bot.isReplyToBot({ quotedMessage: { conversation: "x" } }), false);
+});
+
+test("mention @bot terdeteksi dari LID bot", async () => {
+  const agent = require("../ai/group-agent");
+  const sock = setBotUser({ id: `${OWNER}@s.whatsapp.net`, lid: "111222333444555@lid" });
+  reset(OWNER, [GROUP]);
+  const oldDebounce = process.env.AI_DEBOUNCE_MS;
+  process.env.AI_DEBOUNCE_MS = "60000";
+
+  const m = msg({ text: "halo" });
+  m.message = {
+    extendedTextMessage: {
+      text: "halo",
+      contextInfo: { mentionedJid: ["111222333444555@lid"] },
+    },
+  };
+  const pending = bot.handleMessage(m);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const entry = agent.getHistory(GROUP).at(-1);
+  assert.equal(entry.mentioned_bot, true, "LID bot di mentionedJid harus dihitung sebagai mention");
+  assert.equal(sock.sent.length, 0, "belum ada balasan sebelum debounce selesai");
+
+  agent.clearConversation(GROUP); // batalkan pending, jangan panggil API nyata
+  await pending;
+  assert.equal(sock.sent.length, 0, "tidak boleh ada balasan dari sesi test");
+
+  if (oldDebounce === undefined) delete process.env.AI_DEBOUNCE_MS;
+  else process.env.AI_DEBOUNCE_MS = oldDebounce;
+});
+
+test("gambar dengan caption diproses AI memakai teks caption", async () => {
+  const agent = require("../ai/group-agent");
+  setBotUser({ id: `${OWNER}@s.whatsapp.net` });
+  reset(OWNER, [GROUP]);
+  const oldDebounce = process.env.AI_DEBOUNCE_MS;
+  process.env.AI_DEBOUNCE_MS = "60000";
+
+  const m = {
+    key: { remoteJid: GROUP, fromMe: false, participant: `${PLAYER}@s.whatsapp.net` },
+    pushName: "Tester",
+    message: { imageMessage: { caption: "lihat nih" } },
+  };
+  const pending = bot.handleMessage(m);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const entry = agent.getHistory(GROUP).at(-1);
+  assert.equal(entry.text, "lihat nih", "caption harus dipakai sebagai teks pesan AI");
+  assert.equal(entry.has_image, false, "tanpa url media, gambar tidak ikut (null)");
+
+  agent.clearConversation(GROUP); // batalkan pending, jangan panggil API nyata
+  await pending;
+  if (oldDebounce === undefined) delete process.env.AI_DEBOUNCE_MS;
+  else process.env.AI_DEBOUNCE_MS = oldDebounce;
+});
+
+test("foto sekali lihat (viewOnce) dengan caption tetap diproses AI", async () => {
+  const agent = require("../ai/group-agent");
+  setBotUser({ id: `${OWNER}@s.whatsapp.net` });
+  reset(OWNER, [GROUP]);
+  const oldDebounce = process.env.AI_DEBOUNCE_MS;
+  process.env.AI_DEBOUNCE_MS = "60000";
+
+  const m = {
+    key: { remoteJid: GROUP, fromMe: false, participant: `${PLAYER}@s.whatsapp.net` },
+    pushName: "Tester",
+    message: { viewOnceMessageV2: { message: { imageMessage: { caption: "ini rahasia" } } } },
+  };
+  const pending = bot.handleMessage(m);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const entry = agent.getHistory(GROUP).at(-1);
+  assert.equal(entry.text, "ini rahasia", "caption di dalam viewOnce harus terbaca");
+
+  agent.clearConversation(GROUP);
+  await pending;
+  if (oldDebounce === undefined) delete process.env.AI_DEBOUNCE_MS;
+  else process.env.AI_DEBOUNCE_MS = oldDebounce;
+});
+
+test("identitas bot menangani user.id yang hilang atau LID yang tidak ada", () => {
+  setBotUser({ id: `${OWNER}@s.whatsapp.net` });
+  assert.deepEqual(bot.botIdentities(), [OWNER]);
+  setBotUser({ lid: "111222333444555@lid" });
+  assert.deepEqual(bot.botIdentities(), ["111222333444555"]);
+  setBotUser({});
+  assert.deepEqual(bot.botIdentities(), []);
+});
+
+test("pembungkus viewOnce dibuka untuk deteksi media", () => {
+  const wrapped = {
+    viewOnceMessageV2: { message: { imageMessage: { caption: "cek ini", directPath: "/v2/media" } } },
+  };
+  const inner = bot.unwrapMediaWrappers(wrapped);
+  assert.equal(inner.imageMessage.caption, "cek ini");
+  assert.equal(bot.unwrapMediaWrappers({ conversation: "biasa" }).conversation, "biasa");
+  assert.equal(bot.unwrapMediaWrappers(undefined), undefined);
+  // tidak boleh loop tanpa henti pada wrapper rusak
+  const broken = {};
+  broken.viewOnceMessage = { message: broken };
+  assert.equal(bot.unwrapMediaWrappers(broken), broken);
+});
+
+test("/clear, /memory, dan /reset mengelola konteks grup", async () => {
+  reset(OWNER, [GROUP]);
+  const sock = makeSock();
+  bot.setSock(sock);
+
+  await bot.handleMessage(msg({ text: "/clear" }));
+  assert.match(last(sock).text, /Percakapan aktif/);
+
+  await bot.handleMessage(msg({ text: "/memory" }));
+  assert.match(last(sock).text, /MEMORI GRAD/);
+
+  await bot.handleMessage(msg({ text: "/reset" }));
+  assert.match(last(sock).text, /seluruh memori/);
 });

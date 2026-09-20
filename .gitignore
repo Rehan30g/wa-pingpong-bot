@@ -1,3 +1,10 @@
 node_modules/
+.env
 auth/
 data.json
+ai-memory.json
+ai-memory.json.tmp
+test/data.json
+test/ai-memory.json
+test/ai-memory.json.tmp
+npm-debug.log*
