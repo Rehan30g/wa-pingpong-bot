@@ -18,12 +18,26 @@ const readline = require("readline");
 const childProcess = require("child_process");
 const fs = require("fs");
 const groupAgent = require("./ai/group-agent");
+const directAgent = require("./ai/direct-agent");
+const memoryStore = require("./ai/memory-store");
+const scheduler = require("./ai/scheduler");
 
 const DATA_FILE = process.env.BOT_DATA_FILE || "./data.json";
-let data = { owner: null, allowedGroups: [] };
+let data = { owner: null, allowedGroups: [], vetoAccess: {} };
 if (fs.existsSync(DATA_FILE)) {
   try { data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); } catch {}
 }
+function normalizeDataShape(value = {}) {
+  return {
+    ...value,
+    owner: value.owner || null,
+    allowedGroups: Array.isArray(value.allowedGroups) ? value.allowedGroups : [],
+    vetoAccess: value.vetoAccess && typeof value.vetoAccess === "object" && !Array.isArray(value.vetoAccess)
+      ? value.vetoAccess
+      : {},
+  };
+}
+data = normalizeDataShape(data);
 const saveData = () => fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 
 // ---- state game per grup ----
@@ -83,6 +97,8 @@ function initReadline() {
 
 let sock = null;
 let presenceKeepAlive = null;
+const groupMetadataCache = new Map();
+const GROUP_METADATA_TTL_MS = 60_000;
 
 // Jaga status bot tetap "online": presence available dikirim ulang berkala.
 function startPresenceKeepAlive() {
@@ -117,6 +133,10 @@ async function startBot() {
   });
 
   sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("groups.update", (updates) => {
+    for (const update of updates || []) groupMetadataCache.delete(update.id);
+  });
+  sock.ev.on("group-participants.update", ({ id }) => groupMetadataCache.delete(id));
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -128,9 +148,11 @@ async function startBot() {
       console.log("[+] Bot terhubung!");
       console.log("[i] Kirim /verify dari WhatsApp untuk menjadi owner.");
       startPresenceKeepAlive();
+      scheduler.start({ sock });
     }
     if (connection === "close") {
       stopPresenceKeepAlive();
+      scheduler.stop();
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
       console.log(`[!] Koneksi terputus (code=${code}, reason=${DisconnectReason[code] ?? lastDisconnect?.error?.message})`);
       if (code === DisconnectReason.loggedOut) {
@@ -177,14 +199,44 @@ function getText(m) {
   ).trim();
 }
 
+function isPhoneJid(value) {
+  return /@(s\.whatsapp\.net|c\.us)$/i.test(String(value || ""));
+}
+
 function normalizeJid(jid = "") {
   return String(jid).split(":")[0].split("@")[0];
 }
 
+function normalizePhoneNumber(value = "") {
+  const digits = normalizeJid(value).replace(/\D/g, "");
+  if (digits.startsWith("0")) return `62${digits.slice(1)}`;
+  return digits;
+}
+
+function identitiesMatch(left, right) {
+  const a = normalizeJid(left);
+  const b = normalizeJid(right);
+  if (!a || !b) return false;
+  return a === b || normalizePhoneNumber(a) === normalizePhoneNumber(b);
+}
+
+function messageSenderIdentities(m, isGroup, chatJid) {
+  const candidates = isGroup
+    ? [
+      m.key?.participantPn,
+      m.key?.senderPn,
+      m.key?.participantAlt,
+      m.key?.senderAlt,
+      m.key?.participant,
+    ]
+    : [m.key?.senderPn, m.key?.senderAlt, m.key?.remoteJidAlt, chatJid];
+  return [...new Set(candidates.map(normalizeJid).filter(Boolean))];
+}
+
 function getSenderNumber(m, isGroup, chatJid) {
   const candidates = isGroup
-    ? [m.key?.participantPn, m.key?.senderPn, m.key?.participant, chatJid]
-    : [m.key?.senderPn, chatJid];
+    ? [m.key?.participantPn, m.key?.senderPn, m.key?.participantAlt, m.key?.senderAlt, m.key?.participant, chatJid]
+    : [m.key?.senderPn, m.key?.senderAlt, m.key?.remoteJidAlt, chatJid];
   const phoneJid = candidates.find((value) => /@(s\.whatsapp\.net|c\.us)$/i.test(String(value || "")));
   return normalizeJid(phoneJid || candidates.find(Boolean) || "");
 }
@@ -223,6 +275,35 @@ function getQuotedText(m) {
   ).trim();
 }
 
+// WhatsApp menulis tag di teks sebagai nomor (mis. "@628xxx" atau "@<lid>").
+// Ubah menjadi nama dengan "@" agar AI mengenali tag bot sebagai nama bot.
+// Nomor di teks bisa berupa PN sedangkan mentionedJid berupa LID, jadi semua
+// alias peserta dicoba.
+function mentionTokens(jid, metadata) {
+  const normalized = normalizeJid(jid);
+  if (!normalized) return null;
+  if (botIdentities().includes(normalized)) {
+    return { aliases: botIdentities(), display: groupAgent.config().botName };
+  }
+  const participant = metadata ? participantForIdentity(metadata, jid) : null;
+  const aliases = participant ? participantIdentities(participant) : [normalized];
+  const display = participant?.name || participant?.notify || aliases[0] || normalized;
+  return { aliases: [...new Set([normalized, ...aliases].filter(Boolean))], display };
+}
+
+function decorateMentions(text, contextInfo, metadata) {
+  let value = String(text || "");
+  for (const jid of contextInfo?.mentionedJid || []) {
+    const tokens = mentionTokens(jid, metadata);
+    if (!tokens?.display) continue;
+    for (const alias of tokens.aliases) {
+      const escaped = String(alias).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      value = value.replace(new RegExp(`@${escaped}(?::\\d+)?(?![\\d])`, "g"), `@${tokens.display}`);
+    }
+  }
+  return value;
+}
+
 function botIdentities() {
   return [...new Set([normalizeJid(sock?.user?.id), normalizeJid(sock?.user?.lid)].filter(Boolean))];
 }
@@ -234,19 +315,123 @@ function isReplyToBot(contextInfo) {
 }
 
 // ---- helper download media (untuk stiker dll) ----
-async function downloadMedia(m) {
+function mediaFileLength(message) {
+  const value = message?.fileLength;
+  if (value == null) return null;
+  try {
+    const bytes = typeof value?.toNumber === "function" ? value.toNumber() : Number(value);
+    return Number.isFinite(bytes) && bytes >= 0 ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+function participantIdentities(participant = {}) {
+  return [...new Set([
+    participant.id,
+    participant.lid,
+    participant.jid,
+    participant.phoneNumber,
+    participant.pn,
+  ].map(normalizeJid).filter(Boolean))];
+}
+
+async function getGroupMetadataSafe(groupId) {
+  const cached = groupMetadataCache.get(groupId);
+  if (cached && Date.now() - cached.at < GROUP_METADATA_TTL_MS) return cached.value;
+  try {
+    const value = await sock.groupMetadata(groupId);
+    groupMetadataCache.set(groupId, { at: Date.now(), value });
+    return value;
+  } catch (error) {
+    console.warn("[i] Gagal membaca admin grup:", error.message);
+    return null;
+  }
+}
+
+function participantForIdentity(metadata, identity) {
+  const normalized = normalizeJid(identity);
+  return metadata?.participants?.find((participant) => participantIdentities(participant).includes(normalized));
+}
+
+function participantForIdentities(metadata, identities) {
+  return metadata?.participants?.find((participant) => {
+    const aliases = participantIdentities(participant);
+    return identities.some((identity) => aliases.some((alias) => identitiesMatch(alias, identity)));
+  });
+}
+
+function canonicalParticipantIdentity(participant, fallback = "") {
+  if (!participant) return normalizeJid(fallback);
+  const phone = [participant.jid, participant.phoneNumber, participant.pn, participant.id]
+    .find((value) => /@(s\.whatsapp\.net|c\.us)$/i.test(String(value || "")) || /^\+?\d{8,15}$/.test(String(value || "")));
+  return normalizeJid(phone || fallback || participant.id || participant.lid);
+}
+
+function isAdminParticipant(metadata, senderId) {
+  const participant = participantForIdentity(metadata, senderId);
+  return participant?.admin === "admin" || participant?.admin === "superadmin";
+}
+
+function groupVetoUsers(groupId) {
+  const users = data.vetoAccess?.[groupId];
+  return Array.isArray(users) ? users : [];
+}
+
+function resolveVetoTarget(m, commandText, metadata) {
+  const context = getContextInfo(m);
+  const argument = commandText.split(/\s+/).slice(1).join("").replace(/^@/, "");
+  const numericArgument = /^\+?\d{8,15}$/.test(argument) ? argument : "";
+  const candidates = [
+    context.participantPn,
+    context.senderPn,
+    context.participant,
+    ...(context.mentionedJid || []),
+    numericArgument,
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    const participant = participantForIdentity(metadata, candidate);
+    const resolved = canonicalParticipantIdentity(participant, candidate);
+    if (resolved) return resolved;
+  }
+  return "";
+}
+
+async function collectMediaStream(stream, { maxBytes = Infinity } = {}) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    const buffer = Buffer.from(chunk);
+    total += buffer.length;
+    if (total > maxBytes) {
+      const error = new Error(`Media melebihi batas ${(maxBytes / 1_048_576).toFixed(1)}MB`);
+      error.code = "AI_MEDIA_TOO_LARGE";
+      throw error;
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function downloadMedia(m, { maxBytes = Infinity } = {}) {
   const msg = unwrapMediaWrappers(m.message) || {};
   const type = getContentType(msg);
   if (!msg[type] || !(msg[type].url || msg[type].directPath)) return null;
   const stream = await downloadContentFromMessage(msg[type], type.replace("Message", "").replace("DocumentWithCaption", "document"));
-  let buf = Buffer.alloc(0);
-  for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
-  return buf;
+  return collectMediaStream(stream, { maxBytes });
 }
 
 // Unduh gambar/video (langsung atau yang dikutip) sebagai data URL untuk GLM multimodal.
 function maxMediaBytes() {
   return Math.max(1, Number(process.env.AI_MAX_MEDIA_MB || 20)) * 1_048_576;
+}
+
+function classifyAiMedia({ type, kind, format, msg } = {}) {
+  const isGif = type === "video" && Boolean(msg?.gifPlayback);
+  return {
+    kind: kind || (isGif ? "sticker" : "attachment"),
+    format: format || (isGif ? "gif" : type),
+  };
 }
 
 async function getAiMedia(m) {
@@ -256,22 +441,27 @@ async function getAiMedia(m) {
     const candidates = [
       direct.imageMessage && { type: "image", msg: direct.imageMessage, source: m },
       direct.videoMessage && { type: "video", msg: direct.videoMessage, source: m },
+      direct.stickerMessage && { type: "image", kind: "sticker", format: "webp", msg: direct.stickerMessage, source: m },
       quoted?.imageMessage && { type: "image", msg: quoted.imageMessage, source: { message: { imageMessage: quoted.imageMessage } } },
       quoted?.videoMessage && { type: "video", msg: quoted.videoMessage, source: { message: { videoMessage: quoted.videoMessage } } },
+      quoted?.stickerMessage && { type: "image", kind: "sticker", format: "webp", msg: quoted.stickerMessage, source: { message: { stickerMessage: quoted.stickerMessage } } },
     ].filter(Boolean);
     // WhatsApp modern kadang hanya mengirim directPath tanpa url; keduanya bisa diunduh.
     const media = candidates.find((candidate) => candidate.msg?.url || candidate.msg?.directPath);
     if (!media) return null;
-    const buffer = await downloadMedia(media.source);
-    if (!buffer?.length) return null;
-    if (buffer.length > maxMediaBytes()) {
-      console.warn(`[AI] Media ${(buffer.length / 1_048_576).toFixed(1)}MB melebihi batas, diabaikan`);
+    const limit = maxMediaBytes();
+    const declaredLength = mediaFileLength(media.msg);
+    if (declaredLength != null && declaredLength > limit) {
+      console.warn(`[AI] Media ${(declaredLength / 1_048_576).toFixed(1)}MB melebihi batas, tidak diunduh`);
       return null;
     }
+    const buffer = await downloadMedia(media.source, { maxBytes: limit });
+    if (!buffer?.length) return null;
+    const { kind, format } = classifyAiMedia(media);
     const mime = media.type === "video"
       ? (String(media.msg.mimetype || "").startsWith("video/") ? media.msg.mimetype : "video/mp4")
-      : (media.msg.mimetype || "image/jpeg");
-    return { type: media.type, dataUrl: `data:${mime};base64,${buffer.toString("base64")}` };
+      : (media.msg.mimetype || (kind === "sticker" ? "image/webp" : "image/jpeg"));
+    return { type: media.type, kind, format, dataUrl: `data:${mime};base64,${buffer.toString("base64")}` };
   } catch (error) {
     console.warn("[AI] Gagal mengunduh media:", error.message);
     return null;
@@ -285,18 +475,47 @@ async function handleMessage(m) {
   const isAllowedGroup = isGroup && data.allowedGroups.includes(jid);
   let earlyMedia = null;
   if (!text) {
-    // Media tanpa caption tetap diproses AI (GLM multimodal); media lain dibuang.
-    if (!isAllowedGroup) return;
+    // Media tanpa caption tetap diproses AI (GLM multimodal), baik di grup
+    // yang diizinkan maupun di chat pribadi; media lain dibuang.
+    if (isGroup && !isAllowedGroup) return;
     earlyMedia = await getAiMedia(m);
     if (!earlyMedia) return;
   }
 
   // identitas pengirim
-  const senderJid = getSenderNumber(m, isGroup, jid);
-  const senderTag = phoneIdentity(senderJid);
+  let senderJid = getSenderNumber(m, isGroup, jid);
+  let senderTag = phoneIdentity(senderJid);
 
   const cmd = text.toLowerCase();
-  const fromOwner = data.owner && senderJid === data.owner;
+  const senderIdentities = messageSenderIdentities(m, isGroup, jid);
+  let senderPhoneVerified = isGroup
+    ? [m.key?.participantPn, m.key?.senderPn, m.key?.participantAlt, m.key?.senderAlt, m.key?.participant].some(isPhoneJid)
+    : [m.key?.senderPn, m.key?.senderAlt, m.key?.remoteJidAlt, jid].some(isPhoneJid);
+  let metadataCache;
+  let senderParticipant;
+  let fromOwner = Boolean(data.owner && senderIdentities.some((identity) => identitiesMatch(identity, data.owner)));
+  const loadSenderMetadata = async () => {
+    if (!isGroup) return null;
+    if (metadataCache === undefined) metadataCache = await getGroupMetadataSafe(jid);
+    senderParticipant ||= participantForIdentities(metadataCache, senderIdentities);
+    const canonical = canonicalParticipantIdentity(senderParticipant, senderJid);
+    if (senderParticipant && [senderParticipant.jid, senderParticipant.phoneNumber, senderParticipant.pn].some(isPhoneJid)) {
+      senderPhoneVerified = true;
+    }
+    if (canonical) {
+      senderJid = canonical;
+      if (data.owner && identitiesMatch(canonical, data.owner)) fromOwner = true;
+    }
+    return metadataCache;
+  };
+
+  // Pada grup mode LID, nomor PN tersedia lewat participantAlt atau field `jid`
+  // di metadata peserta. Resolusi dilakukan untuk semua pesan grup aktif agar
+  // riwayat Jev/GLM menyimpan nomor, bukan LID.
+  if (isGroup && (cmd.startsWith("/") || isAllowedGroup)) {
+    await loadSenderMetadata();
+    senderTag = phoneIdentity(senderJid);
+  }
 
   // ===== VERIFIKASI OWNER =====
   if (cmd === "/verify") {
@@ -333,6 +552,36 @@ async function handleMessage(m) {
     return;
   }
 
+  // ===== KONTROL AGEN (khusus owner) =====
+  if (cmd === "/agent" || cmd.startsWith("/agent ")) {
+    if (!fromOwner) {
+      await sock.sendMessage(jid, { text: "❌ Hanya owner yang bisa mengatur agen." });
+      return;
+    }
+    const arg = cmd.split(/\s+/)[1] || "status";
+    if (arg === "on" || arg === "off") {
+      const enabled = arg === "on";
+      scheduler.setEnabled(enabled);
+      if (enabled) scheduler.start({ sock });
+    } else if (arg === "clear") {
+      scheduler.clearJobs();
+    }
+    const state = scheduler.status();
+    await sock.sendMessage(jid, {
+      text: [
+        "🤖 *STATUS AGEN GRAD*",
+        `Aktif: ${state.enabled ? "ya" : "tidak"}`,
+        `DM proaktif: ${state.proactive ? "boleh" : "tidak"}`,
+        `Job menunggu: ${state.jobs}`,
+        `DM proaktif hari ini: ${state.proactiveToday}/${state.dailyLimit}`,
+        `Jam tenang: ${state.quiet ? "ya (bot tidak memulai DM)" : "tidak"}`,
+        "",
+        "Perintah: /agent on, /agent off, /agent clear, /agent status",
+      ].join("\n"),
+    });
+    return;
+  }
+
   // ===== AKTIVASI GRUP (khusus owner) =====
   if (cmd === "/allow" || cmd === "/deny") {
     if (!fromOwner) {
@@ -343,7 +592,7 @@ async function handleMessage(m) {
       await sock.sendMessage(jid, { text: "⚠️ Perintah ini hanya bisa dipakai di dalam grup." });
       return;
     }
-    const meta = await sock.groupMetadata(jid);
+    const meta = metadataCache || await sock.groupMetadata(jid);
     if (cmd === "/allow") {
       if (!data.allowedGroups.includes(jid)) {
         data.allowedGroups.push(jid);
@@ -359,10 +608,72 @@ async function handleMessage(m) {
     return;
   }
 
+// ===== CHAT PRIBADI (DM) =====
+  if (!isGroup) {
+    // Perintah tidak dikenal di DM diabaikan; media tanpa caption tetap diproses.
+    if (text.startsWith("/")) return;
+    const dmMedia = earlyMedia || (await getAiMedia(m));
+    if (!text && !dmMedia) return;
+    await directAgent.processDirectMessage({
+      sock,
+      message: m,
+      phone: senderJid,
+      senderName: m.pushName || senderTag,
+      text: text || (dmMedia?.kind === "sticker" ? "[mengirim stiker]" : dmMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+      quotedText: getQuotedText(m),
+      media: dmMedia,
+      isOwner: fromOwner,
+    });
+    return;
+  }
+
   // ===== Semua perintah di bawah hanya aktif di grup yang diizinkan =====
-  if (!isGroup || !data.allowedGroups.includes(jid)) return;
+  if (!data.allowedGroups.includes(jid)) return;
+
+  // Owner dapat memberi hak pengelolaan konteks kepada anggota tertentu.
+  if (cmd === "/veto list" || cmd === "/veto" || cmd.startsWith("/veto ") || cmd === "/unveto" || cmd.startsWith("/unveto ")) {
+    if (!fromOwner) {
+      await sock.sendMessage(jid, { text: "Hanya owner yang bisa memberi atau mencabut akses veto." });
+      return;
+    }
+    if (cmd === "/veto list") {
+      const users = groupVetoUsers(jid);
+      await sock.sendMessage(jid, { text: users.length ? `Akses veto grup:\n${users.map((id) => `• ${phoneIdentity(id)}`).join("\n")}` : "Belum ada anggota dengan akses veto di grup ini." });
+      return;
+    }
+    const metadata = await loadSenderMetadata();
+    const target = resolveVetoTarget(m, cmd, metadata);
+    if (!target) {
+      await sock.sendMessage(jid, { text: "Reply pesan anggota atau gunakan /veto 628xxx. Untuk mencabut: /unveto 628xxx." });
+      return;
+    }
+    const users = new Set(groupVetoUsers(jid));
+    if (cmd.startsWith("/unveto")) users.delete(target);
+    else users.add(target);
+    data.vetoAccess[jid] = [...users];
+    saveData();
+    await sock.sendMessage(jid, {
+      text: cmd.startsWith("/unveto")
+        ? `Akses veto ${phoneIdentity(target)} sudah dicabut.`
+        : `Akses veto ${phoneIdentity(target)} sudah diberikan.`,
+    });
+    return;
+  }
 
   // ===== MANAJEMEN KONTEKS AI =====
+  if (cmd === "/clear" || cmd === "/reset" || cmd === "/memory") {
+    const vetoCandidates = [...senderIdentities, senderJid];
+    const hasVeto = groupVetoUsers(jid).some((allowed) => vetoCandidates.some((identity) => identitiesMatch(allowed, identity)));
+    const metadata = fromOwner || hasVeto ? metadataCache : await loadSenderMetadata();
+    const fromGroupAdmin = metadata
+      ? Boolean(senderParticipant?.admin === "admin" || senderParticipant?.admin === "superadmin" || isAdminParticipant(metadata, senderJid))
+      : false;
+    if (!fromOwner && !hasVeto && !fromGroupAdmin) {
+      await sock.sendMessage(jid, { text: "Hanya owner, admin grup, atau anggota dengan akses veto yang bisa mengelola memori Grad." });
+      return;
+    }
+  }
+
   if (cmd === "/clear") {
     groupAgent.clearConversation(jid);
     await sock.sendMessage(jid, { text: "Percakapan aktif sudah dibersihkan. Memori compact tetap disimpan." });
@@ -465,18 +776,28 @@ async function handleMessage(m) {
   const nameMention = groupAgent.textMentionsBotName(text);
   const explicitMention = metadataMention || nameMention;
   const replyToBot = isReplyToBot(contextInfo);
+  const decoratedText = decorateMentions(text, contextInfo, metadataCache);
+  const decoratedQuoted = decorateMentions(getQuotedText(m), contextInfo, metadataCache);
+
+  // Catat orang yang pernah aktif di grup agar Grad mengenalnya dan boleh
+  // membalas/ memulai DM hanya kepada mereka.
+  if (senderPhoneVerified) {
+    memoryStore.recordParticipant({ phone: senderJid, name: m.pushName || senderTag, groupId: jid, at: groupAgent.witTimestamp() });
+  } else {
+    console.warn(`[AI] PN pengirim belum terverifikasi; LID tidak dimasukkan whitelist DM (${senderJid})`);
+  }
 
   await groupAgent.processGroupMessage({
     sock,
     message: m,
     groupId: jid,
-    senderId: senderJid,
+    senderId: senderPhoneVerified ? senderJid : "nomor-tidak-diketahui",
     senderName: m.pushName || senderTag,
-    text: text || (aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+    text: decoratedText || (aiMedia?.kind === "sticker" ? "[mengirim stiker]" : aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
     explicitMention,
     replyToBot,
     media: aiMedia,
-    quotedText: getQuotedText(m),
+    quotedText: decoratedQuoted,
   });
 }
 
@@ -490,16 +811,23 @@ module.exports = {
   phoneIdentity,
   setPendingVerify: (v) => { pendingVerify = v; },
   getData: () => data,
-  setData: (d) => { data = d; saveData(); },
+  setData: (d) => { data = normalizeDataShape(d); saveData(); },
   isReplyToBot,
   botIdentities,
+  collectMediaStream,
+  classifyAiMedia,
+  mediaFileLength,
   unwrapMediaWrappers,
-  resetData: () => { data = { owner: null, allowedGroups: [] }; saveData(); },
-  setSock: (s) => { sock = s; },
+  resetData: () => { data = { owner: null, allowedGroups: [], vetoAccess: {} }; groupMetadataCache.clear(); saveData(); },
+  setSock: (s) => { sock = s; groupMetadataCache.clear(); },
   games,
   setReboot: (fn) => { rebootFn = fn; },
   setRebootDelay: (ms) => { rebootDelay = ms; },
   realReboot,
+  groupAgent,
+  directAgent,
+  memoryStore,
+  scheduler,
 };
 
 if (require.main === module) {

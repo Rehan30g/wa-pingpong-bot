@@ -1,27 +1,14 @@
 const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
-const fs = require("fs");
-const path = require("path");
+const memoryStore = require("./memory-store");
 
-const DEFAULT_HISTORY_LIMIT = 10;
+const DEFAULT_HISTORY_LIMIT = 24;
 const histories = new Map();
 const pendingGroups = new Map();
-const groupVersions = new Map();
 const evaluationChains = new Map();
 const contextEpochs = new Map();
 const compactingGroups = new Set();
 let entrySequence = 0;
-
-const MEMORY_FILE = path.resolve(process.env.AI_MEMORY_FILE || "./ai-memory.json");
-let memoryData = { groups: {} };
-if (fs.existsSync(MEMORY_FILE)) {
-  try {
-    memoryData = JSON.parse(fs.readFileSync(MEMORY_FILE, "utf8"));
-    if (!memoryData.groups) memoryData.groups = {};
-  } catch (error) {
-    console.warn("[AI] File memori tidak dapat dibaca, memakai memori kosong:", error.message);
-  }
-}
 
 function envNumber(name, fallback) {
   const value = Number(process.env[name]);
@@ -29,6 +16,9 @@ function envNumber(name, fallback) {
 }
 
 function config() {
+  const historyLimit = Math.max(3, envNumber("AI_HISTORY_LIMIT", DEFAULT_HISTORY_LIMIT));
+  const compactTrigger = Math.min(historyLimit, Math.max(3, envNumber("AI_COMPACT_TRIGGER", 18)));
+  const compactRetain = Math.min(compactTrigger - 1, Math.max(1, envNumber("AI_COMPACT_RETAIN", 6)));
   return {
     apiKey: process.env.OPENROUTER_API_KEY || "",
     proxyUrl: process.env.OPENROUTER_PROXY_URL || "",
@@ -37,10 +27,11 @@ function config() {
     reasoningEffort: process.env.GLM_REASONING_EFFORT || "low",
     botName: process.env.BOT_NAME || "Aira",
     botRole: process.env.BOT_ROLE || "asisten grup yang ramah dan membantu",
-    historyLimit: Math.max(3, envNumber("AI_HISTORY_LIMIT", DEFAULT_HISTORY_LIMIT)),
+    historyLimit,
     debounceMs: Math.max(0, envNumber("AI_DEBOUNCE_MS", 1_200)),
-    compactTrigger: Math.max(6, envNumber("AI_COMPACT_TRIGGER", 18)),
-    compactRetain: Math.max(2, envNumber("AI_COMPACT_RETAIN", 6)),
+    compactTrigger,
+    compactRetain,
+    historyMediaLimit: Math.max(1, Math.min(historyLimit, envNumber("AI_HISTORY_MEDIA_LIMIT", 4))),
     replyConfidence: envNumber("AI_REPLY_CONFIDENCE", 0.55),
     reactConfidence: envNumber("AI_REACT_CONFIDENCE", 0.70),
     directReactConfidence: envNumber("AI_DIRECT_REACT_CONFIDENCE", 0.30),
@@ -63,21 +54,8 @@ function witTimestamp(date = new Date()) {
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")} WIT`;
 }
 
-function saveMemoryData() {
-  const dir = path.dirname(MEMORY_FILE);
-  fs.mkdirSync(dir, { recursive: true });
-  const temp = `${MEMORY_FILE}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(memoryData, null, 2));
-  fs.renameSync(temp, MEMORY_FILE);
-}
-
 function getGroupMemory(groupId) {
-  return memoryData.groups[groupId] || {
-    glm: "Belum ada memori terkompresi.",
-    jev: "Belum ada konteks keputusan terkompresi.",
-    updated_at_wit: null,
-    compact_log: [],
-  };
+  return memoryStore.getGroupMemory(groupId);
 }
 
 function isConfigured() {
@@ -118,13 +96,21 @@ function trimHistory(groupId) {
   const cfg = config();
   const history = histories.get(groupId) || [];
   if (history.length > cfg.historyLimit) history.splice(0, history.length - cfg.historyLimit);
+  // Data URL dapat besar. Pertahankan media terbaru saja, tetapi jangan hapus
+  // teks/penanda media dari pesan yang lebih lama.
+  let retainedMedia = 0;
+  for (let index = history.length - 1; index >= 0; index--) {
+    if (!history[index].media) continue;
+    retainedMedia++;
+    if (retainedMedia > cfg.historyMediaLimit) history[index].media = null;
+  }
   histories.set(groupId, history);
   return history;
 }
 
 function remember(groupId, entry) {
   const history = histories.get(groupId) || [];
-  history.push({
+  const saved = {
     entry_id: ++entrySequence,
     sender: entry.sender || "Anggota",
     sender_id: entry.senderId || "nomor-tidak-diketahui",
@@ -134,25 +120,47 @@ function remember(groupId, entry) {
     mentioned_bot: Boolean(entry.mentionedBot),
     has_image: Boolean(entry.hasImage),
     has_video: Boolean(entry.hasVideo),
-  });
+    media_kind: entry.media?.kind || null,
+    media_format: entry.media?.format || null,
+    media: mediaContentPart(entry.media)
+      ? { type: entry.media.type, kind: entry.media.kind, format: entry.media.format, dataUrl: entry.media.dataUrl }
+      : null,
+    message_key: entry.messageKey || null,
+    message_ref: entry.messageRef || null,
+  };
+  history.push(saved);
   histories.set(groupId, history);
   trimHistory(groupId);
-  scheduleCompaction(groupId);
+  // Kunci DM ("dm:<nomor>") punya alur compact sendiri di direct-agent.
+  if (!String(groupId).startsWith("dm:")) scheduleCompaction(groupId);
+  return saved;
 }
 
 function getHistory(groupId) {
   return [...(histories.get(groupId) || [])];
 }
 
+function dropHistoryEntries(groupId, entryIds) {
+  const ids = new Set(entryIds);
+  const current = histories.get(groupId) || [];
+  histories.set(groupId, current.filter((item) => !ids.has(item.entry_id)));
+}
+
 function resetHistories() {
+  const affectedGroups = new Set([
+    ...histories.keys(),
+    ...pendingGroups.keys(),
+    ...evaluationChains.keys(),
+  ]);
+  for (const groupId of affectedGroups) {
+    contextEpochs.set(groupId, (contextEpochs.get(groupId) || 0) + 1);
+  }
   histories.clear();
   for (const pending of pendingGroups.values()) {
     clearTimeout(pending.timer);
     pending.resolve({ action: "superseded" });
   }
   pendingGroups.clear();
-  groupVersions.clear();
-  contextEpochs.clear();
 }
 
 function clearConversation(groupId) {
@@ -163,22 +171,20 @@ function clearConversation(groupId) {
     pending.resolve({ action: "superseded" });
     pendingGroups.delete(groupId);
   }
-  groupVersions.set(groupId, (groupVersions.get(groupId) || 0) + 1);
   contextEpochs.set(groupId, (contextEpochs.get(groupId) || 0) + 1);
 }
 
 function resetGroupContext(groupId) {
   clearConversation(groupId);
-  delete memoryData.groups[groupId];
-  saveMemoryData();
+  memoryStore.deleteGroupMemory(groupId);
 }
 
 function formatIdentity(entry) {
   return `${entry.sender} [${entry.sender_id}]${entry.is_bot ? " (Grad/bot)" : ""}`;
 }
 
-function conversationForPrompt(groupId) {
-  return getHistory(groupId).map((item) => ({
+function conversationForPrompt(groupId, historySnapshot = getHistory(groupId)) {
+  return historySnapshot.map((item) => ({
     sender: item.sender,
     phone: item.sender_id,
     is_bot: item.is_bot,
@@ -187,12 +193,14 @@ function conversationForPrompt(groupId) {
     mentioned_bot: item.mentioned_bot,
     has_image: item.has_image,
     has_video: item.has_video,
+    media_kind: item.media_kind,
+    media_format: item.media_format,
   }));
 }
 
-function participantsForPrompt(groupId) {
+function participantsForPrompt(groupId, historySnapshot = getHistory(groupId)) {
   const people = new Map();
-  for (const item of getHistory(groupId)) {
+  for (const item of historySnapshot) {
     const key = item.sender_id || `name:${item.sender}`;
     const current = people.get(key) || { phone: item.sender_id, names: [], is_bot: item.is_bot };
     if (!current.names.includes(item.sender)) current.names.push(item.sender);
@@ -229,7 +237,10 @@ async function compactGroupMemory(groupId) {
           "Identitas: nomor telepon yang sama berarti orang yang sama walau nama berubah; nama sama dengan nomor berbeda berarti orang berbeda.",
           "glm_memory harus terperinci: identitas, fakta stabil, preferensi, keputusan, relasi, konteks penting, dan hal belum selesai.",
           "jev_context harus ringkas untuk klasifikasi: topik aktif, siapa berbicara kepada siapa, pola pemanggilan bot, pertanyaan belum terjawab, sensitivitas, dan kapan bot sebaiknya menjawab/diam.",
+          "people berisi satu entri per nomor telepon yang muncul: phone (digit, awali 62), name, profile (fakta stabil, preferensi, kebiasaan), dan relation (hubungan orang itu dengan bot Grad dan dengan anggota lain).",
+          "relationships berisi ringkasan hubungan antar pihak memakai id: nomor telepon untuk orang, atau 'group:<id>' untuk grup; a dan b adalah dua id yang dihubungkan.",
           "Gabungkan memori lama dengan fakta baru, buang pengulangan dan hal remeh yang sudah selesai.",
+          "Jika tidak ada informasi orang atau hubungan yang layak disimpan, kirim array kosong.",
         ].join(" "),
       },
       {
@@ -257,8 +268,35 @@ async function compactGroupMemory(groupId) {
           properties: {
             glm_memory: { type: "string" },
             jev_context: { type: "string" },
+            people: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  phone: { type: "string" },
+                  name: { type: "string" },
+                  profile: { type: "string" },
+                  relation: { type: "string" },
+                },
+                required: ["phone", "name", "profile", "relation"],
+                additionalProperties: false,
+              },
+            },
+            relationships: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  a: { type: "string" },
+                  b: { type: "string" },
+                  summary: { type: "string" },
+                },
+                required: ["a", "b", "summary"],
+                additionalProperties: false,
+              },
+            },
           },
-          required: ["glm_memory", "jev_context"],
+          required: ["glm_memory", "jev_context", "people", "relationships"],
           additionalProperties: false,
         },
       },
@@ -273,13 +311,28 @@ async function compactGroupMemory(groupId) {
   if (!parsed?.glm_memory || !parsed?.jev_context) throw new Error("Output compact tidak lengkap");
   if ((contextEpochs.get(groupId) || 0) !== contextEpoch) return false;
 
-  memoryData.groups[groupId] = {
-    glm: String(parsed.glm_memory).slice(0, 8_000),
-    jev: String(parsed.jev_context).slice(0, 4_000),
+  memoryStore.setGroupMemory(groupId, {
+    glm: parsed.glm_memory,
+    jev: parsed.jev_context,
     updated_at_wit: timestamp,
     compact_log: [...(previous.compact_log || []), timestamp].slice(-20),
-  };
-  saveMemoryData();
+  });
+
+  // Memori per orang dan hubungan ikut diperbarui dari compact grup yang sama,
+  // supaya Grad terasa satu AI yang mengenal siapa-siapa di kehidupannya.
+  for (const person of Array.isArray(parsed.people) ? parsed.people : []) {
+    if (!person?.phone) continue;
+    memoryStore.upsertPersonProfile(person.phone, {
+      name: person.name,
+      profile: person.profile,
+      relation: person.relation,
+      merge: true,
+    });
+  }
+  for (const relation of Array.isArray(parsed.relationships) ? parsed.relationships : []) {
+    if (!relation?.a || !relation?.b) continue;
+    memoryStore.setRelationship(relation.a, relation.b, { summary: relation.summary, updated_at_wit: timestamp, merge: true });
+  }
 
   const current = histories.get(groupId) || [];
   histories.set(groupId, current.filter((item) => !snapshotIds.has(item.entry_id)));
@@ -326,9 +379,17 @@ function getMemoryDisplay(groupId) {
   return lines.join("\n");
 }
 
-async function decideAction({ groupId, latestMessage, explicitMention, replyToBot, quotedText, media }) {
+async function decideAction({
+  groupId,
+  latestMessage,
+  explicitMention,
+  replyToBot,
+  quotedText,
+  media,
+  historySnapshot = getHistory(groupId),
+  memorySnapshot = getGroupMemory(groupId),
+}) {
   const cfg = config();
-  const memory = getGroupMemory(groupId);
   const state = {
     description: "Percakapan WhatsApp grup. Nilai pesan PALING TERAKHIR dengan konteks sebelumnya.",
     bot: { name: cfg.botName, role: cfg.botRole },
@@ -338,11 +399,16 @@ async function decideAction({ groupId, latestMessage, explicitMention, replyToBo
       quoted_text: quotedText || null,
       has_image: media?.type === "image",
       has_video: media?.type === "video",
+      media_kind: media?.kind || "none",
+      media_format: media?.format || null,
+      is_sticker: media?.kind === "sticker",
+      is_attachment: media?.kind === "attachment",
+      is_gif: media?.format === "gif",
     },
     identity_rule: "Nomor sama = orang yang sama walau nama berubah. Nama sama dengan nomor berbeda = orang berbeda.",
-    participants: participantsForPrompt(groupId),
-    compact_context_for_decision: memory.jev,
-    conversation: conversationForPrompt(groupId),
+    participants: participantsForPrompt(groupId, historySnapshot),
+    compact_context_for_decision: memorySnapshot.jev,
+    conversation: conversationForPrompt(groupId, historySnapshot),
     latest_message: latestMessage,
   };
 
@@ -361,6 +427,7 @@ async function decideAction({ groupId, latestMessage, explicitMention, replyToBo
           "Undangan terbuka seperti 'siapapun jawab', 'ada yang tahu?', 'ada yang bisa bantu?', atau keluhan bahwa grup kosong mencakup bot; pilih reply dengan antusias jika bot dapat merespons dengan relevan.",
           "Jika seseorang meminta siapa saja menjawab, jangan menunggu nama bot disebut.",
           "Pilih reaction hanya untuk pengakuan sosial singkat yang tidak memerlukan jawaban teks.",
+          "Gunakan media_kind: sticker biasanya ekspresi sosial singkat, sedangkan attachment adalah lampiran yang mungkin perlu dianalisis atau dijawab. GIF berformat video tetapi tetap dapat berfungsi seperti sticker.",
           "Jika pesan diarahkan ke bot (reply_to_bot atau mention) dan berisi gelak tawa, godaan main, atau ajakan bercanda bersama bot, pilih react_laugh dan jangan pilih ignore.",
           "Jika pesan diarahkan ke bot (reply_to_bot, mention, atau lanjutan dialog bot) dan hanya berisi persetujuan atau konfirmasi singkat seperti iyap, iya, sip, oke, pilih react_ack dan JANGAN pilih ignore atau reply.",
           "Jika pesan ditujukan ke bot dan berisi apresiasi hangat yang jelas, pilih react_heart.",
@@ -417,18 +484,35 @@ function mediaContentPart(media) {
   return null;
 }
 
-function buildChatMessages({ groupId, latestMessage, quotedText, media }) {
+function buildChatMessages({
+  groupId,
+  latestMessage,
+  quotedText,
+  media,
+  historySnapshot = getHistory(groupId),
+  memorySnapshot = getGroupMemory(groupId),
+}) {
   const cfg = config();
-  const memory = getGroupMemory(groupId);
-  const conversation = getHistory(groupId)
-    .map((item) => `${formatIdentity(item)}: ${item.text}`)
+  const conversation = historySnapshot
+    .map((item) => `#${item.entry_id} ${formatIdentity(item)}: ${item.text}${item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : ""}`)
     .join("\n");
 
   const mediaPart = mediaContentPart(media);
+  const latestHistoryEntry = historySnapshot.at(-1);
+  const latestEntryIsCurrent = latestHistoryEntry
+    && latestHistoryEntry.sender_id === latestMessage.sender_id
+    && latestHistoryEntry.text === latestMessage.text;
+  const historicalMedia = historySnapshot
+    .filter((item) => item.media && (!latestEntryIsCurrent || item.entry_id !== latestHistoryEntry.entry_id))
+    .map((item) => ({
+      label: `Media lama dari ${formatIdentity(item)}: ${item.text || (item.has_video ? "[mengirim video]" : "[mengirim gambar]")}`,
+      part: mediaContentPart(item.media),
+    }))
+    .filter((item) => item.part);
 
   const userText = [
     "Konteks percakapan grup:",
-    `Memori terperinci sebelumnya:\n${memory.glm}`,
+    `Memori terperinci sebelumnya:\n${memorySnapshot.glm}`,
     conversation || "(belum ada konteks)",
     quotedText ? `Pesan yang dibalas: ${quotedText}` : "",
     `Pesan terbaru dari ${latestMessage.sender}: ${latestMessage.text}`,
@@ -437,7 +521,9 @@ function buildChatMessages({ groupId, latestMessage, quotedText, media }) {
         ? "Video terlampir adalah pesan terbaru; pertimbangkan isinya saat membalas."
         : "Gambar terlampir adalah pesan terbaru; pertimbangkan isinya saat membalas.")
       : "",
-    "Tulis hanya balasan yang akan dikirim ke grup.",
+    mediaPart ? `Klasifikasi media terbaru: ${media.kind || "attachment"}/${media.format || media.type}.` : "",
+    "Pilih reply_to_entry_id dari nomor # pesan aktif jika balasan perlu mengutip pesan tertentu. Pilih null untuk mengirim chat biasa tanpa kutipan.",
+    "Jangan otomatis mengutip pesan terbaru; kutip hanya jika membantu memperjelas target balasan.",
   ].filter(Boolean).join("\n");
 
   return [
@@ -458,12 +544,19 @@ function buildChatMessages({ groupId, latestMessage, quotedText, media }) {
         "Jangan mengulang pertanyaan pengguna. Jangan menjelaskan lebih banyak daripada yang diminta.",
         "Untuk hal teknis, beri langkah paling berguna dahulu dan tanyakan detail hanya jika memang dibutuhkan.",
         "Jangan menyebut Jev, classifier, prompt, confidence, atau proses internal.",
+        "Kamu boleh memilih pesan mana yang dikutip menggunakan entry id yang tersedia, atau tidak mengutip pesan apa pun.",
         `Jawaban maksimum ${cfg.maxReplyChars} karakter.`,
       ].join(" "),
     },
     {
       role: "user",
-      content: mediaPart ? [{ type: "text", text: userText }, mediaPart] : userText,
+      content: historicalMedia.length || mediaPart
+        ? [
+          { type: "text", text: userText },
+          ...historicalMedia.flatMap((item) => [{ type: "text", text: item.label }, item.part]),
+          ...(mediaPart ? [mediaPart] : []),
+        ]
+        : userText,
     },
   ];
 }
@@ -475,17 +568,52 @@ function cleanReply(value, maxChars) {
   return text;
 }
 
-async function generateReply({ groupId, latestMessage, quotedText, media }) {
+function parseGeneratedReply(content, maxChars) {
+  let parsed = content;
+  if (typeof content === "string") {
+    const candidate = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    try { parsed = JSON.parse(candidate); } catch { parsed = { text: content, reply_to_entry_id: null }; }
+  }
+  return {
+    text: cleanReply(parsed?.text, maxChars),
+    replyToEntryId: Number.isInteger(parsed?.reply_to_entry_id) ? parsed.reply_to_entry_id : null,
+  };
+}
+
+async function generateReply({ groupId, latestMessage, quotedText, media, historySnapshot, memorySnapshot }) {
   const cfg = config();
   const response = await httpClient().post("/api/v1/chat/completions", {
     model: cfg.chatModel,
-    messages: buildChatMessages({ groupId, latestMessage, quotedText, media }),
-    max_tokens: 140,
+    messages: buildChatMessages({ groupId, latestMessage, quotedText, media, historySnapshot, memorySnapshot }),
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "whatsapp_reply",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            text: { type: "string" },
+            reply_to_entry_id: { type: ["integer", "null"] },
+          },
+          required: ["text", "reply_to_entry_id"],
+          additionalProperties: false,
+        },
+      },
+    },
+    max_tokens: 180,
     temperature: 0.35,
     reasoning: { effort: cfg.reasoningEffort, exclude: true },
   });
 
-  return cleanReply(response.data?.choices?.[0]?.message?.content, cfg.maxReplyChars);
+  return parseGeneratedReply(response.data?.choices?.[0]?.message?.content, cfg.maxReplyChars);
+}
+
+function replyTargetForEntry(historySnapshot, entryId) {
+  if (!Number.isInteger(entryId)) return null;
+  const entry = historySnapshot.find((item) => item.entry_id === entryId);
+  if (!entry?.message_key) return null;
+  return entry.message_ref || { key: entry.message_key, message: { conversation: entry.text } };
 }
 
 const REACTIONS = {
@@ -513,11 +641,14 @@ async function setTyping(sock, groupId, state) {
   }
 }
 
-async function evaluateGroupMessage({ sock, message, groupId, senderId, senderName, text, explicitMention, replyToBot, quotedText, media }) {
+async function evaluateGroupMessage(
+  { sock, message, groupId, senderId, senderName, text, explicitMention, replyToBot, quotedText, media },
+  { scheduledEpoch, historySnapshot, memorySnapshot },
+) {
   const cfg = config();
-  // Versi konteks saat evaluasi dimulai; /clear atau /reset mengubahnya
-  // sehingga evaluasi yang sedang berjalan jadi superseded.
-  const version = groupVersions.get(groupId) || 0;
+  // Epoch diambil saat evaluasi dijadwalkan, bukan saat mulai. Karena itu
+  // /clear dan /reset juga membatalkan pekerjaan yang masih mengantre.
+  if ((contextEpochs.get(groupId) || 0) !== scheduledEpoch) return { action: "superseded" };
   const latestMessage = {
     sender: senderName,
     sender_id: senderId,
@@ -526,14 +657,23 @@ async function evaluateGroupMessage({ sock, message, groupId, senderId, senderNa
 
   let decision;
   try {
-    decision = await decideAction({ groupId, latestMessage, explicitMention, replyToBot, quotedText, media });
+    decision = await decideAction({
+      groupId,
+      latestMessage,
+      explicitMention,
+      replyToBot,
+      quotedText,
+      media,
+      historySnapshot,
+      memorySnapshot,
+    });
   } catch (error) {
     console.error("[AI] Jev gagal:", error.response?.data?.error?.message || error.message);
     decision = { action: explicitMention || replyToBot ? "reply" : "ignore", confidence: 1 };
   }
 
   // Pesan baru sudah datang ketika API masih bekerja: jangan kirim balasan basi.
-  if (((groupVersions.get(groupId) || 0) !== version)) return { action: "superseded", decision };
+  if ((contextEpochs.get(groupId) || 0) !== scheduledEpoch) return { action: "superseded", decision };
 
   // Jev sudah menghasilkan keputusan: pesan dianggap terbaca,
   // termasuk ketika keputusannya ignore/ditolak.
@@ -541,7 +681,7 @@ async function evaluateGroupMessage({ sock, message, groupId, senderId, senderNa
 
   // Pesan terakhir di riwayat adalah pesan yang sedang dievaluasi;
   // entri sebelumnya menunjukkan apakah pengguna sedang berdialog dengan bot.
-  const historyBefore = getHistory(groupId);
+  const historyBefore = historySnapshot;
   const inBotDialogue = Boolean(historyBefore[historyBefore.length - 2]?.is_bot);
   const directlyAddressed = explicitMention || replyToBot;
 
@@ -579,12 +719,28 @@ async function evaluateGroupMessage({ sock, message, groupId, senderId, senderNa
   if (shouldReply) {
     await setTyping(sock, groupId, "composing");
     try {
-      const reply = await generateReply({ groupId, latestMessage, quotedText, media });
-      if (((groupVersions.get(groupId) || 0) !== version)) return { action: "superseded", decision };
-      if (!reply) return { action: "ignore", decision };
-      await sock.sendMessage(groupId, { text: reply }, { quoted: message });
-      remember(groupId, { sender: cfg.botName, senderId: "BOT", text: reply, isBot: true });
-      return { action: "reply", text: reply, decision };
+      const generated = await generateReply({
+        groupId,
+        latestMessage,
+        quotedText,
+        media,
+        historySnapshot,
+        memorySnapshot,
+      });
+      if ((contextEpochs.get(groupId) || 0) !== scheduledEpoch) return { action: "superseded", decision };
+      if (!generated.text) return { action: "ignore", decision };
+      const quoteKey = replyTargetForEntry(historySnapshot, generated.replyToEntryId);
+      const sendOptions = quoteKey ? { quoted: quoteKey } : undefined;
+      const sent = await sock.sendMessage(groupId, { text: generated.text }, sendOptions);
+      remember(groupId, {
+        sender: cfg.botName,
+        senderId: "BOT",
+        text: generated.text,
+        isBot: true,
+        messageKey: sent?.key,
+        messageRef: sent,
+      });
+      return { action: "reply", text: generated.text, replyToEntryId: generated.replyToEntryId, decision };
     } catch (error) {
       console.error("[AI] GLM gagal:", error.response?.data?.error?.message || error.message);
       return { action: "error", decision };
@@ -607,6 +763,7 @@ function processGroupMessage(args) {
   if (!isConfigured()) return Promise.resolve({ action: "disabled" });
 
   const { groupId, senderId, senderName, text, explicitMention, replyToBot, media } = args;
+  const scheduledEpoch = contextEpochs.get(groupId) || 0;
   remember(groupId, {
     sender: senderName,
     senderId,
@@ -615,6 +772,9 @@ function processGroupMessage(args) {
     replyToBot,
     hasImage: media?.type === "image",
     hasVideo: media?.type === "video",
+    media,
+    messageKey: args.message?.key,
+    messageRef: args.message,
   });
 
   // Pesan baru dalam jendela debounce yang sama menggantikan pesan lama.
@@ -629,12 +789,17 @@ function processGroupMessage(args) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingGroups.delete(groupId);
+      // Snapshot tunggal dipakai Jev dan GLM agar pesan yang datang saat API
+      // berjalan tidak bocor ke balasan yang sedang diproses.
+      const historySnapshot = getHistory(groupId);
+      const memorySnapshot = { ...getGroupMemory(groupId) };
       const previousRun = (evaluationChains.get(groupId) || Promise.resolve()).catch(() => {});
       const run = previousRun.then(() => {
         // Pesan lebih baru masih menunggu di debounce: pesan ini basi,
         // biarkan pesan terbaru yang mewakili (konteksnya sudah lengkap).
         if (pendingGroups.has(groupId)) return { action: "superseded" };
-        return evaluateGroupMessage(args);
+        if ((contextEpochs.get(groupId) || 0) !== scheduledEpoch) return { action: "superseded" };
+        return evaluateGroupMessage(args, { scheduledEpoch, historySnapshot, memorySnapshot });
       });
       const finish = (result) => {
         if (evaluationChains.get(groupId) === run) evaluationChains.delete(groupId);
@@ -659,16 +824,23 @@ module.exports = {
   compactGroupMemory,
   config,
   decideAction,
+  dropHistoryEntries,
+  formatIdentity,
   generateReply,
   getHistory,
   getGroupMemory,
   getMemoryDisplay,
+  httpClient,
   isConfigured,
   markRead,
+  mediaContentPart,
+  parseGeneratedReply,
+  replyTargetForEntry,
   processGroupMessage,
   remember,
   resetHistories,
   resetGroupContext,
   setTyping,
   textMentionsBotName,
+  witTimestamp,
 };

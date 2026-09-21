@@ -11,7 +11,7 @@ Panduan untuk AI agent (dan manusia) yang bekerja di VPS ini.
 
 - `index.js` — kode utama bot
 - `auth/` — kredensial sesi WhatsApp. **JANGAN dihapus/di-edit** — kalau hilang, bot harus scan QR ulang
-- `data.json` — owner (`owner`) & grup yang diizinkan (`allowedGroups`). Edit via `data = ...` di kode, bukan manual saat bot jalan
+- `data.json` — owner (`owner`), grup yang diizinkan (`allowedGroups`), dan akses pengelola per grup (`vetoAccess`). Edit via command/kode, bukan manual saat bot jalan
 - `test/` — unit test, jalankan dengan `npm test`
 
 ## Sesi tmux yang Berjalan (run nonstop)
@@ -87,23 +87,36 @@ Kalau WARP disconnect: `warp-cli --accept-tos connect`
 
 - `ai/group-agent.js` mengelola buffer percakapan, keputusan Jev, balasan GLM, reaction, read receipt, presence mengetik, identitas peserta, dan auto-compact.
 - Jev (`typesafe/jev-1.13`) hanya memilih tindakan. GLM (`z-ai/glm-5.3-flash`) menulis balasan dan compact memory dengan reasoning `low`.
-- Gambar dan video (langsung atau yang dikutip) diunduh sebagai data URL dan dikirim ke GLM sebagai konten multimodal (`image_url`/`video_url`); media tanpa caption diproses dengan teks `[mengirim gambar]`/`[mengirim video]`. Jev tetap berbasis teks dan hanya menerima sinyal `has_image`/`has_video`. Batas ukuran media diatur `AI_MAX_MEDIA_MB` (default 20 MB).
+- Gambar dan video (langsung atau yang dikutip) diunduh sebagai data URL dan dikirim ke GLM sebagai konten multimodal (`image_url`/`video_url`); media aktif terdahulu ikut dikirim ulang hingga batas `AI_HISTORY_MEDIA_LIMIT` (default 4). Media tanpa caption diproses dengan teks `[mengirim gambar]`/`[mengirim video]`. Jev tetap berbasis teks dan hanya menerima sinyal `has_image`/`has_video`. Batas ukuran tiap media diatur `AI_MAX_MEDIA_MB` (default 20 MB).
+- Media membawa klasifikasi `kind` (`sticker`/`attachment`) dan `format` (`image`/`video`/`gif`/`webp`). Jev menerima sinyal klasifikasi tersebut. GLM menghasilkan output terstruktur berisi teks dan `reply_to_entry_id`; nilai null berarti kirim bubble standalone, bukan otomatis quote pemicu.
 - Pesan cepat memakai debounce per grup. Pesan dalam jendela debounce yang sama digabung (`superseded`), tetapi evaluasi yang sedang berjalan TIDAK dibatalkan pesan baru — pesan baru mengantri dan diproses setelahnya, dan evaluasi antrean yang basi (ada pesan lebih baru) dilewati.
 - Read receipt (centang biru) dikirim setelah Jev menghasilkan keputusan untuk pesan itu, termasuk saat keputusannya ignore/ditolak. Pesan yang belum pernah dievaluasi (masih di debounce atau basi/superseded) tetap belum terbaca (centang 1).
 - Bot memakai `markOnlineOnConnect` plus heartbeat presence `available` berkala (4 menit) agar status bot selalu tampil online dan receipt delivered aktif: pesan pengguna mendapat centang abu-abu begitu diterima perangkat bot, terlepas dari keputusan Jev.
 - Lanjutan percakapan langsung dengan bot (entri riwayat sebelum pesan terbaru berasal dari bot) dianggap diarahkan ke bot untuk threshold reply dan reaction, sehingga balasan tidak hilang hanya karena confidence Jev rendah. Konfirmasi singkat ("iyap", "sip") dalam dialog bot diberi reaction ack, bukan diabaikan; reaction heart tetap khusus apresiasi yang ditujukan ke bot.
-- Identitas peserta harus memakai `participantPn`/`senderPn` sebelum `participant`, karena `participant` dapat berupa JID `@lid`. Nomor sama berarti orang sama; nama sama dengan nomor berbeda berarti orang berbeda.
-- Riwayat aktif dan memori compact berbeda. `/clear` hanya membersihkan riwayat aktif; `/reset` membersihkan keduanya; `/memory` menampilkan konteks GLM, konteks Jev, riwayat aktif, dan timestamp WIT.
+- Identitas peserta harus memakai `participantPn`/`senderPn`/alias sebelum `participant`, lalu petakan LID melalui field `jid` pada metadata peserta grup. Riwayat dan state harus menyimpan nomor PN, bukan LID. Nomor sama berarti orang sama; nama sama dengan nomor berbeda berarti orang berbeda.
+- Tag/mention di teks WhatsApp berupa nomor (PN atau LID). `decorateMentions` di `index.js` mengubahnya menjadi `@Nama` sebelum masuk riwayat, sehingga tag bot terbaca sebagai `@<BOT_NAME>`, bukan nomor.
+- Riwayat aktif dan memori compact berbeda. `/clear` hanya membersihkan riwayat aktif; `/reset` membersihkan keduanya; `/memory` menampilkan konteks GLM, konteks Jev, riwayat aktif, dan timestamp WIT. Ketiganya dapat dipakai owner, admin WhatsApp grup, atau anggota yang diberi akses veto oleh owner (`/veto`, `/unveto`, `/veto list`).
 - Auto-compact tidak boleh diumumkan ke grup dan tidak boleh menghidupkan kembali konteks setelah `/clear` atau `/reset`.
+- `.env` adalah rahasia dan tidak boleh di-commit. `.env.example` harus selalu memakai placeholder.
+
+## Arsitektur Agen, Memori, dan DM
+
+- `ai/memory-store.js` memegang seluruh `ai-memory.json` (versi 2) dan bermigrasi otomatis dari bentuk lama `{groups}`. Isinya: `groups` (memori per grup), `people` (profil per nomor + memori DM), dan `relationships` (ringkasan hubungan antar orang/grup).
+- Saat compact grup, GLM sekaligus mengekstrak `people` dan `relationships`, jadi memori orang/grup/hubungan tumbuh bersama dan Grad terasa satu AI yang mengenal siapa-siapa.
+- `ai/direct-agent.js` menangani chat pribadi. Di DM bot membalas lebih sering (default reply) karena chat jelas ditujukan ke bot, tetapi tetap natural: delay + presence mengetik + sesekali memecah balasan.
+- **Safety DM (wajib dipertahankan):** `memoryStore.canDirectMessage(phone)` hanya true bila nomor pernah mengirim pesan di grup yang diizinkan. Orang asing yang DM dibiarkan tanpa balasan. Permintaan menyebarkan/mem-forward pesan ke banyak orang ditolak dengan template tetap, dan tidak ada API kirim ke target selain lawan chat.
+- `ai/humanize.js` menyediakan delay natural, deteksi jam tenang WIT, pemecahan balasan, deteksi broadcast, deteksi opt-out/opt-in, dan parser reminder sederhana.
+- `ai/scheduler.js` menjalankan job persisten di `agent-jobs.json`: `reminder`, `follow_up`, dan `proactive_checkin`. DM proaktif melewati gerbang whitelist, `opt_out`, jam tenang, cooldown per orang, dan kuota harian. Reminder yang diminta pengguna tetap dikirim walau DM proaktif dimatikan.
+- Owner mengontrol lewat `/agent status`, `/agent on`, `/agent off`, `/agent clear`.
 - `.env` adalah rahasia dan tidak boleh di-commit. `.env.example` harus selalu memakai placeholder.
 
 ## Checklist Perubahan AI
 
-1. Jalankan `node --check index.js` dan `node --check ai/group-agent.js`.
+1. Jalankan `node --check index.js`, `node --check ai/group-agent.js`, `node --check ai/direct-agent.js`, dan `node --check ai/scheduler.js`.
 2. Jalankan `npm test`.
-3. Untuk perubahan alur pesan, wajib ada tes yang memanggil `processGroupMessage` langsung dengan mock socket; tes helper saja tidak cukup.
+3. Untuk perubahan alur pesan, wajib ada tes yang memanggil `processGroupMessage` langsung dengan mock socket; tes helper saja tidak cukup. Untuk DM, panggil `processDirectMessage` dengan mock socket dan pastikan whitelist/broadcast dijaga.
 4. Pastikan parameter yang dipakai saat menyimpan riwayat (`senderId`, `senderName`, `text`, mention/reply) diambil dari object argumen atau dideklarasikan lokal—jangan mengandalkan variabel yang tidak berada dalam scope.
-5. Untuk validasi API nyata gunakan `npm run simulate:ai`, `npm run simulate:burst`, atau `npm run simulate:memory`; jangan mencetak API key.
+5. Untuk validasi API nyata gunakan `npm run simulate:ai`, `npm run simulate:burst`, `npm run simulate:memory`, atau `npm run simulate:dm`; jangan mencetak API key.
 
 ## Env
 

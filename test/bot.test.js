@@ -9,7 +9,7 @@ const GROUP = "120363000000000@g.us";
 const OWNER = "628111111111";
 const PLAYER = "628222222222";
 
-function makeSock() {
+function makeSock({ participants = [] } = {}) {
   const sent = [];
   const reads = [];
   return {
@@ -21,19 +21,32 @@ function makeSock() {
     },
     readMessages: async (keys) => reads.push(...keys),
     sendPresenceUpdate: async () => {},
-    groupMetadata: async (jid) => ({ subject: "Grup Test" }),
+    groupMetadata: async (jid) => ({ subject: "Grup Test", participants }),
   };
 }
 
-function msg({ chat = GROUP, from = PLAYER, text, pushName = "Tester" }) {
+function msg({
+  chat = GROUP,
+  from = PLAYER,
+  text,
+  pushName = "Tester",
+  contextInfo = null,
+  participant,
+  participantAlt,
+  participantPn,
+}) {
   return {
     key: {
       remoteJid: chat,
       fromMe: false,
-      participant: chat.endsWith("@g.us") ? `${from}@s.whatsapp.net` : undefined,
+      participant: chat.endsWith("@g.us") ? (participant || `${from}@s.whatsapp.net`) : undefined,
+      participantAlt,
+      participantPn,
     },
     pushName,
-    message: { conversation: text },
+    message: contextInfo
+      ? { extendedTextMessage: { text, contextInfo } }
+      : { conversation: text },
   };
 }
 
@@ -357,6 +370,34 @@ test("mention @bot terdeteksi dari LID bot", async () => {
   else process.env.AI_DEBOUNCE_MS = oldDebounce;
 });
 
+test("tag bot ditampilkan sebagai @NamaBot, bukan nomor PN/LID", async () => {
+  const agent = require("../ai/group-agent");
+  const sock = setBotUser({ id: `${OWNER}@s.whatsapp.net`, lid: "111222333444555@lid" });
+  reset(OWNER, [GROUP]);
+  const oldDebounce = process.env.AI_DEBOUNCE_MS;
+  process.env.AI_DEBOUNCE_MS = "60000";
+  const botName = agent.config().botName;
+
+  const m = msg({ text: `@${OWNER} coba tebak` });
+  m.message = {
+    extendedTextMessage: {
+      text: `@${OWNER} coba tebak`,
+      contextInfo: { mentionedJid: ["111222333444555@lid"] },
+    },
+  };
+  const pending = bot.handleMessage(m);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const entry = agent.getHistory(GROUP).at(-1);
+  assert.equal(entry.text, `@${botName} coba tebak`, "nomor tag bot harus menjadi nama bot dengan @");
+  assert.ok(!entry.text.includes(OWNER), "nomor PN bot tidak boleh tersisa di teks");
+
+  agent.clearConversation(GROUP);
+  await pending;
+  if (oldDebounce === undefined) delete process.env.AI_DEBOUNCE_MS;
+  else process.env.AI_DEBOUNCE_MS = oldDebounce;
+});
+
 test("gambar dengan caption diproses AI memakai teks caption", async () => {
   const agent = require("../ai/group-agent");
   setBotUser({ id: `${OWNER}@s.whatsapp.net` });
@@ -429,9 +470,52 @@ test("pembungkus viewOnce dibuka untuk deteksi media", () => {
   assert.equal(bot.unwrapMediaWrappers(broken), broken);
 });
 
+test("stream media dihentikan segera saat melewati batas", async () => {
+  async function* chunks() {
+    yield Buffer.alloc(4, 1);
+    yield Buffer.alloc(4, 2);
+  }
+
+  await assert.rejects(
+    bot.collectMediaStream(chunks(), { maxBytes: 6 }),
+    (error) => error.code === "AI_MEDIA_TOO_LARGE",
+  );
+  assert.equal(bot.mediaFileLength({ fileLength: { toNumber: () => 1234 } }), 1234);
+  assert.equal(bot.mediaFileLength({ fileLength: "invalid" }), null);
+});
+
+test("gambar, GIF, dan sticker diklasifikasikan untuk Jev", () => {
+  assert.deepEqual(bot.classifyAiMedia({ type: "image", msg: {} }), { kind: "attachment", format: "image" });
+  assert.deepEqual(bot.classifyAiMedia({ type: "video", msg: { gifPlayback: true } }), { kind: "sticker", format: "gif" });
+  assert.deepEqual(
+    bot.classifyAiMedia({ type: "image", kind: "sticker", format: "webp", msg: {} }),
+    { kind: "sticker", format: "webp" },
+  );
+});
+
 test("/clear, /memory, dan /reset mengelola konteks grup", async () => {
   reset(OWNER, [GROUP]);
   const sock = makeSock();
+  bot.setSock(sock);
+
+  await bot.handleMessage(msg({ text: "/memory" }));
+  assert.match(last(sock).text, /Hanya owner/);
+
+  await bot.handleMessage(msg({ from: OWNER, text: "/clear" }));
+  assert.match(last(sock).text, /Percakapan aktif/);
+
+  await bot.handleMessage(msg({ from: OWNER, text: "/memory" }));
+  assert.match(last(sock).text, /MEMORI GRAD/);
+
+  await bot.handleMessage(msg({ from: OWNER, text: "/reset" }));
+  assert.match(last(sock).text, /seluruh memori/);
+});
+
+test("admin grup dapat mengelola konteks tanpa menjadi owner", async () => {
+  reset(OWNER, [GROUP]);
+  const sock = makeSock({
+    participants: [{ id: `${PLAYER}@s.whatsapp.net`, admin: "admin" }],
+  });
   bot.setSock(sock);
 
   await bot.handleMessage(msg({ text: "/clear" }));
@@ -439,7 +523,116 @@ test("/clear, /memory, dan /reset mengelola konteks grup", async () => {
 
   await bot.handleMessage(msg({ text: "/memory" }));
   assert.match(last(sock).text, /MEMORI GRAD/);
+});
 
-  await bot.handleMessage(msg({ text: "/reset" }));
-  assert.match(last(sock).text, /seluruh memori/);
+test("admin grup mode LID dikenali lewat alias metadata", async () => {
+  reset(OWNER, [GROUP]);
+  const lid = "987654321012345";
+  const sock = makeSock({
+    participants: [{ id: `${lid}@lid`, jid: `${PLAYER}@s.whatsapp.net`, admin: "admin" }],
+  });
+  bot.setSock(sock);
+
+  await bot.handleMessage(msg({
+    text: "/clear",
+    participant: `${lid}@lid`,
+    participantAlt: `${PLAYER}@s.whatsapp.net`,
+  }));
+  assert.match(last(sock).text, /Percakapan aktif/);
+});
+
+test("pesan biasa mode LID memakai nomor jid sebagai identitas", async () => {
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  const lid = "777654321012345";
+  try {
+    reset(OWNER, [GROUP]);
+    const sock = makeSock({
+      participants: [{ id: `${lid}@lid`, jid: `${PLAYER}@s.whatsapp.net`, admin: null }],
+    });
+    bot.setSock(sock);
+
+    await bot.handleMessage(msg({ from: OWNER, text: "/start" }));
+    for (let i = 0; i < 3; i++) {
+      await bot.handleMessage(msg({ text: "pong", participant: `${lid}@lid` }));
+    }
+
+    assert.ok(bot.games.get(GROUP).scores[PLAYER], "skor harus disimpan memakai nomor jid, bukan LID");
+    assert.equal(bot.games.get(GROUP).scores[lid], undefined);
+  } finally {
+    Math.random = originalRandom;
+  }
+});
+
+test("LID tanpa pasangan jid tidak pernah masuk whitelist DM", async () => {
+  const agent = require("../ai/group-agent");
+  const lid = "999654321012345";
+  reset(OWNER, [GROUP]);
+  bot.memoryStore.resetAllMemory();
+  const sock = makeSock({ participants: [] });
+  bot.setSock(sock);
+  const oldDebounce = process.env.AI_DEBOUNCE_MS;
+  process.env.AI_DEBOUNCE_MS = "60000";
+
+  const pending = bot.handleMessage(msg({ text: "halo semuanya", participant: `${lid}@lid` }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bot.memoryStore.canDirectMessage(lid), false);
+  assert.equal(agent.getHistory(GROUP).at(-1).sender_id, "nomor-tidak-diketahui");
+
+  agent.clearConversation(GROUP);
+  await pending;
+  if (oldDebounce === undefined) delete process.env.AI_DEBOUNCE_MS;
+  else process.env.AI_DEBOUNCE_MS = oldDebounce;
+});
+
+test("owner format 08 cocok dengan pengirim format 62", async () => {
+  const localOwner = `0${OWNER.slice(2)}`;
+  reset(localOwner, [GROUP]);
+  const sock = makeSock();
+  bot.setSock(sock);
+
+  await bot.handleMessage(msg({ from: OWNER, text: "/memory" }));
+  assert.match(last(sock).text, /MEMORI GRAD/);
+});
+
+test("owner dapat memberi, melihat, dan mencabut akses veto per grup", async () => {
+  reset(OWNER, [GROUP]);
+  const sock = makeSock();
+  bot.setSock(sock);
+
+  await bot.handleMessage(msg({ from: OWNER, text: `/veto ${PLAYER}` }));
+  assert.match(last(sock).text, /sudah diberikan/);
+  assert.deepEqual(bot.getData().vetoAccess[GROUP], [PLAYER]);
+
+  await bot.handleMessage(msg({ text: "/memory" }));
+  assert.match(last(sock).text, /MEMORI GRAD/);
+
+  await bot.handleMessage(msg({ from: OWNER, text: "/veto list" }));
+  assert.match(last(sock).text, new RegExp(PLAYER));
+
+  await bot.handleMessage(msg({ from: OWNER, text: `/unveto ${PLAYER}` }));
+  assert.match(last(sock).text, /sudah dicabut/);
+
+  await bot.handleMessage(msg({ text: "/clear" }));
+  assert.match(last(sock).text, /owner, admin grup, atau anggota/);
+});
+
+test("veto dari reply LID disimpan sebagai nomor PN peserta", async () => {
+  reset(OWNER, [GROUP]);
+  const lid = "123456789012345";
+  const sock = makeSock({
+    participants: [{ id: `${lid}@lid`, jid: `${PLAYER}@s.whatsapp.net`, admin: null }],
+  });
+  bot.setSock(sock);
+
+  await bot.handleMessage(msg({
+    from: OWNER,
+    text: "/veto",
+    contextInfo: {
+      participant: `${lid}@lid`,
+      quotedMessage: { conversation: "beri aku akses" },
+    },
+  }));
+
+  assert.deepEqual(bot.getData().vetoAccess[GROUP], [PLAYER]);
 });

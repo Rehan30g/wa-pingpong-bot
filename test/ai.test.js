@@ -7,7 +7,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function makeMockAiServer(hangFirstDecision = true) {
   const state = { decisions: [], chatCalls: [] };
-  const mock = { state, decision: { choice: "reply", confidence: 0.9 }, gratitude: { choice: "not_gratitude", confidence: 0.99 } };
+  const mock = {
+    state,
+    decision: { choice: "reply", confidence: 0.9 },
+    gratitude: { choice: "not_gratitude", confidence: 0.99 },
+    reply: "Oke, aku jawab ya.",
+  };
   let releaseFirstDecision;
   const firstDecisionGate = new Promise((resolve) => { releaseFirstDecision = resolve; });
   const server = http.createServer((req, res) => {
@@ -29,7 +34,7 @@ function makeMockAiServer(hangFirstDecision = true) {
       if (req.url === "/api/v1/chat/completions") {
         state.chatCalls.push(JSON.parse(body || "{}"));
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ choices: [{ message: { content: "Oke, aku jawab ya." } }] }));
+        res.end(JSON.stringify({ choices: [{ message: { content: mock.reply } }] }));
         return;
       }
       res.statusCode = 404;
@@ -45,7 +50,14 @@ function makeMockAiServer(hangFirstDecision = true) {
       server.closeAllConnections?.();
       server.close(() => resolve());
     });
-  return { state, releaseFirstDecision, setDecision: (decision) => { mock.decision = decision; }, listen, close };
+  return {
+    state,
+    releaseFirstDecision,
+    setDecision: (decision) => { mock.decision = decision; },
+    setReply: (reply) => { mock.reply = reply; },
+    listen,
+    close,
+  };
 }
 
 function makeAiSock() {
@@ -54,8 +66,8 @@ function makeAiSock() {
   return {
     sent,
     reads,
-    sendMessage: async (jid, content) => {
-      sent.push({ jid, ...content });
+    sendMessage: async (jid, content, options) => {
+      sent.push({ jid, ...content, options });
       return { key: { id: `sent-${sent.length}` } };
     },
     readMessages: async (keys) => reads.push(...keys.map((k) => k.id)),
@@ -101,6 +113,17 @@ test("cleanReply membuang code fence dan membatasi panjang bubble", () => {
   assert.equal(agent.cleanReply("1234567890", 6), "12345…");
 });
 
+test("parseGeneratedReply menerima JSON biasa dan JSON code fence", () => {
+  assert.deepEqual(
+    agent.parseGeneratedReply('{"text":"halo","reply_to_entry_id":12}', 100),
+    { text: "halo", replyToEntryId: 12 },
+  );
+  assert.deepEqual(
+    agent.parseGeneratedReply('```json\n{"text":"standalone","reply_to_entry_id":null}\n```', 100),
+    { text: "standalone", replyToEntryId: null },
+  );
+});
+
 test("riwayat grup terpisah dan dibatasi", () => {
   const oldLimit = process.env.AI_HISTORY_LIMIT;
   process.env.AI_HISTORY_LIMIT = "3";
@@ -118,6 +141,27 @@ test("riwayat grup terpisah dan dibatasi", () => {
   if (oldLimit === undefined) delete process.env.AI_HISTORY_LIMIT;
   else process.env.AI_HISTORY_LIMIT = oldLimit;
   agent.resetHistories();
+});
+
+test("batas compact selalu konsisten dengan kapasitas riwayat", () => {
+  const previous = {
+    AI_HISTORY_LIMIT: process.env.AI_HISTORY_LIMIT,
+    AI_COMPACT_TRIGGER: process.env.AI_COMPACT_TRIGGER,
+    AI_COMPACT_RETAIN: process.env.AI_COMPACT_RETAIN,
+  };
+  process.env.AI_HISTORY_LIMIT = "8";
+  process.env.AI_COMPACT_TRIGGER = "18";
+  process.env.AI_COMPACT_RETAIN = "99";
+
+  const current = agent.config();
+  assert.equal(current.historyLimit, 8);
+  assert.equal(current.compactTrigger, 8);
+  assert.equal(current.compactRetain, 7);
+
+  for (const [key, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 test("prompt GLM meminta gaya singkat tanpa Markdown", () => {
@@ -173,6 +217,45 @@ test("buildChatMessages melampirkan gambar/video sebagai konten multimodal", () 
   assert.equal(typeof plain[1].content, "string", "data URL tidak valid harus diabaikan");
 });
 
+test("media dari percakapan aktif lama ikut dilampirkan ke GLM", () => {
+  agent.resetHistories();
+  agent.remember("history-media", {
+    sender: "Ani",
+    senderId: "+6281111",
+    text: "ini gambar errornya",
+    hasImage: true,
+    media: { type: "image", dataUrl: "data:image/jpeg;base64,TEFNQQ==" },
+  });
+
+  const messages = agent.buildChatMessages({
+    groupId: "history-media",
+    latestMessage: { sender: "Budi", sender_id: "+6282222", text: "menurutmu kenapa?" },
+    quotedText: "",
+  });
+  assert.ok(Array.isArray(messages[1].content));
+  assert.ok(messages[1].content.some((part) => part.type === "image_url" && part.image_url.url.includes("TEFNQQ==")));
+  assert.ok(messages[1].content.some((part) => part.type === "text" && /Media lama dari Ani/.test(part.text)));
+});
+
+test("jumlah media aktif yang disimpan mengikuti AI_HISTORY_MEDIA_LIMIT", () => {
+  const previous = process.env.AI_HISTORY_MEDIA_LIMIT;
+  process.env.AI_HISTORY_MEDIA_LIMIT = "2";
+  agent.resetHistories();
+  for (let index = 1; index <= 3; index++) {
+    agent.remember("media-limit", {
+      sender: "Ani",
+      text: `gambar ${index}`,
+      hasImage: true,
+      media: { type: "image", dataUrl: `data:image/jpeg;base64,${index}` },
+    });
+  }
+  assert.equal(agent.getHistory("media-limit").filter((item) => item.media).length, 2);
+  assert.equal(agent.getHistory("media-limit")[0].has_image, true, "penanda media lama tetap dipertahankan");
+  if (previous === undefined) delete process.env.AI_HISTORY_MEDIA_LIMIT;
+  else process.env.AI_HISTORY_MEDIA_LIMIT = previous;
+  agent.resetHistories();
+});
+
 test("processGroupMessage mengirim media ke GLM dan sinyal ke Jev", async () => {
   await withMockAiServer(async (mock) => {
     const sock = makeAiSock();
@@ -226,6 +309,98 @@ test("processGroupMessage mengirim video_url ke GLM", async () => {
     const content = mock.state.chatCalls[0].messages.at(-1).content;
     assert.ok(Array.isArray(content), "request GLM harus membawa video");
     assert.equal(content[1].type, "video_url");
+  }, false);
+});
+
+test("Jev menerima perbedaan stiker, GIF, dan lampiran", async () => {
+  await withMockAiServer(async (mock) => {
+    const sock = makeAiSock();
+    await agent.processGroupMessage({
+      sock,
+      message: aiMessage("sticker-kind"),
+      groupId: "sticker-kind@g.us",
+      senderId: "+6281111",
+      senderName: "Ani",
+      text: "[mengirim stiker]",
+      explicitMention: false,
+      replyToBot: false,
+      quotedText: "",
+      media: { type: "video", kind: "sticker", format: "gif", dataUrl: "data:video/mp4;base64,QUJD" },
+    });
+    const signals = mock.state.decisions[0].state.signals;
+    assert.equal(signals.media_kind, "sticker");
+    assert.equal(signals.media_format, "gif");
+    assert.equal(signals.is_sticker, true);
+    assert.equal(signals.is_attachment, false);
+    assert.equal(signals.is_gif, true);
+  }, false);
+});
+
+test("GLM dapat memilih pesan lama untuk di-reply atau mengirim standalone", async () => {
+  await withMockAiServer(async (mock) => {
+    const sock = makeAiSock();
+    mock.setReply(JSON.stringify({ text: "Jawaban pertama", reply_to_entry_id: null }));
+    await agent.processGroupMessage({
+      sock,
+      message: aiMessage("select-1"),
+      groupId: "select-reply@g.us",
+      senderId: "+6281111",
+      senderName: "Ani",
+      text: "pertanyaan awal",
+      explicitMention: true,
+      replyToBot: false,
+      quotedText: "",
+    });
+    const target = agent.getHistory("select-reply@g.us").find((item) => item.text === "pertanyaan awal");
+    assert.equal(sock.sent[0].options, undefined, "null harus dikirim tanpa quote");
+
+    mock.setReply(JSON.stringify({ text: "Aku jawab yang awal", reply_to_entry_id: target.entry_id }));
+    const secondMessage = { key: { id: "select-2", remoteJid: "select-reply@g.us" }, message: { conversation: "lanjut" } };
+    await agent.processGroupMessage({
+      sock,
+      message: secondMessage,
+      groupId: "select-reply@g.us",
+      senderId: "+6282222",
+      senderName: "Budi",
+      text: "lanjut",
+      explicitMention: true,
+      replyToBot: false,
+      quotedText: "",
+    });
+    assert.equal(sock.sent[1].options.quoted.key.id, "select-1");
+  }, false);
+});
+
+test("processGroupMessage mengirim ulang gambar lama saat membalas pesan berikutnya", async () => {
+  await withMockAiServer(async (mock) => {
+    const sock = makeAiSock();
+    await agent.processGroupMessage({
+      sock,
+      message: aiMessage("old-img"),
+      groupId: "old-image@g.us",
+      senderId: "+6281111",
+      senderName: "Ani",
+      text: "lihat error ini",
+      explicitMention: true,
+      replyToBot: false,
+      quotedText: "",
+      media: { type: "image", dataUrl: "data:image/jpeg;base64,R0FNQkFS" },
+    });
+    await agent.processGroupMessage({
+      sock,
+      message: aiMessage("followup-img"),
+      groupId: "old-image@g.us",
+      senderId: "+6281111",
+      senderName: "Ani",
+      text: "jadi penyebabnya apa?",
+      explicitMention: true,
+      replyToBot: false,
+      quotedText: "",
+    });
+
+    const followupContent = mock.state.chatCalls[1].messages.at(-1).content;
+    assert.ok(Array.isArray(followupContent));
+    assert.ok(followupContent.some((part) => part.type === "image_url" && part.image_url.url.includes("R0FNQkFS")));
   }, false);
 });
 
@@ -329,6 +504,55 @@ test("pesan saat evaluasi berjalan mengantri dan tetap diproses, tidak dibatalka
       "read receipt dikirim saat Jev merespons tiap pesan",
     );
     assert.equal(mock.state.decisions.length, 2);
+    const firstReplyContent = mock.state.chatCalls[0].messages.at(-1).content;
+    const firstReplyText = Array.isArray(firstReplyContent)
+      ? firstReplyContent.find((part) => part.type === "text")?.text || ""
+      : firstReplyContent;
+    assert.doesNotMatch(
+      firstReplyText,
+      /pertanyaan dua/,
+      "GLM untuk pesan pertama tidak boleh melihat pesan yang datang setelah evaluasi dimulai",
+    );
+  });
+});
+
+test("clear membatalkan evaluasi aktif dan antrean lama", async () => {
+  await withMockAiServer(async (mock) => {
+    const sock = makeAiSock();
+    const groupId = "clear-race@g.us";
+    const p1 = agent.processGroupMessage({
+      sock,
+      message: aiMessage("clear-1"),
+      groupId,
+      senderId: "+6281111",
+      senderName: "Ani",
+      text: "pesan lama satu",
+      explicitMention: true,
+      replyToBot: false,
+      quotedText: "",
+    });
+    await sleep(150);
+    const p2 = agent.processGroupMessage({
+      sock,
+      message: aiMessage("clear-2"),
+      groupId,
+      senderId: "+6282222",
+      senderName: "Budi",
+      text: "pesan lama dua",
+      explicitMention: true,
+      replyToBot: false,
+      quotedText: "",
+    });
+    await sleep(150);
+
+    agent.clearConversation(groupId);
+    mock.releaseFirstDecision();
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    assert.equal(r1.action, "superseded");
+    assert.equal(r2.action, "superseded");
+    assert.equal(sock.sent.length, 0, "evaluasi dari konteks sebelum clear tidak boleh membalas");
+    assert.equal(mock.state.chatCalls.length, 0, "GLM tidak boleh dijalankan untuk konteks yang sudah dihapus");
   });
 });
 

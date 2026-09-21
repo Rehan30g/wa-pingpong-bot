@@ -5,10 +5,11 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/bot.test.js test/ai.test.js",
+    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js",
     "simulate:ai": "node scripts/simulate-ai.js",
     "simulate:burst": "node scripts/simulate-burst.js",
-    "simulate:memory": "node scripts/simulate-memory.js"
+    "simulate:memory": "node scripts/simulate-memory.js",
+    "simulate:dm": "node scripts/simulate-dm.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.24",

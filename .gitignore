@@ -4,7 +4,14 @@ auth/
 data.json
 ai-memory.json
 ai-memory.json.tmp
+agent-jobs.json
+agent-jobs.json.tmp
 test/data.json
 test/ai-memory.json
 test/ai-memory.json.tmp
+test/ai-memory-agent.json
+test/ai-memory-agent.json.tmp
+test/agent-jobs.json
+test/agent-jobs.json.tmp
+test/data-agent.json
 npm-debug.log*

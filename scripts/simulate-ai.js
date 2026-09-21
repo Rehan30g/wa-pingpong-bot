@@ -156,7 +156,9 @@ async function runScenario(scenario, index) {
     (decision.action === "ignore" && directlyAddressed);
   if (shouldReply) {
     execution = "JAWAB";
-    reply = await agent.generateReply({ groupId, latestMessage, quotedText: scenario.quotedText || "" });
+    const generated = await agent.generateReply({ groupId, latestMessage, quotedText: scenario.quotedText || "" });
+    reply = generated.text;
+    execution += generated.replyToEntryId == null ? " (standalone)" : ` (reply #${generated.replyToEntryId})`;
   } else if (
     reactionMap[decision.action] &&
     (decision.confidence >= cfg.reactConfidence || (directlyAddressed && decision.confidence >= cfg.directReactConfidence))

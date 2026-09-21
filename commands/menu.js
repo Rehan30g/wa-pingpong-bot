@@ -16,9 +16,6 @@ module.exports = {
       "/react <emoji> — react ke pesan yang di-reply",
       "/qr <teks> — generate QR code jadi gambar",
       "/s (reply gambar) — ubah gambar jadi stiker",
-      "/memory — lihat memori dan konteks Grad",
-      "/clear — hapus percakapan aktif, pertahankan memori",
-      "/reset — hapus percakapan dan seluruh memori grup",
       "",
       "👑 *Admin/Owner*",
       "/owner — info owner",
@@ -26,6 +23,12 @@ module.exports = {
       "/reboot — restart bot",
       "/allow — izinkan grup",
       "/deny — tolak grup",
+      "/memory — lihat memori dan konteks Grad",
+      "/clear — hapus percakapan aktif, pertahankan memori",
+      "/reset — hapus percakapan dan seluruh memori grup",
+      "/veto (reply/nomor) — beri akses pengelola (owner)",
+      "/unveto (reply/nomor) — cabut akses pengelola (owner)",
+      "/veto list — lihat daftar akses veto",
     ].join("\n");
 
     await sock.sendMessage(jid, { text: menu });
