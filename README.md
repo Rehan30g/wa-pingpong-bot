@@ -26,7 +26,11 @@ Pesan grup -> Jev -> diam / reaction / reply -> GLM 5.3 Flash (hanya untuk reply
 
 Jika Jev gagal, bot hanya mencoba menjawab bila pesan me-mention bot atau merupakan reply ke pesan bot. Jika GLM gagal, bot tidak mengirim jawaban palsu.
 
-Gambar, GIF, video, dan stiker (langsung atau dikutip/reply) diunduh sebagai data URL dan dikirim ke GLM sebagai konten multimodal (`image_url`/`video_url`). Media terbaru dari percakapan aktif juga dikirim kembali pada request berikutnya; jumlahnya dibatasi `AI_HISTORY_MEDIA_LIMIT` (default 4). Jev menerima `media_kind`, `media_format`, `is_sticker`, `is_attachment`, dan `is_gif`, sehingga reaction sticker/GIF dapat dibedakan dari lampiran yang perlu dianalisis. Batas ukuran tiap media diatur `AI_MAX_MEDIA_MB` (default 20 MB).
+Gambar, GIF, dan stiker (langsung atau dikutip/reply) dikirim sebagai `image_url`. Video dikonversi menjadi satu frame JPEG dengan ffmpeg; jika ffmpeg tidak tersedia atau konversi gagal, bot hanya memakai metadata dan tidak mengklaim telah menonton video. Video base64 tidak dikirim ke OpenRouter. Media aktif terbaru dibatasi `AI_HISTORY_MEDIA_LIMIT` (default 4). Jev menerima klasifikasi media; ukuran unduhan dibatasi `AI_MAX_MEDIA_MB` (default 20 MB).
+
+Runtime agen memiliki `web_search`, `web_fetch`, `fetch_media_from_url`, `fetch_media_from_message`, `make_sticker`, dan `send_asset` yang nonaktif secara default. Owner mengaktifkan flag masing-masing di `.env`; dua capability URL juga memerlukan allowlist hostname HTTPS. `/task cari web <query>` mencari informasi publik lewat OpenRouter dengan sitasi sumber; query yang tampak mengandung rahasia/data pribadi ditolak. Perintah `/task media` membaca gambar pada pesan sumber atau kutipannya; `/task stiker` membuat asset WebP 512×512; `/task kirim stiker` mengantrekan pengiriman ke chat asal melalui outbox. Task pengiriman tetap `verifying` sampai receipt transport diterima, dan menjadi `delivery_uncertain` bila proses terputus setelah send. Asset dibatasi scope chat/task dan TTL; shadow memakai root terpisah.
+
+Gate lokal otomatis Fase 4 lulus; kuota egress tersimpan di SQLite, gambar diverifikasi dengan decode terpisah, dan mock transport telah menguji receipt serta pemulihan crash. Ini belum mencakup uji WhatsApp langsung oleh pengguna atau izin rollout. Lihat [`PHASE4_MEDIA_WEB_REPORT.md`](./docs/overhaul/PHASE4_MEDIA_WEB_REPORT.md) untuk batas bukti dan hasil tes.
 
 Rencana capability file/media/storage/Python tersedia di [`Plan.md`](./Plan.md). Scaffolding nonaktif-by-default berada di `ai/capabilities/`.
 
@@ -48,3 +52,11 @@ Di chat pribadi, mekaniknya berbeda: karena pesan jelas ditujukan ke bot, Grad m
 ```bash
 npm test
 ```
+
+## Demo agen tanpa WhatsApp
+
+Jalankan `npm run agent:headless` untuk mencoba `/task catat`, `/task baca`, dan `/task ringkas` di terminal. Ini memakai API GLM asli, SQLite sementara di direktori temp, dan mode shadow tanpa socket WhatsApp. Ketik `/exit` untuk menutup sesi; data demo dihapus. Untuk satu tugas: `npm run agent:headless -- --once "/task catat: Rapat Jumat jam 9 WIT"`. Siapkan `OPENROUTER_API_KEY` seperti simulasi lain; key tidak dicetak. Demo ini terpisah dari `RUNTIME_ENGINE_MODE` bot WhatsApp.
+
+# Status overhaul AI Agent
+
+Runtime produksi tetap `legacy`. Gate lokal Fase 0–5 sudah dilaporkan; Fase 6 `run_python` sengaja tidak disertakan karena sandbox container belum teruji. Fase 7 belum lulus shadow/canary WhatsApp. Semua laporan overhaul ada di [`docs/overhaul/`](./docs/overhaul/): [`STATUS_OVERHAUL.md`](./docs/overhaul/STATUS_OVERHAUL.md), [`PHASE5_MEMORY_PROACTIVE_REPORT.md`](./docs/overhaul/PHASE5_MEMORY_PROACTIVE_REPORT.md), [`PHASE6_SANDBOX_DECISION.md`](./docs/overhaul/PHASE6_SANDBOX_DECISION.md), dan [`PHASE7_RELEASE_GATE_REPORT.md`](./docs/overhaul/PHASE7_RELEASE_GATE_REPORT.md). Jalankan `npm run evaluate:release` untuk evaluasi 60 skenario lokal; hasilnya tidak mengaktifkan rilis.

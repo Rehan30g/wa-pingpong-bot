@@ -1,9 +1,14 @@
-process.env.BOT_DATA_FILE = "./test/data.json";
-process.env.AI_MEMORY_FILE = "./test/ai-memory.json";
+const { setupIsolatedTestEnv } = require("./helpers/test-env");
+const { cleanup } = setupIsolatedTestEnv("wa-test-bot-");
+
 const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("fs");
 const bot = require("../index.js");
+
+test.after(() => {
+  cleanup();
+});
 
 const GROUP = "120363000000000@g.us";
 const OWNER = "628111111111";
@@ -59,6 +64,16 @@ const reset = (owner = null, groups = []) => {
   bot.games.clear();
 };
 
+test("/task yang tidak tersedia dijawab jujur di DM dan grup yang diizinkan", async () => {
+  reset(OWNER, [GROUP]);
+  const sock = makeSock();
+  bot.setSock(sock);
+  await bot.dispatchInboundMessage(msg({ chat: `${OWNER}@s.whatsapp.net`, from: OWNER, text: "/task Ramat Jumat jam 9 WIT" }), { sock });
+  await bot.dispatchInboundMessage(msg({ text: "/task baca" }), { sock });
+  assert.equal(sock.sent.length, 2);
+  for (const sent of sock.sent) assert.match(sent.text, /Tidak ada catatan atau pengingat yang dibuat/);
+});
+
 test("/verify membuat kode dan menunggu input terminal", async () => {
   reset();
   const sock = makeSock();
@@ -91,7 +106,7 @@ test("kode salah ditolak, owner belum diset", async () => {
   assert.equal(bot.getData().owner, PLAYER);
   assert.equal(bot.getPendingVerify(), null);
   assert.ok(sock.sent.some((s) => s.text.includes("Verifikasi berhasil")));
-  assert.ok(JSON.parse(fs.readFileSync("./test/data.json", "utf8")).owner === PLAYER, "owner tersimpan di file");
+  assert.ok(JSON.parse(fs.readFileSync(process.env.BOT_DATA_FILE, "utf8")).owner === PLAYER, "owner tersimpan di file");
 });
 
 test("input tanpa sesi verifikasi -> ditolak", async () => {
@@ -131,7 +146,7 @@ test("/allow oleh owner di grup mengaktifkan bot", async () => {
   await bot.handleMessage(msg({ from: OWNER, text: "/allow" }));
   assert.ok(bot.getData().allowedGroups.includes(GROUP));
   assert.match(last(sock).text, /AKTIF/);
-  assert.ok(JSON.parse(fs.readFileSync("./test/data.json", "utf8")).allowedGroups.includes(GROUP));
+  assert.ok(JSON.parse(fs.readFileSync(process.env.BOT_DATA_FILE, "utf8")).allowedGroups.includes(GROUP));
 });
 
 test("pesan diabaikan di grup yang belum di-allow", async () => {

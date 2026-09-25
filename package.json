@@ -5,14 +5,20 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js",
+    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js test/foundation.test.js test/runtime-storage.test.js test/runtime-recovery.test.js test/runtime-lifecycle.test.js test/autonomous-task-loop.test.js test/media-web.test.js test/web-search.test.js test/headless-agent.test.js",
     "simulate:ai": "node scripts/simulate-ai.js",
     "simulate:burst": "node scripts/simulate-burst.js",
     "simulate:memory": "node scripts/simulate-memory.js",
-    "simulate:dm": "node scripts/simulate-dm.js"
+    "simulate:dm": "node scripts/simulate-dm.js",
+    "simulate:replan": "node scripts/simulate-replan.js",
+    "simulate:web-search": "node scripts/simulate-web-search.js",
+    "evaluate:release": "node scripts/evaluate-release.js",
+    "agent:headless": "node scripts/headless-agent.js"
   },
   "dependencies": {
+    "@libsql/client": "0.18.0",
     "@whiskeysockets/baileys": "^6.7.24",
+    "ajv": "^8.20.0",
     "axios": "^1.20.0",
     "dotenv": "^18.0.1",
     "https-proxy-agent": "^9.1.0",

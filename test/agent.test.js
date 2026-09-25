@@ -1,11 +1,15 @@
-process.env.AI_MEMORY_FILE = "./test/ai-memory-agent.json";
-process.env.AGENT_JOBS_FILE = "./test/agent-jobs.json";
-process.env.BOT_DATA_FILE = "./test/data-agent.json";
+const { setupIsolatedTestEnv } = require("./helpers/test-env");
+const { cleanup, memoryFile } = setupIsolatedTestEnv("wa-test-agent-");
 process.env.AI_HUMAN_DELAY_SCALE = "0";
 
 const test = require("node:test");
 const assert = require("node:assert");
 const http = require("node:http");
+const fs = require("node:fs");
+
+test.after(() => {
+  cleanup();
+});
 
 const memoryStore = require("../ai/memory-store");
 const humanize = require("../ai/humanize");
@@ -105,6 +109,20 @@ function dmArgs(sock, text, extra = {}) {
   };
 }
 
+test("DM tidak mengaku menjadwalkan pengingat jika waktu tidak jelas", async () => {
+  await withMock(async (mock) => {
+    memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP });
+    memoryStore.setDmMemory(PHONE, { opt_out: false });
+    mock.mock.intent = { choice: "reminder", confidence: 0.95 };
+    mock.mock.reply = "Sudah kuingatkan nanti ya";
+    const sock = makeSock();
+    const result = await directAgent.processDirectMessage(dmArgs(sock, "ingatkan aku rapat nanti"));
+    assert.equal(result.action, "reminder_not_scheduled");
+    assert.match(sock.sent[0].text, /belum bisa menjadwalkannya/);
+    assert.equal(mock.state.chat.length, 0);
+  });
+});
+
 test("memori lama (v1) dimigrasi ke skema v2", () => {
   const migrated = memoryStore.migrate({ groups: { [GROUP]: { glm: "lama", jev: "j", compact_log: ["t"] } } });
   assert.equal(migrated.version, 2);
@@ -112,6 +130,25 @@ test("memori lama (v1) dimigrasi ke skema v2", () => {
   assert.deepEqual(migrated.relationships, {});
   assert.equal(migrated.groups[GROUP].glm, "lama");
   assert.deepEqual(migrated.groups[GROUP].compact_log, ["t"]);
+});
+
+test("migrasi v2 tanpa provenance tetap privat dan tidak masuk konteks chat lain", () => {
+  const legacy = memoryStore.migrate({ version: 2, people: { [PHONE]: { name: "Rehan", profile: "rahasia lama", relation: "pribadi", groups: [GROUP], dm: { glm: "DM rahasia", proactive_consent: false } } }, relationships: { [`person:${PHONE}|person:${OTHER}`]: { summary: "relasi lama" } } });
+  assert.equal(legacy.people[PHONE].legacy_profile_scope, "legacy_private");
+  assert.equal(legacy.people[PHONE].scoped_profiles[GROUP], undefined);
+  assert.equal(legacy.relationships[`person:${PHONE}|person:${OTHER}`].legacy_scope, "legacy_private");
+  assert.deepEqual(legacy.relationships[`person:${PHONE}|person:${OTHER}`].scoped_summaries, {});
+  memoryStore.resetAllMemory();
+  memoryStore.upsertPersonProfile(PHONE, { profile: "profil baru DM", sourceChatId: `${PHONE}@s.whatsapp.net` });
+  assert.equal(memoryStore.getPersonForChat(PHONE, GROUP).profile, "");
+  assert.equal(memoryStore.getPersonForChat(PHONE, `${PHONE}@s.whatsapp.net`).profile, "profil baru DM");
+  fs.writeFileSync(memoryFile, JSON.stringify({ version: 2, people: { [PHONE]: { name: "Rehan", profile: "rahasia lama", groups: [GROUP], dm: { glm: "DM rahasia" } } }, relationships: { [`person:${PHONE}|person:${OTHER}`]: { summary: "relasi lama" } } }), { mode: 0o600 });
+  memoryStore.reload(memoryFile);
+  assert.equal(memoryStore.getPersonForChat(PHONE, `${PHONE}@s.whatsapp.net`).profile, "");
+  assert.equal(memoryStore.getPersonForChat(PHONE, GROUP).profile, "");
+  assert.equal(memoryStore.getDmMemory(PHONE).glm, "DM rahasia");
+  assert.equal(memoryStore.getRelationshipForChat(PHONE, OTHER, GROUP), null);
+  memoryStore.resetAllMemory();
 });
 
 test("registry orang: DM hanya diizinkan setelah pernah chat di grup", () => {
@@ -137,6 +174,20 @@ test("profil orang dan hubungan disimpan terpisah dari memori grup", () => {
   assert.equal(memoryStore.getRelationship(OTHER, PHONE).summary, "sahabat");
   assert.equal(memoryStore.getGroupMemory(GROUP).glm, "memori grup");
   assert.equal(memoryStore.getDmMemory(PHONE).glm, "Belum ada memori DM.");
+});
+
+test("reset grup membuang profil dengan provenance grup itu saja", () => {
+  memoryStore.resetAllMemory();
+  const otherGroup = "other-profile@g.us";
+  memoryStore.upsertPersonProfile(PHONE, { profile: "fakta grup A", sourceChatId: GROUP });
+  memoryStore.upsertPersonProfile(PHONE, { profile: "fakta grup B", sourceChatId: otherGroup });
+  memoryStore.setRelationship(PHONE, OTHER, { summary: "relasi grup A", sourceChatId: GROUP });
+  memoryStore.setRelationship(PHONE, OTHER, { summary: "relasi grup B", sourceChatId: otherGroup });
+  groupAgent.resetGroupContext(GROUP);
+  assert.equal(memoryStore.getPersonForChat(PHONE, GROUP).profile, "");
+  assert.equal(memoryStore.getPersonForChat(PHONE, otherGroup).profile, "fakta grup B");
+  assert.equal(memoryStore.getRelationshipForChat(PHONE, OTHER, GROUP), null);
+  assert.equal(memoryStore.getRelationshipForChat(PHONE, OTHER, otherGroup).summary, "relasi grup B");
 });
 
 test("merge profil dan hubungan tidak menghapus memori lama", () => {
@@ -303,7 +354,13 @@ test("gerbang DM proaktif: whitelist, jam tenang, dan batas harian", () => {
 
   assert.equal(scheduler.canProactivelyMessage(PHONE, busyAt), false, "belum dikenal");
   memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP, at: groupAgent.witTimestamp() });
+  assert.equal(scheduler.canProactivelyMessage(PHONE, busyAt), false, "tanpa persetujuan proaktif");
+  memoryStore.setDmMemory(PHONE, { proactive_consent: true, proactive_consent_at: Date.now(), proactive_consent_source: "test_opt_in" });
   assert.equal(scheduler.canProactivelyMessage(PHONE, busyAt), true);
+  memoryStore.setDmMemory(PHONE, { last_user_dm_at: busyAt - 1_000 });
+  assert.equal(scheduler.canProactivelyMessage(PHONE, busyAt), false, "percakapan DM aktif menekan check-in");
+  memoryStore.setDmMemory(PHONE, { last_user_dm_at: busyAt - 3_600_001 });
+  assert.equal(scheduler.canProactivelyMessage(PHONE, busyAt), true, "cooldown human takeover selesai");
   assert.equal(scheduler.isRecentlyActive(PHONE, Date.now()), true);
 
   const quietAt = humanize.witEpochAt(23, 0);
@@ -311,6 +368,10 @@ test("gerbang DM proaktif: whitelist, jam tenang, dan batas harian", () => {
 
   process.env.AI_AGENT_DAILY_PROACTIVE_LIMIT = "0";
   assert.equal(scheduler.canProactivelyMessage(PHONE, busyAt), false, "batas harian");
+
+  memoryStore.setDmMemory(PHONE, { opt_out: true });
+  assert.equal(memoryStore.getDmMemory(PHONE).proactive_consent, false, "opt-out mencabut standing permission");
+  assert.equal(memoryStore.getDmMemory(PHONE).proactive_consent_at, null);
 
   for (const [key, value] of Object.entries({ AI_AGENT_QUIET_START: oldQuiet.start, AI_AGENT_QUIET_END: oldQuiet.end, AI_AGENT_DAILY_PROACTIVE_LIMIT: oldQuiet.limit, AI_AGENT_PROACTIVE: oldQuiet.proactive })) {
     if (value === undefined) delete process.env[key];
@@ -338,6 +399,7 @@ test("job reminder terkirim walau DM proaktif dimatikan", async () => {
 test("job proactive_checkin memakai gerbang aman dan mencatat kuota", async () => {
   await withMock(async (mock) => {
     memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP, at: groupAgent.witTimestamp() });
+    memoryStore.setDmMemory(PHONE, { proactive_consent: true, proactive_consent_at: Date.now(), proactive_consent_source: "test_opt_in" });
     mock.mock.reply = "Hai, apa kabar? Semoga harimu lancar.";
     const oldQuiet = { start: process.env.AI_AGENT_QUIET_START, end: process.env.AI_AGENT_QUIET_END, limit: process.env.AI_AGENT_DAILY_PROACTIVE_LIMIT, proactive: process.env.AI_AGENT_PROACTIVE };
     process.env.AI_AGENT_QUIET_START = "22";
@@ -369,4 +431,18 @@ test("job untuk nomor di luar whitelist diblokir", async () => {
     assert.equal(results[0].status, "blocked");
     assert.equal(sock.sent.length, 0);
   });
+});
+
+test("profil legacy dan profil grup lain tidak masuk konteks DM", () => {
+  memoryStore.resetAllMemory();
+  memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP, at: groupAgent.witTimestamp() });
+  memoryStore.upsertPersonProfile(PHONE, { profile: "Rahasia grup A", sourceChatId: GROUP });
+  assert.equal(memoryStore.getPersonForChat(PHONE, `${PHONE}@s.whatsapp.net`).profile, "");
+  assert.equal(memoryStore.getPersonForChat(PHONE, GROUP).profile, "Rahasia grup A");
+  memoryStore.upsertPersonProfile(PHONE, { profile: "Preferensi di DM", sourceChatId: `${PHONE}@s.whatsapp.net` });
+  assert.equal(memoryStore.getPersonForChat(PHONE, `${PHONE}@s.whatsapp.net`).profile, "Preferensi di DM");
+  assert.equal(memoryStore.getPersonForChat(PHONE, GROUP).profile, "Rahasia grup A");
+  const migrated = memoryStore.migrate({ people: { [OTHER]: { profile: "Memori lama tanpa sumber", groups: [GROUP] } } });
+  assert.equal(migrated.people[OTHER].legacy_profile_scope, "legacy_private");
+  memoryStore.resetAllMemory();
 });

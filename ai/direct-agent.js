@@ -1,6 +1,8 @@
 const groupAgent = require("./group-agent");
 const memoryStore = require("./memory-store");
 const humanize = require("./humanize");
+const { createJevClient } = require("./providers/jev-client");
+const { createGlmClient } = require("./providers/glm-client");
 
 const DM_PREFIX = "dm:";
 const dmPending = new Map();
@@ -49,7 +51,7 @@ function witNow() {
 }
 
 function personContext(phone) {
-  const person = memoryStore.getPerson(phone) || {};
+  const person = memoryStore.getPersonForChat(phone, phoneJid(phone)) || {};
   const dm = memoryStore.getDmMemory(phone);
   return { person, dm };
 }
@@ -94,9 +96,16 @@ async function decideDirectAction({ phone, latestMessage, quotedText, media, his
     latest_message: latestMessage,
   };
 
-  const response = await groupAgent.httpClient().post("/api/alpha/decisions", {
+  const jev = createJevClient({
     model: cfg.jevModel,
-    session_id: `wa-dm-${phone}`.slice(0, 256),
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    baseURL: process.env.OPENROUTER_BASE_URL,
+  });
+
+  const response = await jev.decide({
+    model: cfg.jevModel,
+    sessionId: `wa-dm-${phone}`.slice(0, 256),
     state,
     questions: {
       action: {
@@ -142,8 +151,8 @@ async function decideDirectAction({ phone, latestMessage, quotedText, media, his
     user: phone,
   });
 
-  const action = response.data?.answers?.action;
-  const intent = response.data?.answers?.intent;
+  const action = response.answers?.action;
+  const intent = response.answers?.intent;
   return {
     action: action?.choice || "reply",
     confidence: groupAgent.choiceConfidence(action),
@@ -179,7 +188,13 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
     conversation ? `Percakapan terakhir:\n${conversation}` : "(belum ada konteks)",
     quotedText ? `Pesan yang dibalas: ${quotedText}` : "",
     `Pesan terbaru dari ${latestMessage.sender}: ${latestMessage.text}`,
-    mediaPart ? "Ada media terlampir dari pengguna; pertimbangkan isinya." : "",
+    mediaPart
+      ? (media?.type === "video"
+        ? "Satu frame dari video pengguna terlampir. Jelaskan hanya yang terlihat pada frame; jangan mengklaim telah menonton seluruh video."
+        : "Ada media terlampir dari pengguna; pertimbangkan isinya.")
+      : (media?.type === "video"
+        ? "Ada video terlampir dari pengguna, namun isi visual video belum dianalisis. Jangan mengklaim telah menonton video tersebut."
+        : ""),
     mediaPart ? `Klasifikasi media terbaru: ${media.kind || "attachment"}/${media.format || media.type}.` : "",
     "Pilih reply_to_entry_id dari nomor # jika perlu mengutip pesan tertentu, atau null untuk chat biasa tanpa kutipan.",
     "Jangan otomatis mengutip pesan terbaru.",
@@ -194,9 +209,11 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
         "Gunakan bahasa yang sama dengan pengguna; bila campuran, pakai bahasa Indonesia santai dan sopan.",
         "Jangan gunakan Markdown, heading, tabel, atau code fence.",
         "Biasanya satu atau dua kalimat pendek saja. Jangan bertele-tele.",
+        "Hindari emoji yang tidak perlu atau berlebihan; gunakan gaya percakapan teks santai dan bersahaja.",
         "Jangan mengaku manusia atau punya tubuh/perasaan; jangan membahas proses internal atau model AI.",
         "Jangan pernah menawarkan atau melakukan penyebaran pesan ke banyak orang, broadcast, atau forward. Kalau diminta, tolak singkat dan tawarkan bantu susun pesannya agar pengguna kirim sendiri.",
-        "Jika pengguna meminta reminder dengan waktu yang jelas, scheduler lokal menanganinya; konfirmasi singkat bahwa pengingat sudah dijadwalkan dan jangan mengaku tidak bisa mengingatkan.",
+        "Jangan mengaku telah mencatat atau menjadwalkan pengingat kecuali sistem sudah memastikan penyimpanannya berhasil.",
+        "Jika pengguna mengirim video, jangan mengaku telah menonton isinya; sampaikan secara wajar bahwa isi visual video belum dapat dianalisis pada fase ini.",
         "Boleh menyapa balik dan menanyakan kabar secara wajar, tetapi jangan memaksa topik.",
         `Jawaban maksimum ${cfg.maxReplyChars} karakter.`,
       ].join(" "),
@@ -216,10 +233,19 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
 
 async function generateDirectReply(args) {
   const cfg = dmConfig();
-  const response = await groupAgent.httpClient().post("/api/v1/chat/completions", {
+  const glm = createGlmClient({
+    model: cfg.chatModel,
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    baseURL: process.env.OPENROUTER_BASE_URL,
+    reasoningEffort: cfg.reasoningEffort,
+    supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
+  });
+
+  const response = await glm.chatCompletion({
     model: cfg.chatModel,
     messages: buildDirectMessages(args),
-    response_format: {
+    responseFormat: {
       type: "json_schema",
       json_schema: {
         name: "whatsapp_direct_reply",
@@ -235,18 +261,27 @@ async function generateDirectReply(args) {
         },
       },
     },
-    max_tokens: 160,
+    maxTokens: 160,
     temperature: 0.4,
-    reasoning: { effort: cfg.reasoningEffort, exclude: true },
+    reasoningEffort: cfg.reasoningEffort,
+    supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
   });
-  return groupAgent.parseGeneratedReply(response.data?.choices?.[0]?.message?.content, cfg.maxReplyChars);
+  return groupAgent.parseGeneratedReply(response.text, cfg.maxReplyChars);
 }
 
 async function generateProactive(phone, { reason = "menyapa" } = {}) {
   const cfg = dmConfig();
   const { person, dm } = personContext(phone);
   const profile = [person.profile, person.relation].filter(Boolean).join("\n");
-  const response = await groupAgent.httpClient().post("/api/v1/chat/completions", {
+  const glm = createGlmClient({
+    model: cfg.chatModel,
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    baseURL: process.env.OPENROUTER_BASE_URL,
+    reasoningEffort: cfg.reasoningEffort,
+  });
+
+  const response = await glm.chatCompletion({
     model: cfg.chatModel,
     messages: [
       {
@@ -270,11 +305,12 @@ async function generateProactive(phone, { reason = "menyapa" } = {}) {
         ].filter(Boolean).join("\n"),
       },
     ],
-    max_tokens: 120,
-    temperature: 0.6,
-    reasoning: { effort: cfg.reasoningEffort, exclude: true },
+    maxTokens: 100,
+    temperature: 0.5,
+    reasoningEffort: cfg.reasoningEffort,
   });
-  return groupAgent.cleanReply(response.data?.choices?.[0]?.message?.content, 160);
+
+  return groupAgent.cleanReply(response.text, 160);
 }
 
 async function deliverDirect(sock, jid, text, { message, cfg, split = true } = {}) {
@@ -337,22 +373,32 @@ async function evaluateDirectMessage(
     return { action: "opt_out", decision };
   }
   if (intent === "opt_in" || humanize.detectOptIn(text)) {
-    memoryStore.setDmMemory(phone, { opt_out: false });
+    memoryStore.setDmMemory(phone, { opt_out: false, proactive_consent: true, proactive_consent_at: Date.now(), proactive_consent_source: "dm_opt_in" });
   }
 
   if (intent === "reminder") {
     const reminder = humanize.parseReminderRequest(text);
+    let scheduled = false;
+    let response = "Aku belum bisa menjadwalkannya. Sebutkan waktu yang jelas, misalnya: ingetin aku besok jam 9 WIT untuk rapat.";
     if (reminder) {
       try {
-        require("./scheduler").scheduleJob({
+        const job = await require("./scheduler").scheduleJob({
           type: "reminder",
           fire_at: reminder.fireAt,
           payload: { phone, text: reminder.text },
         });
+        if (!job) throw new Error("Job tidak tersimpan");
+        scheduled = true;
+        const when = new Date(reminder.fireAt).toLocaleString("id-ID", { timeZone: "Asia/Jayapura", dateStyle: "medium", timeStyle: "short" });
+        response = `Oke, pengingat untuk ${reminder.text} sudah dijadwalkan pada ${when} WIT.`;
       } catch (error) {
         console.warn("[DM] Gagal menjadwalkan reminder:", error.message);
+        response = "Maaf, pengingatnya gagal disimpan. Belum ada pengingat yang terjadwal.";
       }
     }
+    const sent = await deliverDirect(sock, target, response, { message, cfg, split: false });
+    groupAgent.remember(key, { sender: cfg.botName, senderId: "BOT", text: response, isBot: true, messageKey: sent?.key, messageRef: sent });
+    return { action: scheduled ? "reminder_scheduled" : "reminder_not_scheduled", text: response, decision };
   }
 
   // Di chat pribadi bot merespons lebih sering: hanya diam untuk spam atau
@@ -469,7 +515,15 @@ async function compactDirectMemory(phone) {
   const { person, dm } = personContext(phone);
   const timestamp = witNow();
 
-  const response = await groupAgent.httpClient().post("/api/v1/chat/completions", {
+  const glm = createGlmClient({
+    model: cfg.chatModel,
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    baseURL: process.env.OPENROUTER_BASE_URL,
+    reasoningEffort: cfg.reasoningEffort,
+  });
+
+  const response = await glm.chatCompletion({
     model: cfg.chatModel,
     messages: [
       {
@@ -497,7 +551,7 @@ async function compactDirectMemory(phone) {
         }),
       },
     ],
-    response_format: {
+    responseFormat: {
       type: "json_schema",
       json_schema: {
         name: "dm_memory",
@@ -514,12 +568,12 @@ async function compactDirectMemory(phone) {
         },
       },
     },
-    max_tokens: 900,
+    maxTokens: 900,
     temperature: 0.2,
-    reasoning: { effort: cfg.reasoningEffort, exclude: true },
+    reasoningEffort: cfg.reasoningEffort,
   });
 
-  const content = response.data?.choices?.[0]?.message?.content;
+  const content = response.text;
   const parsed = typeof content === "string" ? JSON.parse(content) : content;
   if (!parsed?.dm_memory) throw new Error("Output compact DM tidak lengkap");
   if ((dmEpochs.get(key) || 0) !== epoch) return false;
@@ -528,7 +582,7 @@ async function compactDirectMemory(phone) {
     glm: parsed.dm_memory,
     updated_at_wit: timestamp,
   });
-  memoryStore.upsertPersonProfile(phone, { profile: parsed.profile, relation: parsed.relation });
+  memoryStore.upsertPersonProfile(phone, { profile: parsed.profile, relation: parsed.relation, sourceChatId: phoneJid(phone) });
 
   groupAgent.dropHistoryEntries(key, [...snapshotIds]);
   return { removed: [...snapshotIds] };

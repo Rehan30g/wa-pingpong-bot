@@ -15,3 +15,12 @@ test/agent-jobs.json
 test/agent-jobs.json.tmp
 test/data-agent.json
 npm-debug.log*
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.tmp
+runtime*.db*
+test/*.db*
+backups/
+traces/

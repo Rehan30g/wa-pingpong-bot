@@ -1,3 +1,6 @@
+const { setupSimulatorEnv } = require("./simulator-setup");
+const { cleanup } = setupSimulatorEnv();
+
 require("dotenv").config({ quiet: true });
 
 const agent = require("../ai/group-agent");
@@ -26,7 +29,11 @@ async function main() {
   agent.resetGroupContext(groupId);
 }
 
-main().catch((error) => {
-  console.error(error.response?.data || error);
-  process.exitCode = 1;
-});
+main()
+  .catch((error) => {
+    console.error(error.response?.data || error);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    cleanup();
+  });
