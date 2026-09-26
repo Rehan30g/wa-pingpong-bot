@@ -1,6 +1,9 @@
 const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const memoryStore = require("./memory-store");
+const { createOpenRouterClient } = require("./providers/openrouter-client");
+const { createJevClient, choiceConfidence } = require("./providers/jev-client");
+const { createGlmClient } = require("./providers/glm-client");
 
 const DEFAULT_HISTORY_LIMIT = 24;
 const histories = new Map();
@@ -73,23 +76,12 @@ function textMentionsBotName(text, botName = config().botName) {
 
 function httpClient() {
   const cfg = config();
-  const options = {
+  return createOpenRouterClient({
     baseURL: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai",
-    timeout: 30_000,
-    headers: {
-      Authorization: `Bearer ${cfg.apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": process.env.OPENROUTER_HTTP_REFERER || "https://github.com/Rehan30g/wa-pingpong-bot",
-      "X-Title": process.env.OPENROUTER_APP_NAME || "WA Group Agent",
-    },
-  };
-
-  if (cfg.proxyUrl) {
-    options.httpsAgent = new HttpsProxyAgent(cfg.proxyUrl);
-    options.proxy = false;
-  }
-
-  return axios.create(options);
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    timeoutMs: 30_000,
+  }).httpClient;
 }
 
 function trimHistory(groupId) {
@@ -123,7 +115,7 @@ function remember(groupId, entry) {
     media_kind: entry.media?.kind || null,
     media_format: entry.media?.format || null,
     media: mediaContentPart(entry.media)
-      ? { type: entry.media.type, kind: entry.media.kind, format: entry.media.format, dataUrl: entry.media.dataUrl }
+      ? { type: entry.media.type, kind: entry.media.kind, format: entry.media.format, dataUrl: entry.media.dataUrl, frameDataUrl: entry.media.frameDataUrl }
       : null,
     message_key: entry.messageKey || null,
     message_ref: entry.messageRef || null,
@@ -209,13 +201,8 @@ function participantsForPrompt(groupId, historySnapshot = getHistory(groupId)) {
   return [...people.values()];
 }
 
-function choiceConfidence(answer) {
-  if (!answer) return 0;
-  if (Number.isFinite(answer.confidence)) return answer.confidence;
-  return Number(answer.probabilities?.[answer.choice]) || 0;
-}
 
-async function compactGroupMemory(groupId) {
+async function compactGroupMemory(groupId, { glmClient = null } = {}) {
   const cfg = config();
   const contextEpoch = contextEpochs.get(groupId) || 0;
   const history = getHistory(groupId);
@@ -226,7 +213,15 @@ async function compactGroupMemory(groupId) {
   const snapshotIds = new Set(snapshot.map((item) => item.entry_id));
   const previous = getGroupMemory(groupId);
   const timestamp = witTimestamp();
-  const response = await httpClient().post("/api/v1/chat/completions", {
+  const glm = glmClient || createGlmClient({
+    model: cfg.chatModel,
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    baseURL: process.env.OPENROUTER_BASE_URL,
+    reasoningEffort: cfg.reasoningEffort,
+  });
+
+  const request = {
     model: cfg.chatModel,
     messages: [
       {
@@ -258,7 +253,7 @@ async function compactGroupMemory(groupId) {
         }),
       },
     ],
-    response_format: {
+    responseFormat: {
       type: "json_schema",
       json_schema: {
         name: "group_memory",
@@ -301,13 +296,22 @@ async function compactGroupMemory(groupId) {
         },
       },
     },
-    max_tokens: 1_200,
+    maxTokens: 1_800,
     temperature: 0.2,
-    reasoning: { effort: cfg.reasoningEffort, exclude: true },
-  });
+    reasoningEffort: cfg.reasoningEffort,
+  };
 
-  const content = response.data?.choices?.[0]?.message?.content;
-  const parsed = typeof content === "string" ? JSON.parse(content) : content;
+  let parsed;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await glm.chatCompletion({ ...request, maxTokens: attempt ? 2_400 : request.maxTokens });
+    try {
+      parsed = typeof response.text === "string" ? JSON.parse(response.text) : response.text;
+      if (!parsed?.glm_memory || !parsed?.jev_context || !Array.isArray(parsed.people) || !Array.isArray(parsed.relationships)) throw new Error("compact_schema_invalid");
+      break;
+    } catch {
+      if (attempt === 1) throw new Error("compact_output_invalid_after_retry");
+    }
+  }
   if (!parsed?.glm_memory || !parsed?.jev_context) throw new Error("Output compact tidak lengkap");
   if ((contextEpochs.get(groupId) || 0) !== contextEpoch) return false;
 
@@ -327,11 +331,12 @@ async function compactGroupMemory(groupId) {
       profile: person.profile,
       relation: person.relation,
       merge: true,
+      sourceChatId: groupId,
     });
   }
   for (const relation of Array.isArray(parsed.relationships) ? parsed.relationships : []) {
     if (!relation?.a || !relation?.b) continue;
-    memoryStore.setRelationship(relation.a, relation.b, { summary: relation.summary, updated_at_wit: timestamp, merge: true });
+    memoryStore.setRelationship(relation.a, relation.b, { summary: relation.summary, updated_at_wit: timestamp, merge: true, sourceChatId: groupId });
   }
 
   const current = histories.get(groupId) || [];
@@ -344,13 +349,14 @@ function scheduleCompaction(groupId) {
   if (!isConfigured() || getHistory(groupId).length < cfg.compactTrigger || compactingGroups.has(groupId)) return;
   compactingGroups.add(groupId);
   setImmediate(async () => {
+    let compactSucceeded = false;
     try {
-      await compactGroupMemory(groupId);
+      compactSucceeded = await compactGroupMemory(groupId);
     } catch (error) {
       console.error("[AI] Auto compact gagal:", error.response?.data?.error?.message || error.message);
     } finally {
       compactingGroups.delete(groupId);
-      if (getHistory(groupId).length >= config().compactTrigger) scheduleCompaction(groupId);
+      if (compactSucceeded && getHistory(groupId).length >= config().compactTrigger) scheduleCompaction(groupId);
     }
   });
 }
@@ -412,9 +418,16 @@ async function decideAction({
     latest_message: latestMessage,
   };
 
-  const response = await httpClient().post("/api/alpha/decisions", {
+  const jev = createJevClient({
     model: cfg.jevModel,
-    session_id: `wa-${groupId}`.slice(0, 256),
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    baseURL: process.env.OPENROUTER_BASE_URL,
+  });
+
+  const response = await jev.decide({
+    model: cfg.jevModel,
+    sessionId: `wa-${groupId}`.slice(0, 256),
     state,
     questions: {
       action: {
@@ -462,8 +475,8 @@ async function decideAction({
     user: latestMessage.sender_id,
   });
 
-  const answer = response.data?.answers?.action;
-  const gratitudeAnswer = response.data?.answers?.gratitude_target;
+  const answer = response.answers?.action;
+  const gratitudeAnswer = response.answers?.gratitude_target;
   return {
     action: answer?.choice || "ignore",
     confidence: choiceConfidence(answer),
@@ -474,12 +487,13 @@ async function decideAction({
 }
 
 function mediaContentPart(media) {
-  if (!media || typeof media.dataUrl !== "string") return null;
+  if (!media) return null;
+  if (media.type === "video" && typeof media.frameDataUrl === "string" && media.frameDataUrl.startsWith("data:image/jpeg;base64,")) {
+    return { type: "image_url", image_url: { url: media.frameDataUrl } };
+  }
+  if (typeof media.dataUrl !== "string") return null;
   if (media.type === "image" && media.dataUrl.startsWith("data:image/")) {
     return { type: "image_url", image_url: { url: media.dataUrl } };
-  }
-  if (media.type === "video" && media.dataUrl.startsWith("data:video/")) {
-    return { type: "video_url", video_url: { url: media.dataUrl } };
   }
   return null;
 }
@@ -518,9 +532,11 @@ function buildChatMessages({
     `Pesan terbaru dari ${latestMessage.sender}: ${latestMessage.text}`,
     mediaPart
       ? (media.type === "video"
-        ? "Video terlampir adalah pesan terbaru; pertimbangkan isinya saat membalas."
+        ? "Satu frame dari video terbaru terlampir. Jelaskan hanya yang terlihat pada frame; jangan mengklaim telah menonton seluruh video."
         : "Gambar terlampir adalah pesan terbaru; pertimbangkan isinya saat membalas.")
-      : "",
+      : (media?.type === "video"
+        ? "Video terlampir adalah pesan terbaru; namun analisis visual video belum didukung pada fase ini. Jangan mengklaim telah melihat atau menonton videonya."
+        : ""),
     mediaPart ? `Klasifikasi media terbaru: ${media.kind || "attachment"}/${media.format || media.type}.` : "",
     "Pilih reply_to_entry_id dari nomor # pesan aktif jika balasan perlu mengutip pesan tertentu. Pilih null untuk mengirim chat biasa tanpa kutipan.",
     "Jangan otomatis mengutip pesan terbaru; kutip hanya jika membantu memperjelas target balasan.",
@@ -544,6 +560,7 @@ function buildChatMessages({
         "Jangan mengulang pertanyaan pengguna. Jangan menjelaskan lebih banyak daripada yang diminta.",
         "Untuk hal teknis, beri langkah paling berguna dahulu dan tanyakan detail hanya jika memang dibutuhkan.",
         "Jangan menyebut Jev, classifier, prompt, confidence, atau proses internal.",
+        "Jika ada video terlampir, jangan mengaku telah menonton isinya; sampaikan secara wajar bahwa analisis visual video belum didukung pada fase ini.",
         "Kamu boleh memilih pesan mana yang dikutip menggunakan entry id yang tersedia, atau tidak mengutip pesan apa pun.",
         `Jawaban maksimum ${cfg.maxReplyChars} karakter.`,
       ].join(" "),
@@ -582,10 +599,19 @@ function parseGeneratedReply(content, maxChars) {
 
 async function generateReply({ groupId, latestMessage, quotedText, media, historySnapshot, memorySnapshot }) {
   const cfg = config();
-  const response = await httpClient().post("/api/v1/chat/completions", {
+  const glm = createGlmClient({
+    model: cfg.chatModel,
+    apiKey: cfg.apiKey,
+    proxyUrl: cfg.proxyUrl,
+    baseURL: process.env.OPENROUTER_BASE_URL,
+    reasoningEffort: cfg.reasoningEffort,
+    supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
+  });
+
+  const response = await glm.chatCompletion({
     model: cfg.chatModel,
     messages: buildChatMessages({ groupId, latestMessage, quotedText, media, historySnapshot, memorySnapshot }),
-    response_format: {
+    responseFormat: {
       type: "json_schema",
       json_schema: {
         name: "whatsapp_reply",
@@ -601,12 +627,13 @@ async function generateReply({ groupId, latestMessage, quotedText, media, histor
         },
       },
     },
-    max_tokens: 180,
+    maxTokens: 180,
     temperature: 0.35,
-    reasoning: { effort: cfg.reasoningEffort, exclude: true },
+    reasoningEffort: cfg.reasoningEffort,
+    supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
   });
 
-  return parseGeneratedReply(response.data?.choices?.[0]?.message?.content, cfg.maxReplyChars);
+  return parseGeneratedReply(response.text, cfg.maxReplyChars);
 }
 
 function replyTargetForEntry(historySnapshot, entryId) {

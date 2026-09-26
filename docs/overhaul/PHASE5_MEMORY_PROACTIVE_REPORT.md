@@ -1,0 +1,19 @@
+# Fase 5 — Memori dan proaktif (gate lokal selesai)
+
+Status: **gate lokal otomatis lulus**. Default runtime tetap `legacy`; belum ada uji WhatsApp nyata atau observasi canary.
+
+Checkpoint awal:
+
+- Pesan proaktif kini mensyaratkan standing permission eksplisit dari DM (`opt_in`). Orang yang hanya pernah muncul di grup tetap boleh menerima reminder yang ia minta, tetapi tidak otomatis menerima check-in. `opt_out` mencabut izin proaktif dan metadata waktunya. Legacy dan durable scheduler memakai gerbang yang sama.
+- Profil orang yang dihasilkan dari compact grup dan DM diberi `source_chat_id` pada `scoped_profiles`. Prompt DM hanya mengambil profil dari chat DM orang itu. Profil v2 lama tanpa asal diberi label konservatif `legacy_private` dan tidak dipakai sebagai profil lintas chat oleh prompt DM.
+- Tes lokal membuktikan profil grup lain tidak muncul pada retrieval DM, opt-out mencabut standing permission, dan reminder eksplisit tetap berjalan saat proaktif off.
+- Human takeover: pesan DM terbaru mencatat `last_user_dm_at`; legacy dan durable scheduler menahan check-in proaktif selama satu jam setelah pengguna aktif berbicara. Reminder eksplisit tetap menggunakan jalurnya sendiri.
+- SQLite schema v3 kini menyimpan fakta eksplisit dengan `memory_id`, subject PN, chat/entry sumber, confidence, expiry, versi, dan epoch. `/task ingat ...` mengambil teks dari task tersumber, bukan argumen bebas model; `/task cari memori ...` hanya membaca chat asal. Keduanya mati secara default (`AGENT_MEMORY_FACTS_ENABLED=false`). Replay dari entry yang sama idempotent, sedangkan isi berbeda ditolak. `/clear` mempertahankan fakta dan menolak write epoch lama; `/reset` memberi tombstone pada fakta chat terkait.
+- `/task koreksi memori <memory_id>: <teks>` hanya dapat mengoreksi fakta milik nomor yang sama dalam chat sumber; versi sebelumnya berstatus `corrected`, versi baru memiliki sumber dan nomor versi baru. Replay koreksi idempotent dan pencarian tidak mengembalikan versi lama. Reset grup juga membuang profil yang bersumber dari grup itu tanpa menghapus profil grup lain. Verifier pencarian membaca ulang ID dan teks dari SQLite sebelum menerima hasil.
+- Profil dan ringkasan relasi hasil compact baru hanya disimpan dengan provenance chat. Profil/relasi v2 lama tetap berlabel privat dan tidak digunakan pada prompt DM lintas chat. Reset grup menghapus ringkasan bersumber dari grup tersebut; test balapan reset ketika model compact masih berjalan membuktikan hasil lama ditolak sebelum menulis profil atau relasi.
+- Fakta berformat `Topik: nilai` diberi kunci topik deterministik. Dua nilai berbeda dari subject/chat/topik yang sama dipertahankan sebagai `conflicted` dengan kedua ID dan entry sumber terlihat pada pencarian; bot tidak diam-diam memilih salah satunya. Koreksi eksplisit menyimpan versi baru; konflik yang masih punya sumber lain tetap ditandai. Teks bebas tanpa kunci topik tidak diduga konflik secara otomatis.
+- Fixture memori v2 di file sementara menunjukkan profil/relasi tanpa provenance tetap `legacy_private` dan tidak muncul dalam konteks grup atau DM lain. Compact yang selesai setelah reset ditolak sebelum menulis memori.
+
+Gate akhir Fase 5: `npm test` **220/220 lulus** pada tiga run berurutan; `npm audit --omit=dev` **0 vulnerability**; sintaks dan `git diff --check` lulus. Simulasi OpenRouter nyata `simulate:ai`, `simulate:burst`, `simulate:memory`, dan `simulate:dm` lulus menggunakan state sementara. SHA-256 `ai-memory.json`, `agent-jobs.json`, dan `data.json` identik sebelum/sesudah. Tidak ada pengiriman WhatsApp nyata.
+
+Batas rilis: evaluasi Fase 7, shadow 24 jam, canary 48 jam/30 tugas, dan uji WA milik pengguna masih belum dilakukan. Penanganan konflik hanya untuk kunci topik eksplisit; belum ada penyelesaian konflik semantik bebas oleh model. Fitur SQLite facts mati secara default.

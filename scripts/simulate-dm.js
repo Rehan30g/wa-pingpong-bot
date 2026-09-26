@@ -1,3 +1,6 @@
+const { setupSimulatorEnv } = require("./simulator-setup");
+const { cleanup } = setupSimulatorEnv();
+
 require("dotenv").config({ quiet: true });
 
 const groupAgent = require("../ai/group-agent");
@@ -77,7 +80,11 @@ async function main() {
   if (reminder) console.log("Reminder terjadwal:", new Date(reminder.fire_at).toISOString(), "-", reminder.payload.text);
 }
 
-main().catch((error) => {
-  console.error("Simulasi DM gagal:", error.response?.data || error.message);
-  process.exitCode = 1;
-});
+main()
+  .catch((error) => {
+    console.error("Simulasi DM gagal:", error.response?.data || error.message);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    cleanup();
+  });

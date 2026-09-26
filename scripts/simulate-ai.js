@@ -1,3 +1,6 @@
+const { setupSimulatorEnv } = require("./simulator-setup");
+const { cleanup } = setupSimulatorEnv();
+
 require("dotenv").config({ quiet: true });
 
 const agent = require("../ai/group-agent");
@@ -179,7 +182,11 @@ async function main() {
   for (let i = 0; i < scenarios.length; i++) await runScenario(scenarios[i], i);
 }
 
-main().catch((error) => {
-  console.error("Simulasi gagal:", error.response?.data || error.message);
-  process.exitCode = 1;
-});
+main()
+  .catch((error) => {
+    console.error("Simulasi gagal:", error.response?.data || error.message);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    cleanup();
+  });

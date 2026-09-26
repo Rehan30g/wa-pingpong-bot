@@ -1,7 +1,66 @@
+const { setupIsolatedTestEnv } = require("./helpers/test-env");
+const { cleanup } = setupIsolatedTestEnv("wa-test-ai-");
+
 const test = require("node:test");
 const assert = require("node:assert");
 const http = require("node:http");
 const agent = require("../ai/group-agent");
+const memoryStore = require("../ai/memory-store");
+
+test("compact grup mengulang JSON model yang rusak tanpa menghapus konteks lama", async () => {
+  const groupId = "compact-invalid-test@g.us";
+  agent.resetGroupContext(groupId);
+  for (let i = 0; i < 8; i++) agent.remember(groupId, { sender: "R", senderId: "628123456789", text: `Fakta ${i}` });
+  const prior = memoryStore.getGroupMemory(groupId).glm;
+  let calls = 0;
+  const glmClient = { chatCompletion: async () => {
+    calls++;
+    return { text: calls === 1 ? '{"glm_memory":"terpotong' : JSON.stringify({ glm_memory: "Fakta terverifikasi", jev_context: "Topik fakta", people: [], relationships: [] }) };
+  } };
+  assert.equal(await agent.compactGroupMemory(groupId, { glmClient }), true);
+  assert.equal(calls, 2);
+  assert.equal(memoryStore.getGroupMemory(groupId).glm, "Fakta terverifikasi");
+  assert.notEqual(prior, memoryStore.getGroupMemory(groupId).glm);
+  agent.resetGroupContext(groupId);
+});
+
+test("compact grup gagal tertutup jika dua respons model rusak", async () => {
+  const groupId = "compact-double-invalid@g.us";
+  agent.resetGroupContext(groupId);
+  for (let i = 0; i < 8; i++) agent.remember(groupId, { sender: "R", senderId: "628123456789", text: `Fakta ${i}` });
+  const before = memoryStore.getGroupMemory(groupId).glm;
+  const historyBefore = agent.getHistory(groupId).length;
+  let calls = 0;
+  await assert.rejects(agent.compactGroupMemory(groupId, { glmClient: { chatCompletion: async () => { calls++; return { text: '{"broken":' }; } } }), /compact_output_invalid_after_retry/);
+  assert.equal(calls, 2);
+  assert.equal(memoryStore.getGroupMemory(groupId).glm, before);
+  assert.equal(agent.getHistory(groupId).length, historyBefore);
+  agent.resetGroupContext(groupId);
+});
+
+test("reset saat compact berjalan menolak hasil model lama termasuk profil dan relasi", async () => {
+  const groupId = "compact-reset-race@g.us";
+  const phone = "628123456789";
+  const other = "628999999999";
+  agent.resetGroupContext(groupId);
+  for (let i = 0; i < 8; i++) agent.remember(groupId, { sender: "R", senderId: phone, text: `Fakta ${i}` });
+  let release;
+  let called;
+  const entered = new Promise((resolve) => { called = resolve; });
+  const resultReady = new Promise((resolve) => { release = resolve; });
+  const compacting = agent.compactGroupMemory(groupId, { glmClient: { chatCompletion: async () => { called(); await resultReady; return { text: JSON.stringify({ glm_memory: "memori basi", jev_context: "konteks basi", people: [{ phone, name: "R", profile: "profil basi", relation: "relasi basi" }], relationships: [{ a: phone, b: other, summary: "hubungan basi" }] }) }; } } });
+  await entered;
+  agent.resetGroupContext(groupId);
+  release();
+  assert.equal(await compacting, false);
+  assert.equal(memoryStore.getGroupMemory(groupId).glm, "Belum ada memori terkompresi.");
+  assert.equal(memoryStore.getPersonForChat(phone, groupId)?.profile || "", "");
+  assert.equal(memoryStore.getRelationshipForChat(phone, other, groupId), null);
+});
+
+test.after(() => {
+  cleanup();
+});
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -85,10 +144,12 @@ async function withMockAiServer(runTest, hangFirstDecision = true) {
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     AI_DEBOUNCE_MS: process.env.AI_DEBOUNCE_MS,
     OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
+    AI_PROVIDER_SUPPORTS_VIDEO: process.env.AI_PROVIDER_SUPPORTS_VIDEO,
   };
   process.env.OPENROUTER_API_KEY = "test-key";
   process.env.AI_DEBOUNCE_MS = "50";
   process.env.OPENROUTER_BASE_URL = await mock.listen();
+  process.env.AI_PROVIDER_SUPPORTS_VIDEO = "true";
   agent.resetHistories();
   try {
     await runTest(mock);
@@ -186,7 +247,7 @@ test("nama bot di teks dianggap mention dengan batas kata", () => {
   assert.equal(agent.textMentionsBotName("Makasih Budi", "Grad"), false);
 });
 
-test("buildChatMessages melampirkan gambar/video sebagai konten multimodal", () => {
+test("buildChatMessages melampirkan gambar dan frame video, tanpa video data URL", () => {
   agent.resetHistories();
   const withImage = agent.buildChatMessages({
     groupId: "img",
@@ -204,9 +265,16 @@ test("buildChatMessages melampirkan gambar/video sebagai konten multimodal", () 
     quotedText: "",
     media: { type: "video", dataUrl: "data:video/mp4;base64,QUJD" },
   });
-  assert.ok(Array.isArray(withVideo[1].content), "konten harus multipart saat ada video");
-  assert.equal(withVideo[1].content[1].type, "video_url");
-  assert.equal(withVideo[1].content[1].video_url.url, "data:video/mp4;base64,QUJD");
+  assert.equal(typeof withVideo[1].content, "string", "video mentah tidak boleh dikirim sebagai data URL");
+
+  const withFrame = agent.buildChatMessages({
+    groupId: "vid-frame",
+    latestMessage: { sender: "Ani", text: "tengok ini" },
+    quotedText: "",
+    media: { type: "video", frameDataUrl: "data:image/jpeg;base64,QUJD" },
+  });
+  assert.equal(withFrame[1].content[1].type, "image_url");
+  assert.equal(withFrame[1].content[1].image_url.url, "data:image/jpeg;base64,QUJD");
 
   const plain = agent.buildChatMessages({
     groupId: "img",
@@ -215,6 +283,22 @@ test("buildChatMessages melampirkan gambar/video sebagai konten multimodal", () 
     media: { type: "image", dataUrl: "bukan-data-url" },
   });
   assert.equal(typeof plain[1].content, "string", "data URL tidak valid harus diabaikan");
+});
+
+test("ekstraksi frame gagal dengan aman bila ffmpeg tidak tersedia", async () => {
+  const { extractVideoFrame } = require("../ai/media/video-frame");
+  const { EventEmitter } = require("node:events");
+  const result = await extractVideoFrame(Buffer.from("video"), {
+    spawnProcess: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stdin = { on() {}, end() {} };
+      child.kill = () => {};
+      queueMicrotask(() => child.emit("error", new Error("ENOENT")));
+      return child;
+    },
+  });
+  assert.equal(result, null);
 });
 
 test("media dari percakapan aktif lama ikut dilampirkan ke GLM", () => {
@@ -287,7 +371,7 @@ test("processGroupMessage mengirim media ke GLM dan sinyal ke Jev", async () => 
   }, false);
 });
 
-test("processGroupMessage mengirim video_url ke GLM", async () => {
+test("processGroupMessage mengirim frame video sebagai image_url ke GLM", async () => {
   await withMockAiServer(async (mock) => {
     const sock = makeAiSock();
     const result = await agent.processGroupMessage({
@@ -300,15 +384,15 @@ test("processGroupMessage mengirim video_url ke GLM", async () => {
       explicitMention: true,
       replyToBot: false,
       quotedText: "",
-      media: { type: "video", dataUrl: "data:video/mp4;base64,QUJD" },
+      media: { type: "video", frameDataUrl: "data:image/jpeg;base64,QUJD" },
     });
 
     assert.equal(result.action, "reply");
     const decisionState = mock.state.decisions[0].state.signals;
     assert.equal(decisionState.has_video, true);
     const content = mock.state.chatCalls[0].messages.at(-1).content;
-    assert.ok(Array.isArray(content), "request GLM harus membawa video");
-    assert.equal(content[1].type, "video_url");
+    assert.ok(Array.isArray(content), "request GLM harus membawa frame video");
+    assert.equal(content[1].type, "image_url");
   }, false);
 });
 

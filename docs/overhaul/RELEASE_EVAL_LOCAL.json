@@ -1,0 +1,99 @@
+{
+  "date_utc": "2026-09-24T08:03:01.031Z",
+  "scope": "local_mock_and_fault_injection_only",
+  "release_ready": false,
+  "test_exit_code": 0,
+  "failed_count": 0,
+  "skipped_count": 0,
+  "todo_count": 0,
+  "total_suite_tests": 222,
+  "selected_unique_scenarios": 60,
+  "category_counts": {
+    "chat_routing": 10,
+    "multi_step_tools": 15,
+    "memory_privacy": 10,
+    "crash_retry_delivery": 10,
+    "attacks_permissions": 10,
+    "scheduler_budget": 5
+  },
+  "selected": {
+    "chat_routing": [
+      "DM dari nomor di luar whitelist diabaikan total",
+      "DM dari orang dikenal dibalas meski confidence Jev rendah",
+      "DM ignore hanya ketika Jev sangat yakin dan bukan spam",
+      "permintaan menyebarkan pesan ditolak dan tidak menyentuh nomor lain",
+      "processGroupMessage mengirim media ke GLM dan sinyal ke Jev",
+      "processGroupMessage mengirim frame video sebagai image_url ke GLM",
+      "GLM dapat memilih pesan lama untuk di-reply atau mengirim standalone",
+      "pesan saat evaluasi berjalan mengantri dan tetap diproses, tidak dibatalkan",
+      "pesan dalam jendela debounce yang sama digabung (superseded)",
+      "34. Inbound Dispatcher: pesan grup biasa tanpa mention bot tidak membuat task"
+    ],
+    "multi_step_tools": [
+      "1. Happy multi-step: task 3 langkah (summarize -> create_note -> read_note) sukses dengan bukti",
+      "2. Bad planner JSON: output model bukan JSON valid ditolak fail-closed",
+      "3. Bad planner schema: output model melanggar skema Ajv ditolak fail-closed",
+      "4. Plan step bounds exceeded: rencana > 8 langkah ditolak fail-closed",
+      "8. Capability deny - capability tidak terdaftar: task gagal dengan reason jelas",
+      "9. Capability deny - capability dinonaktifkan: task gagal dengan status terminal",
+      "13. Timeout / abort in capability: eksekusi yang macet dibatalkan dan dilaporkan",
+      "14. Retry budget exhausted: kegagalan berulang menghabiskan budget retry (maksimal 2)",
+      "27. Verifier deterministic output mismatch: output capability melanggar schema ditolak",
+      "28. Acceptance criteria verification: verifier memeriksa acceptance criteria sebelum succeeded",
+      "replan atomik setelah note tidak ditemukan menyelesaikan tiga langkah tanpa mengulang write",
+      "40. Point C: Checkpoint per langkah tersimpan persisten di SQLite & resume tidak mengulang langkah yang telah succeeded",
+      "32b. Inbound /task ingat menyimpan fakta dari pesan sumber melalui runner",
+      "asset privat terikat chat/task, berintegritas, dan kedaluwarsa",
+      "stiker diproses dalam child process menjadi WebP 512x512 dan tetap terikat task"
+    ],
+    "memory_privacy": [
+      "migrasi v2 tanpa provenance tetap privat dan tidak masuk konteks chat lain",
+      "reset grup membuang profil dengan provenance grup itu saja",
+      "profil legacy dan profil grup lain tidak masuk konteks DM",
+      "reset saat compact berjalan menolak hasil model lama termasuk profil dan relasi",
+      "compact grup mengulang JSON model yang rusak tanpa menghapus konteks lama",
+      "compact grup gagal tertutup jika dua respons model rusak",
+      "fakta bersumber dibatasi chat, expiry, epoch, reset, dan restart",
+      "router dan capability fakta memori menjaga sumber task serta scope chat",
+      "fakta berkunci yang bertentangan tetap tampil sebagai konflik sampai bukti koreksi",
+      "riwayat DM terpisah dari riwayat grup"
+    ],
+    "crash_retry_delivery": [
+      "4. Crash pre-send vs restart: claimed outbox pulih ke pending dengan fencing bump, bukan uncertain",
+      "5. Crash post-send vs restart: sending outbox menjadi uncertain dan DILARANG blind resend",
+      "18. Fencing takeover: worker usang ditolak saat fencing token telah dinaikkan",
+      "17. Restart resume dari checkpoint: melanjutkan langkah yang belum selesai tanpa ulang",
+      "20. Startup recovery: memulihkan task/job running yang terputus & outbox sending ke uncertain",
+      "6. Process lock dipakai lifecycle dan mencegah double-instance tanpa menjatuhkan legacy",
+      "8. Duplikasi idempotency first-write-wins bertahan lintas restart dan mendeteksi konflik",
+      "7. Cancellation / context epoch bump membatalkan outbox sebelum delivery",
+      "15. Outbox crash matrix dan delivery_uncertain: tidak ada blind resend",
+      "8. Lease expiry takeover: worker baru dapat merebut task saat lease expired"
+    ],
+    "attacks_permissions": [
+      "5. Model injection attempt - destination injected: ditolak oleh planner",
+      "6. Model injection attempt - idempotencyKey injected: ditolak oleh planner",
+      "7. Model injection attempt - policy/approval injected: ditolak oleh planner",
+      "16. Raw WhatsApp LID ditolak di inbox fail-closed sebelum DB",
+      "12. Approval argument hash mismatch: perubahan argumen membatalkan persetujuan",
+      "web menolak IP privat, URL berbahaya, dan redirect ke host lain",
+      "redirect se-host ke DNS privat tetap ditolak sebelum request kedua",
+      "26. Audit secret redaction: sensor API key dan token Authorization pada jejak audit",
+      "37. Inbound Dispatcher: shadow inbound menghasilkan zero external send dan hash produksi tidak berubah",
+      "dispatcher agent menolak grup tak diizinkan dan DM asing sebelum membuat task"
+    ],
+    "scheduler_budget": [
+      "job reminder terkirim walau DM proaktif dimatikan",
+      "job proactive_checkin memakai gerbang aman dan mencatat kuota",
+      "gerbang DM proaktif: whitelist, jam tenang, dan batas harian",
+      "13. Scheduler proaktif off vs emergency pause",
+      "16. Budget survives restart: akumulasi penggunaan dan ledger tidak ter-reset"
+    ]
+  },
+  "external_gates_pending": [
+    "shadow_24h",
+    "canary_48h_30_tasks",
+    "user_whatsapp_test",
+    "human_naturalness_review"
+  ]
+}

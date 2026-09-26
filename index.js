@@ -21,6 +21,11 @@ const groupAgent = require("./ai/group-agent");
 const directAgent = require("./ai/direct-agent");
 const memoryStore = require("./ai/memory-store");
 const scheduler = require("./ai/scheduler");
+const { extractVideoFrame } = require("./ai/media/video-frame");
+const { detectImageMime } = require("./ai/runtime/safe-media-fetch");
+const { validateImage } = require("./ai/media/image-validator");
+const { initGlobalLifecycle, getGlobalLifecycle } = require("./ai/runtime/lifecycle");
+const { routeTaskIntent } = require("./ai/runtime/intent-router");
 
 const DATA_FILE = process.env.BOT_DATA_FILE || "./data.json";
 let data = { owner: null, allowedGroups: [], vetoAccess: {} };
@@ -117,7 +122,19 @@ function stopPresenceKeepAlive() {
   presenceKeepAlive = null;
 }
 
+async function initRuntime(options = {}) {
+  return initGlobalLifecycle({ sock, ...options });
+}
+
+async function shutdownRuntime() {
+  const lifecycle = getGlobalLifecycle();
+  if (lifecycle) {
+    await lifecycle.shutdown();
+  }
+}
+
 async function startBot() {
+  await initRuntime({ sock });
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
   const { version } = await fetchLatestBaileysVersion();
 
@@ -138,7 +155,7 @@ async function startBot() {
   });
   sock.ev.on("group-participants.update", ({ id }) => groupMetadataCache.delete(id));
 
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       console.log("\n[*] Scan QR ini dengan WhatsApp (Perangkat Tertaut):\n");
@@ -148,15 +165,26 @@ async function startBot() {
       console.log("[+] Bot terhubung!");
       console.log("[i] Kirim /verify dari WhatsApp untuk menjadi owner.");
       startPresenceKeepAlive();
-      scheduler.start({ sock });
+      const lifecycle = getGlobalLifecycle();
+      if (lifecycle) {
+        await lifecycle.onTransportReady({ sock });
+      } else {
+        scheduler.start({ sock });
+      }
     }
     if (connection === "close") {
       stopPresenceKeepAlive();
-      scheduler.stop();
+      const lifecycle = getGlobalLifecycle();
+      if (lifecycle) {
+        await lifecycle.onTransportClosed();
+      } else {
+        scheduler.stop();
+      }
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
       console.log(`[!] Koneksi terputus (code=${code}, reason=${DisconnectReason[code] ?? lastDisconnect?.error?.message})`);
       if (code === DisconnectReason.loggedOut) {
         console.log("[!] Ter-logout. Hapus folder auth dan scan ulang.");
+        await shutdownRuntime();
         process.exit(0);
       }
       console.log("[!] Koneksi terputus, menyambung ulang...");
@@ -169,7 +197,7 @@ async function startBot() {
     for (const m of messages) {
       if (!m.message || m.key.fromMe) continue;
       try {
-        await handleMessage(m);
+        await dispatchInboundMessage(m, { sock });
       } catch (e) {
         console.error("[E]", e);
       }
@@ -336,11 +364,13 @@ function participantIdentities(participant = {}) {
   ].map(normalizeJid).filter(Boolean))];
 }
 
-async function getGroupMetadataSafe(groupId) {
+async function getGroupMetadataSafe(groupId, customSock = null) {
   const cached = groupMetadataCache.get(groupId);
   if (cached && Date.now() - cached.at < GROUP_METADATA_TTL_MS) return cached.value;
+  const active = customSock || sock;
+  if (!active || typeof active.groupMetadata !== "function") return null;
   try {
-    const value = await sock.groupMetadata(groupId);
+    const value = await active.groupMetadata(groupId);
     groupMetadataCache.set(groupId, { at: Date.now(), value });
     return value;
   } catch (error) {
@@ -421,7 +451,7 @@ async function downloadMedia(m, { maxBytes = Infinity } = {}) {
   return collectMediaStream(stream, { maxBytes });
 }
 
-// Unduh gambar/video (langsung atau yang dikutip) sebagai data URL untuk GLM multimodal.
+// Unduh media langsung atau kutipan; video dikonversi menjadi satu frame gambar.
 function maxMediaBytes() {
   return Math.max(1, Number(process.env.AI_MAX_MEDIA_MB || 20)) * 1_048_576;
 }
@@ -458,6 +488,14 @@ async function getAiMedia(m) {
     const buffer = await downloadMedia(media.source, { maxBytes: limit });
     if (!buffer?.length) return null;
     const { kind, format } = classifyAiMedia(media);
+    if (media.type === "video") {
+      const frame = await extractVideoFrame(buffer);
+      return {
+        type: "video", kind, format,
+        durationSeconds: Number(media.msg.seconds) || null,
+        frameDataUrl: frame ? `data:image/jpeg;base64,${frame.toString("base64")}` : null,
+      };
+    }
     const mime = media.type === "video"
       ? (String(media.msg.mimetype || "").startsWith("video/") ? media.msg.mimetype : "video/mp4")
       : (media.msg.mimetype || (kind === "sticker" ? "image/webp" : "image/jpeg"));
@@ -468,53 +506,31 @@ async function getAiMedia(m) {
   }
 }
 
-async function handleMessage(m) {
-  const jid = m.key.remoteJid;
-  const isGroup = jid.endsWith("@g.us");
-  const text = getText(m);
-  const isAllowedGroup = isGroup && data.allowedGroups.includes(jid);
-  let earlyMedia = null;
-  if (!text) {
-    // Media tanpa caption tetap diproses AI (GLM multimodal), baik di grup
-    // yang diizinkan maupun di chat pribadi; media lain dibuang.
-    if (isGroup && !isAllowedGroup) return;
-    earlyMedia = await getAiMedia(m);
-    if (!earlyMedia) return;
-  }
+async function runLegacyMessageFlow({
+  m,
+  jid,
+  isGroup,
+  isAllowedGroup,
+  text,
+  cmd,
+  senderJid,
+  senderTag,
+  senderIdentities,
+  senderPhoneVerified,
+  fromOwner,
+  loadSenderMetadata,
+  earlyMedia,
+  metadataCache,
+  senderParticipant,
+  activeSock,
+}) {
+  const currentSock = activeSock || sock;
 
-  // identitas pengirim
-  let senderJid = getSenderNumber(m, isGroup, jid);
-  let senderTag = phoneIdentity(senderJid);
-
-  const cmd = text.toLowerCase();
-  const senderIdentities = messageSenderIdentities(m, isGroup, jid);
-  let senderPhoneVerified = isGroup
-    ? [m.key?.participantPn, m.key?.senderPn, m.key?.participantAlt, m.key?.senderAlt, m.key?.participant].some(isPhoneJid)
-    : [m.key?.senderPn, m.key?.senderAlt, m.key?.remoteJidAlt, jid].some(isPhoneJid);
-  let metadataCache;
-  let senderParticipant;
-  let fromOwner = Boolean(data.owner && senderIdentities.some((identity) => identitiesMatch(identity, data.owner)));
-  const loadSenderMetadata = async () => {
-    if (!isGroup) return null;
-    if (metadataCache === undefined) metadataCache = await getGroupMetadataSafe(jid);
-    senderParticipant ||= participantForIdentities(metadataCache, senderIdentities);
-    const canonical = canonicalParticipantIdentity(senderParticipant, senderJid);
-    if (senderParticipant && [senderParticipant.jid, senderParticipant.phoneNumber, senderParticipant.pn].some(isPhoneJid)) {
-      senderPhoneVerified = true;
+  if (/^[/!]task(?:\s|$)/i.test(text)) {
+    if ((!isGroup && (fromOwner || memoryStore.canDirectMessage(senderJid))) || (isGroup && isAllowedGroup)) {
+      await currentSock.sendMessage(jid, { text: "Perintah /task ini belum tersedia di chat ini. Tidak ada catatan atau pengingat yang dibuat." });
     }
-    if (canonical) {
-      senderJid = canonical;
-      if (data.owner && identitiesMatch(canonical, data.owner)) fromOwner = true;
-    }
-    return metadataCache;
-  };
-
-  // Pada grup mode LID, nomor PN tersedia lewat participantAlt atau field `jid`
-  // di metadata peserta. Resolusi dilakukan untuk semua pesan grup aktif agar
-  // riwayat Jev/GLM menyimpan nomor, bukan LID.
-  if (isGroup && (cmd.startsWith("/") || isAllowedGroup)) {
-    await loadSenderMetadata();
-    senderTag = phoneIdentity(senderJid);
+    return;
   }
 
   // ===== VERIFIKASI OWNER =====
@@ -564,9 +580,9 @@ async function handleMessage(m) {
       scheduler.setEnabled(enabled);
       if (enabled) scheduler.start({ sock });
     } else if (arg === "clear") {
-      scheduler.clearJobs();
+      await scheduler.clearJobs();
     }
-    const state = scheduler.status();
+    const state = await scheduler.status();
     await sock.sendMessage(jid, {
       text: [
         "🤖 *STATUS AGEN GRAD*",
@@ -801,8 +817,291 @@ async function handleMessage(m) {
   });
 }
 
+async function dispatchInboundMessage(m, {
+  sock: customSock = null,
+  lifecycle: customLifecycle = null,
+  mediaLoader = getAiMedia,
+} = {}) {
+  const activeSock = customSock || sock;
+  if (!m?.message || m?.key?.fromMe) return null;
+
+  const currentLifecycle = customLifecycle !== undefined ? customLifecycle : getGlobalLifecycle();
+  const isLegacy = !currentLifecycle || currentLifecycle.isLegacy();
+
+  const jid = m.key.remoteJid;
+  const isGroup = jid.endsWith("@g.us");
+  const text = getText(m);
+  const isAllowedGroup = isGroup && data.allowedGroups.includes(jid);
+  let earlyMedia = null;
+  if (!text) {
+    if (isGroup && !isAllowedGroup) return null;
+    earlyMedia = await getAiMedia(m);
+    if (!earlyMedia) return null;
+  }
+
+  // identitas pengirim
+  let senderJid = getSenderNumber(m, isGroup, jid);
+  let senderTag = phoneIdentity(senderJid);
+
+  const cmd = text.toLowerCase();
+  const senderIdentities = messageSenderIdentities(m, isGroup, jid);
+  let senderPhoneVerified = isGroup
+    ? [m.key?.participantPn, m.key?.senderPn, m.key?.participantAlt, m.key?.senderAlt, m.key?.participant].some(isPhoneJid)
+    : [m.key?.senderPn, m.key?.senderAlt, m.key?.remoteJidAlt, jid].some(isPhoneJid);
+  let metadataCache;
+  let senderParticipant;
+  let fromOwner = Boolean(data.owner && senderIdentities.some((identity) => identitiesMatch(identity, data.owner)));
+  const loadSenderMetadata = async () => {
+    if (!isGroup) return null;
+    if (metadataCache === undefined) metadataCache = await getGroupMetadataSafe(jid, activeSock);
+    senderParticipant ||= participantForIdentities(metadataCache, senderIdentities);
+    const canonical = canonicalParticipantIdentity(senderParticipant, senderJid);
+    if (senderParticipant && [senderParticipant.jid, senderParticipant.phoneNumber, senderParticipant.pn].some(isPhoneJid)) {
+      senderPhoneVerified = true;
+    }
+    if (canonical) {
+      senderJid = canonical;
+      if (data.owner && identitiesMatch(canonical, data.owner)) fromOwner = true;
+    }
+    return metadataCache;
+  };
+
+  if (isGroup && (cmd.startsWith("/") || isAllowedGroup || !isLegacy)) {
+    await loadSenderMetadata();
+    senderTag = phoneIdentity(senderJid);
+  }
+
+  // ==========================================
+  // JIKA MODE LEGACY: 100% JALUR ASLI BOT (NOL DB TASK / INBOX EVENT)
+  // ==========================================
+  if (isLegacy) {
+    return runLegacyMessageFlow({
+      m,
+      jid,
+      isGroup,
+      isAllowedGroup,
+      text,
+      cmd,
+      senderJid,
+      senderTag,
+      senderIdentities,
+      senderPhoneVerified,
+      fromOwner,
+      loadSenderMetadata,
+      earlyMedia,
+      metadataCache,
+      senderParticipant,
+      activeSock,
+    });
+  }
+
+  // ==========================================
+  // MODE SHADOW & AGENT (AUTONOMOUS TASK RUNTIME)
+  // ==========================================
+  // 1. ProcessLock guard: jika lock tidak dipegang, fail closed (no-op, nol DB write)
+  if (!currentLifecycle.lockHeld) {
+    return { status: "lock_not_held", handled: false };
+  }
+
+  const inboxManager = currentLifecycle.getInboxManager();
+  if (!inboxManager) {
+    return { status: "inbox_unavailable", handled: false };
+  }
+
+  // 2. Hubungkan /clear dan /reset ke context epoch bump
+  if (cmd === "/clear" || cmd === "/reset") {
+    const vetoCandidates = [...senderIdentities, senderJid];
+    const hasVeto = groupVetoUsers(jid).some((allowed) => vetoCandidates.some((identity) => identitiesMatch(allowed, identity)));
+    const metadata = fromOwner || hasVeto ? metadataCache : await loadSenderMetadata();
+    const fromGroupAdmin = metadata
+      ? Boolean(senderParticipant?.admin === "admin" || senderParticipant?.admin === "superadmin" || isAdminParticipant(metadata, senderJid))
+      : false;
+
+    if (!fromOwner && !hasVeto && !fromGroupAdmin) {
+      if (!currentLifecycle.isShadow() && activeSock) {
+        await activeSock.sendMessage(jid, { text: "Hanya owner, admin grup, atau anggota dengan akses veto yang bisa mengelola memori Grad." });
+      }
+      return { status: "unauthorized_epoch_bump", handled: true };
+    }
+
+    const newEpoch = await currentLifecycle.bumpChatEpoch(jid, { reason: cmd.slice(1) });
+    if (currentLifecycle.isShadow()) {
+      return { status: "shadow_epoch_bumped", epoch: newEpoch, handled: true };
+    }
+
+    if (cmd === "/clear") {
+      groupAgent.clearConversation(jid);
+      if (activeSock) {
+        await activeSock.sendMessage(jid, { text: "Percakapan aktif sudah dibersihkan. Memori compact tetap disimpan." });
+      }
+    } else {
+      groupAgent.resetGroupContext(jid);
+      if (activeSock) {
+        await activeSock.sendMessage(jid, { text: "Konteks percakapan dan seluruh memori Grad untuk grup ini sudah direset." });
+      }
+    }
+    return { status: "epoch_bumped", epoch: newEpoch, handled: true };
+  }
+
+  // 3. Evaluasi apakah pesan dialamatkan ke bot
+  const contextInfo = getContextInfo(m);
+  const mentioned = (contextInfo.mentionedJid || []).map(normalizeJid);
+  const metadataMention = Boolean(botIdentities().some((id) => mentioned.includes(id)));
+  const nameMention = groupAgent.textMentionsBotName(text);
+  const explicitMention = metadataMention || nameMention;
+  const replyToBot = isReplyToBot(contextInfo);
+  const isDirectTaskCommand = /^[!/](task|catat|note|baca|readnote|ringkas|summarize|rangkum)\b/i.test(text);
+
+  const addressedToBot = !isGroup || explicitMention || replyToBot || isDirectTaskCommand;
+
+  // Jika pesan di grup dan TIDAK dialamatkan ke bot: jangan buat task!
+  if (isGroup && !addressedToBot) {
+    return { status: "ignored_non_addressed_group", handled: false };
+  }
+
+  // 4. Raw LID fail-closed guard
+  const isRawLid = senderJid.includes("@lid") || senderJid.endsWith(".lid") || (!senderPhoneVerified && String(m.key?.participant || "").includes("@lid"));
+  if (isRawLid) {
+    console.warn(`[RUNTIME] Raw WhatsApp LID ditolak fail-closed (${senderJid})`);
+    return { status: "rejected_raw_lid", handled: false };
+  }
+
+  if (isGroup && !isAllowedGroup) {
+    return { status: "rejected_group_not_allowed", handled: false };
+  }
+  if (!isGroup && !memoryStore.canDirectMessage(senderJid)) {
+    return { status: "rejected_dm_not_whitelisted", handled: false };
+  }
+
+  // 5. Bounded Task Intent Router (Fase 3 allowlist: create_note, read_note, summarize_context)
+  const taskIntent = routeTaskIntent(text, { isGroup, fromOwner, addressedToBot });
+  if (!taskIntent) {
+    if (/^[/!]task(?:\s|$)/i.test(text) && currentLifecycle.isShadow()) {
+      return { status: "shadow_unsupported_task_intent", handled: true };
+    }
+    if (currentLifecycle.isShadow()) {
+      return { status: "shadow_casual_message_ignored", handled: true };
+    }
+    return runLegacyMessageFlow({
+      m,
+      jid,
+      isGroup,
+      isAllowedGroup,
+      text,
+      cmd,
+      senderJid,
+      senderTag,
+      senderIdentities,
+      senderPhoneVerified,
+      fromOwner,
+      loadSenderMetadata,
+      earlyMedia,
+      metadataCache,
+      senderParticipant,
+      activeSock,
+    });
+  }
+
+  // 6. Canary Allowlist Guard pada Mode Agent
+  if (currentLifecycle.isAgent()) {
+    const canary = currentLifecycle.getCanaryManager();
+    const isAllowed = canary.isAllowed({
+      chatId: jid,
+      actorPn: senderJid,
+      engineMode: "agent",
+    });
+    if (!isAllowed) {
+      console.warn(`[RUNTIME] Agent canary allowlist ditolak (fail closed) untuk chat ${jid} / actor ${senderJid}`);
+      return { status: "rejected_canary_allowlist", handled: false };
+    }
+  }
+
+  // 7. Atomic Ingestion melalui InboxManager
+  const sourceEventId = m.key?.id || `evt_${Date.now()}`;
+  const dedupResult = await inboxManager.processInboundEvent({
+    transport: "baileys",
+    chatId: jid,
+    participantPn: senderJid,
+    sourceEventId,
+    payload: {
+      text,
+      senderName: m.pushName || senderTag,
+      isGroup,
+      fromOwner,
+    },
+    taskIntent: {
+      goal: taskIntent.goal,
+      acceptance_criteria: taskIntent.acceptanceCriteria || null,
+      scope: taskIntent.scope || "active_chat",
+      authorization_ref: fromOwner ? `owner_${senderJid}` : `member_${senderJid}`,
+      risk_level: taskIntent.risk_level || "low",
+      provenance: "runtime_inbound_message",
+    },
+  });
+
+  if (dedupResult.duplicate) {
+    return {
+      status: "duplicate_event",
+      duplicate: true,
+      eventId: dedupResult.eventId,
+      task: null,
+      handled: true,
+    };
+  }
+
+  if (["fetch_media_from_message", "make_sticker", "send_asset"].includes(taskIntent.intent) && dedupResult.task) {
+    const task = dedupResult.task;
+    try {
+      if (sourceEventId.length > 200 || !currentLifecycle.assetStore) throw new Error("media_scope_unavailable");
+      const media = earlyMedia || await mediaLoader(m);
+      const dataUrl = media?.frameDataUrl || media?.dataUrl;
+      const match = typeof dataUrl === "string" && /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
+      if (!match) throw new Error("media_image_unavailable");
+      const buffer = Buffer.from(match[2], "base64");
+      const mime = detectImageMime(buffer);
+      if (mime !== `image/${match[1]}`) throw new Error("media_magic_invalid");
+      const decoded = await validateImage(buffer);
+      if (decoded.mime !== mime) throw new Error("media_decode_mismatch");
+      const saved = await currentLifecycle.assetStore.put(buffer, { chatId: jid, taskId: task.task_id, mime });
+      dedupResult.task = await currentLifecycle.storage.updateTask(task.task_id, {
+        expectedVersion: task.version,
+        goal: `${task.goal} Sumber entry_id: ${sourceEventId}.`,
+        evidence_refs: [{ type: "source_media", entry_id: sourceEventId, asset_id: saved.assetId, sha256: saved.sha256, mime, source_type: media.type }],
+      });
+    } catch (error) {
+      await currentLifecycle.storage.updateTask(task.task_id, {
+        expectedVersion: task.version,
+        status: "failed",
+        evidence_refs: [{ type: "source_media_error", code: String(error.message || "media_unavailable").slice(0, 80) }],
+      });
+      return { status: "media_unavailable", handled: true, taskId: task.task_id };
+    }
+  }
+
+  // 8. Eksekusi Task melalui TaskRunner resmi
+  let taskExecutionResult = null;
+  const runner = currentLifecycle.getTaskRunner();
+  if (runner && dedupResult.task) {
+    taskExecutionResult = await runner.runTask(dedupResult.task.task_id);
+  }
+
+  return {
+    status: "task_enqueued_and_executed",
+    duplicate: false,
+    eventId: dedupResult.eventId,
+    task: dedupResult.task,
+    taskExecutionResult,
+    handled: true,
+  };
+}
+
+async function handleMessage(m, options = {}) {
+  return dispatchInboundMessage(m, options);
+}
+
 module.exports = {
   handleMessage,
+  dispatchInboundMessage,
   handleCodeInput,
   startBot,
   initReadline,
@@ -828,6 +1127,10 @@ module.exports = {
   directAgent,
   memoryStore,
   scheduler,
+  initRuntime,
+  shutdownRuntime,
+  getGlobalLifecycle,
+  initGlobalLifecycle,
 };
 
 if (require.main === module) {
@@ -836,5 +1139,13 @@ if (require.main === module) {
     ? `[AI] Aktif: ${groupAgent.config().jevModel} -> ${groupAgent.config().chatModel}`
     : "[AI] Nonaktif: ganti OPENROUTER_API_KEY di file .env");
   initReadline();
+  process.on("SIGINT", async () => {
+    await shutdownRuntime();
+    process.exit(0);
+  });
+  process.on("SIGTERM", async () => {
+    await shutdownRuntime();
+    process.exit(0);
+  });
   startBot();
 }

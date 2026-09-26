@@ -2,20 +2,32 @@ const fs = require("fs");
 const path = require("path");
 const memoryStore = require("./memory-store");
 const humanize = require("./humanize");
+const engineConfig = require("./runtime/engine-config");
+const { getGlobalLifecycle } = require("./runtime/lifecycle");
 
-const JOBS_FILE = path.resolve(process.env.AGENT_JOBS_FILE || "./agent-jobs.json");
+function getJobsFile() {
+  return path.resolve(process.env.AGENT_JOBS_FILE || "./agent-jobs.json");
+}
+
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
 
-let store = load();
+// ==========================================
+// LEGACY SCHEDULER IMPLEMENTATION
+// ==========================================
+
+let lastLoadedFile = null;
+let store = { jobs: [] };
 let timer = null;
 let activeSock = null;
 let sequence = 0;
+let emergencyPaused = false;
 
-function load() {
-  if (!fs.existsSync(JOBS_FILE)) return { jobs: [] };
+function loadLegacy() {
+  const filePath = getJobsFile();
+  if (!fs.existsSync(filePath)) return { jobs: [] };
   try {
-    const raw = JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"));
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
     return { jobs: Array.isArray(raw.jobs) ? raw.jobs : [] };
   } catch (error) {
     console.warn("[AGENT] File jadwal tidak dapat dibaca, memakai kosong:", error.message);
@@ -23,13 +35,43 @@ function load() {
   }
 }
 
-function save() {
-  const dir = path.dirname(JOBS_FILE);
+function getStore() {
+  const currentFile = getJobsFile();
+  if (currentFile !== lastLoadedFile) {
+    store = loadLegacy();
+    lastLoadedFile = currentFile;
+  }
+  return store;
+}
+
+function saveLegacy() {
+  if (!engineConfig.canScheduleProductionJobs() || engineConfig.isShadow()) {
+    // Mode shadow dilarang menulis ke agent-jobs.json produksi!
+    return;
+  }
+  const filePath = getJobsFile();
+  const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
-  const temp = `${JOBS_FILE}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(store, null, 2), { mode: 0o600 });
-  fs.renameSync(temp, JOBS_FILE);
-  fs.chmodSync(JOBS_FILE, 0o600);
+  const temp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(getStore(), null, 2), { mode: 0o600 });
+  try {
+    fs.renameSync(temp, filePath);
+  } catch (err) {
+    if (err.code === "EPERM" || err.code === "EBUSY" || err.code === "EACCES") {
+      try {
+        fs.renameSync(temp, filePath);
+      } catch (retryErr) {
+        try { fs.unlinkSync(temp); } catch {}
+        throw retryErr;
+      }
+    } else {
+      try { fs.unlinkSync(temp); } catch {}
+      throw err;
+    }
+  }
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {}
 }
 
 function envNumber(name, fallback) {
@@ -55,40 +97,46 @@ function phoneJid(phone) {
   return `${memoryStore.normalizePhone(phone)}@s.whatsapp.net`;
 }
 
-function nextId() {
+function nextLegacyId() {
   sequence += 1;
   return `job-${Date.now().toString(36)}-${sequence}`;
 }
 
-function scheduleJob({ type, fire_at, payload = {} } = {}) {
+function legacyScheduleJob({ type, fire_at, payload = {} } = {}) {
+  if (engineConfig.isShadow() || !engineConfig.canScheduleProductionJobs()) {
+    throw new Error("Mode shadow dilarang menjadwalkan job legacy produksi");
+  }
   if (!type || !Number.isFinite(Number(fire_at))) return null;
+  const s = getStore();
   const job = {
-    id: nextId(),
+    id: nextLegacyId(),
     type,
     fire_at: Number(fire_at),
     payload,
     created_at: Date.now(),
     attempts: 0,
   };
-  store.jobs.push(job);
-  save();
+  s.jobs.push(job);
+  saveLegacy();
   return job;
 }
 
-function cancelJob(id) {
-  const before = store.jobs.length;
-  store.jobs = store.jobs.filter((job) => job.id !== id);
-  if (store.jobs.length !== before) save();
-  return before !== store.jobs.length;
+function legacyCancelJob(id) {
+  const s = getStore();
+  const before = s.jobs.length;
+  s.jobs = s.jobs.filter((job) => job.id !== id);
+  if (s.jobs.length !== before) saveLegacy();
+  return before !== s.jobs.length;
 }
 
-function listJobs() {
-  return [...store.jobs].sort((a, b) => a.fire_at - b.fire_at);
+function legacyListJobs() {
+  return [...getStore().jobs].sort((a, b) => a.fire_at - b.fire_at);
 }
 
-function clearJobs() {
-  store = { jobs: [] };
-  save();
+function legacyClearJobs() {
+  const s = getStore();
+  s.jobs = [];
+  saveLegacy();
 }
 
 function todayProactiveCount(at = Date.now()) {
@@ -104,7 +152,8 @@ function canProactivelyMessage(phone, at = Date.now(), cfg = agentConfig()) {
   if (!memoryStore.canDirectMessage(key)) return false;
   if (humanize.isQuietHours(at)) return false;
   const dm = memoryStore.getDmMemory(key);
-  if (dm.opt_out) return false;
+  if (dm.opt_out || dm.proactive_consent !== true) return false;
+  if (Number.isFinite(dm.last_user_dm_at) && at >= dm.last_user_dm_at && at - dm.last_user_dm_at < HOUR) return false;
   if (dm.last_proactive_at && at - dm.last_proactive_at < cfg.personCooldownMs) return false;
   if (todayProactiveCount(at) >= cfg.dailyLimit) return false;
   return true;
@@ -115,7 +164,6 @@ function isRecentlyActive(phone, at = Date.now(), cfg = agentConfig()) {
   if (!person?.last_seen_wit) return false;
   const parsed = Date.parse(String(person.last_seen_wit).replace(" WIT", "Z"));
   if (!Number.isFinite(parsed)) return false;
-  // last_seen_wit memakai zona WIT (UTC+9); koreksi agar perbandingan benar.
   const seenAt = parsed - 9 * HOUR;
   return at - seenAt <= cfg.activeDays * 24 * HOUR;
 }
@@ -135,7 +183,7 @@ async function sendDirect(sock, phone, text, { proactive = false, at = Date.now(
   return { jid, text };
 }
 
-async function runJob(job, { sock, at = Date.now() } = {}) {
+async function legacyRunJob(job, { sock, at = Date.now() } = {}) {
   const cfg = agentConfig();
   const phone = memoryStore.normalizePhone(job.payload?.phone);
   if (!phone) return { ...job, status: "invalid" };
@@ -159,35 +207,39 @@ async function runJob(job, { sock, at = Date.now() } = {}) {
   return { ...job, status: "unknown_type" };
 }
 
-async function runDueJobs({ sock = activeSock, at = Date.now() } = {}) {
+async function legacyRunDueJobs({ sock = activeSock, at = Date.now() } = {}) {
+  if (emergencyPaused) return [];
   const cfg = agentConfig();
   if (!cfg.enabled) return [];
-  const due = store.jobs.filter((job) => job.fire_at <= at);
+  const s = getStore();
+  const due = s.jobs.filter((job) => job.fire_at <= at);
   if (!due.length) return [];
-  const remaining = store.jobs.filter((job) => job.fire_at > at);
-  store.jobs = remaining;
-  save();
+  const remaining = s.jobs.filter((job) => job.fire_at > at);
+  s.jobs = remaining;
+  saveLegacy();
 
   const results = [];
   for (const job of due) {
     try {
-      results.push(await runJob(job, { sock, at }));
+      results.push(await legacyRunJob(job, { sock, at }));
     } catch (error) {
       console.error(`[AGENT] Job ${job.type} gagal:`, error.response?.data?.error?.message || error.message);
       results.push({ ...job, status: "error" });
-      store.jobs.push({ ...job, attempts: (job.attempts || 0) + 1, fire_at: at + 5 * MINUTE });
+      s.jobs.push({ ...job, attempts: (job.attempts || 0) + 1, fire_at: at + 5 * MINUTE });
     }
   }
-  save();
+  saveLegacy();
   return results;
 }
 
-function maybeScheduleProactive({ at = Date.now() } = {}) {
+function legacyMaybeScheduleProactive({ at = Date.now() } = {}) {
+  if (emergencyPaused) return null;
   const cfg = agentConfig();
   if (!cfg.enabled || !cfg.proactive) return null;
   if (humanize.isQuietHours(at)) return null;
   if (todayProactiveCount(at) >= cfg.dailyLimit) return null;
-  if (store.jobs.some((job) => job.type === "proactive_checkin")) return null;
+  const s = getStore();
+  if (s.jobs.some((job) => job.type === "proactive_checkin")) return null;
 
   const candidate = memoryStore.listPeople()
     .filter((person) => canProactivelyMessage(person.phone, at, cfg))
@@ -195,53 +247,240 @@ function maybeScheduleProactive({ at = Date.now() } = {}) {
     .sort((a, b) => (a.dm?.last_proactive_at || 0) - (b.dm?.last_proactive_at || 0))[0];
   if (!candidate) return null;
 
-  return scheduleJob({
+  return legacyScheduleJob({
     type: "proactive_checkin",
     fire_at: at + 1 * MINUTE + Math.floor(Math.random() * 5 * MINUTE),
     payload: { phone: candidate.phone, reason: "menyapa dan menanyakan kabar" },
   });
 }
 
-async function tick({ sock = activeSock, at = Date.now() } = {}) {
-  const results = await runDueJobs({ sock, at });
-  maybeScheduleProactive({ at });
+async function legacyTick({ sock = activeSock, at = Date.now() } = {}) {
+  const results = await legacyRunDueJobs({ sock, at });
+  legacyMaybeScheduleProactive({ at });
   return results;
 }
 
-function start({ sock } = {}) {
-  stop();
+function legacyStart({ sock } = {}) {
+  legacyStop();
   if (sock) activeSock = sock;
   if (!agentConfig().enabled) return null;
   timer = setInterval(() => {
-    tick({ sock: activeSock }).catch((error) => console.error("[AGENT] Tick gagal:", error.message));
+    legacyTick({ sock: activeSock }).catch((error) => console.error("[AGENT] Tick gagal:", error.message));
   }, agentConfig().tickMs);
   if (typeof timer.unref === "function") timer.unref();
   return timer;
 }
 
-function stop() {
+function legacyStop() {
   if (timer) clearInterval(timer);
   timer = null;
 }
 
-function setEnabled(value) {
-  memoryStore.setAgentSettings({ enabled: Boolean(value) });
-  if (!value) stop();
-  return agentConfig().enabled;
-}
-
-function status(at = Date.now()) {
+function legacyStatus(at = Date.now()) {
   const cfg = agentConfig();
   return {
     enabled: cfg.enabled,
     proactive: cfg.proactive,
-    jobs: listJobs().length,
-    nextJobs: listJobs().slice(0, 5),
+    emergencyPaused,
+    jobs: legacyListJobs().length,
+    nextJobs: legacyListJobs().slice(0, 5),
     proactiveToday: todayProactiveCount(at),
     dailyLimit: cfg.dailyLimit,
     quiet: humanize.isQuietHours(at),
     running: Boolean(timer),
   };
+}
+
+// ==========================================
+// DURABLE RESOLUTION (FOR SHADOW & AGENT)
+// ==========================================
+
+let activeDurableScheduler = null;
+
+function setDurableScheduler(ds) {
+  activeDurableScheduler = ds;
+  return activeDurableScheduler;
+}
+
+function getDurableScheduler() {
+  const lifecycle = getGlobalLifecycle();
+  if (lifecycle && lifecycle.started && lifecycle.lockHeld && lifecycle.durableScheduler) {
+    return lifecycle.durableScheduler;
+  }
+  return null;
+}
+
+function resolveDurableScheduler() {
+  const lifecycle = getGlobalLifecycle();
+  if (!lifecycle) {
+    throw new Error("DURABLE_SCHEDULER_UNAVAILABLE: Lifecycle durable runtime belum diinisialisasi");
+  }
+  if (!lifecycle.lockHeld || !lifecycle.durableScheduler) {
+    throw new Error("DURABLE_SCHEDULER_LOCK_FAILED: Lifecycle durable runtime gagal memegang process lock");
+  }
+  if (!lifecycle.started) {
+    throw new Error("DURABLE_SCHEDULER_UNAVAILABLE: Lifecycle durable runtime belum dijalankan");
+  }
+  return lifecycle.durableScheduler;
+}
+
+// ==========================================
+// UNIFIED ADAPTER EXPORTS
+// ==========================================
+
+function scheduleJob(opts) {
+  if (engineConfig.isLegacy()) {
+    return legacyScheduleJob(opts);
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.scheduleJob(opts);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function cancelJob(id) {
+  if (engineConfig.isLegacy()) {
+    return legacyCancelJob(id);
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.cancelJob(id);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function clearJobs() {
+  if (engineConfig.isLegacy()) {
+    return legacyClearJobs();
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.clearJobs();
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function listJobs(opts) {
+  if (engineConfig.isLegacy()) {
+    return legacyListJobs();
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.listJobs(opts);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function status(at = Date.now()) {
+  if (engineConfig.isLegacy()) {
+    return legacyStatus(at);
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.status(at);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function start({ sock } = {}) {
+  if (engineConfig.isLegacy()) {
+    return legacyStart({ sock });
+  }
+  const ds = resolveDurableScheduler();
+  return ds.start({ sock });
+}
+
+function stop() {
+  if (engineConfig.isLegacy()) {
+    return legacyStop();
+  }
+  const ds = getDurableScheduler();
+  if (ds) return ds.stop();
+}
+
+function setEnabled(value) {
+  if (engineConfig.isShadow()) {
+    throw new Error("Mode shadow dilarang memanggil API yang menulis memoryStore atau pengaturan agen produksi");
+  }
+  memoryStore.setAgentSettings({ enabled: Boolean(value) });
+  if (engineConfig.isLegacy()) {
+    if (!value) legacyStop();
+    return agentConfig().enabled;
+  }
+  const ds = getDurableScheduler();
+  if (ds) ds.setEnabled(value);
+  return agentConfig().enabled;
+}
+
+function setEmergencyPaused(value) {
+  emergencyPaused = Boolean(value);
+  if (!engineConfig.isLegacy()) {
+    const ds = getDurableScheduler();
+    if (ds) ds.setEmergencyPaused(value);
+  }
+  return emergencyPaused;
+}
+
+function isEmergencyPaused() {
+  if (engineConfig.isLegacy()) {
+    return emergencyPaused;
+  }
+  const ds = getDurableScheduler();
+  return ds ? ds.isEmergencyPaused() : emergencyPaused;
+}
+
+function runDueJobs(opts) {
+  if (engineConfig.isLegacy()) {
+    return legacyRunDueJobs(opts);
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.runDueJobs(opts);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function runJob(job, opts) {
+  if (engineConfig.isLegacy()) {
+    return legacyRunJob(job, opts);
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.runJob(job, opts);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function maybeScheduleProactive(opts) {
+  if (engineConfig.isLegacy()) {
+    return legacyMaybeScheduleProactive(opts);
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.maybeScheduleProactive(opts);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+function tick(opts) {
+  if (engineConfig.isLegacy()) {
+    return legacyTick(opts);
+  }
+  try {
+    const ds = resolveDurableScheduler();
+    return ds.tick(opts);
+  } catch (err) {
+    return Promise.reject(err);
+  }
 }
 
 module.exports = {
@@ -257,10 +496,17 @@ module.exports = {
   runJob,
   scheduleJob,
   setEnabled,
+  setEmergencyPaused,
+  isEmergencyPaused,
   start,
   status,
   stop,
   tick,
   todayProactiveCount,
-  JOBS_FILE,
+  get JOBS_FILE() {
+    return getJobsFile();
+  },
+  getJobsFile,
+  setDurableScheduler,
+  getDurableScheduler,
 };
