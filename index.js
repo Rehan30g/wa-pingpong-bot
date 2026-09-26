@@ -1,4 +1,6 @@
 require("dotenv").config({ quiet: true });
+// Pengaturan runtime dari dashboard owner menimpa nilai .env (bukan secret).
+require("./ai/runtime-settings").applySavedSettings();
 
 const {
   default: makeWASocket,
@@ -22,10 +24,17 @@ const directAgent = require("./ai/direct-agent");
 const memoryStore = require("./ai/memory-store");
 const scheduler = require("./ai/scheduler");
 const { extractVideoFrame } = require("./ai/media/video-frame");
-const { detectImageMime } = require("./ai/runtime/safe-media-fetch");
-const { validateImage } = require("./ai/media/image-validator");
 const { initGlobalLifecycle, getGlobalLifecycle } = require("./ai/runtime/lifecycle");
-const { routeTaskIntent } = require("./ai/runtime/intent-router");
+const { getStickerCollector, stickerSha } = require("./ai/stickers/collector");
+const { getStickerLibrary } = require("./ai/stickers/library");
+const { handleStickerCommand } = require("./ai/stickers/commands");
+const stickerCurator = require("./ai/stickers/curator");
+const { processVoiceNote } = require("./ai/audio/voice-notes");
+const agentUsage = require("./ai/agent/usage");
+const featureSettings = require("./ai/features");
+const proactiveState = require("./ai/agent/proactive");
+const { handleFeatureCommand } = require("./ai/features-commands");
+const { formatDuration } = require("./ai/audio/ears");
 
 const DATA_FILE = process.env.BOT_DATA_FILE || "./data.json";
 let data = { owner: null, allowedGroups: [], vetoAccess: {} };
@@ -101,6 +110,8 @@ function initReadline() {
 }
 
 let sock = null;
+let connectionOpen = false;
+const startedAt = Date.now();
 let presenceKeepAlive = null;
 const groupMetadataCache = new Map();
 const GROUP_METADATA_TTL_MS = 60_000;
@@ -162,9 +173,11 @@ async function startBot() {
       qrcode.generate(qr, { small: true });
     }
     if (connection === "open") {
+      connectionOpen = true;
       console.log("[+] Bot terhubung!");
       console.log("[i] Kirim /verify dari WhatsApp untuk menjadi owner.");
       startPresenceKeepAlive();
+      stickerCurator.startCurationScheduler();
       const lifecycle = getGlobalLifecycle();
       if (lifecycle) {
         await lifecycle.onTransportReady({ sock });
@@ -173,7 +186,9 @@ async function startBot() {
       }
     }
     if (connection === "close") {
+      connectionOpen = false;
       stopPresenceKeepAlive();
+      stickerCurator.stopCurationScheduler();
       const lifecycle = getGlobalLifecycle();
       if (lifecycle) {
         await lifecycle.onTransportClosed();
@@ -287,6 +302,8 @@ function getContextInfo(m) {
     m.message?.extendedTextMessage?.contextInfo ||
     m.message?.imageMessage?.contextInfo ||
     m.message?.videoMessage?.contextInfo ||
+    m.message?.audioMessage?.contextInfo ||
+    m.message?.stickerMessage?.contextInfo ||
     {}
   );
 }
@@ -464,6 +481,27 @@ function classifyAiMedia({ type, kind, format, msg } = {}) {
   };
 }
 
+// Media asli (bukan frame) dari pesan atau pesan yang di-reply, untuk media_edit.
+async function getRawMedia(m, { maxBytes = 64 * 1_048_576 } = {}) {
+  const direct = unwrapMediaWrappers(m?.message) || {};
+  const quoted = unwrapMediaWrappers(getContextInfo(m || {})?.quotedMessage) || {};
+  const pick = (content) => {
+    if (content.videoMessage) return { type: "videoMessage", msg: content.videoMessage, kind: content.videoMessage.gifPlayback ? "gif" : "video", ext: "mp4" };
+    if (content.stickerMessage) return { type: "stickerMessage", msg: content.stickerMessage, kind: "sticker", ext: "webp" };
+    if (content.imageMessage) return { type: "imageMessage", msg: content.imageMessage, kind: "image", ext: "jpg" };
+    if (content.audioMessage) return { type: "audioMessage", msg: content.audioMessage, kind: "audio", ext: "ogg" };
+    const doc = content.documentMessage;
+    if (doc && /^(video|audio|image)\//.test(doc.mimetype || "")) return { type: "documentMessage", msg: doc, kind: doc.mimetype.split("/")[0], ext: (doc.fileName || "").split(".").pop() || "bin" };
+    return null;
+  };
+  const media = pick(direct) || pick(quoted);
+  if (!media || !(media.msg.url || media.msg.directPath)) return null;
+  const declared = mediaFileLength(media.msg);
+  if (declared != null && declared > maxBytes) throw new Error("media lebih dari 64 MB");
+  const buffer = await downloadMedia({ message: { [media.type]: media.msg } }, { maxBytes });
+  return buffer?.length ? { buffer, kind: media.kind, ext: media.ext.replace(/[^a-z0-9]/gi, "").slice(0, 5) || "bin" } : null;
+}
+
 async function getAiMedia(m) {
   try {
     const direct = unwrapMediaWrappers(m.message) || {};
@@ -506,6 +544,107 @@ async function getAiMedia(m) {
   }
 }
 
+// get_chat_media mengunduh ulang media pesan lama yang sudah dibuang dari riwayat.
+groupAgent.setMediaLoader(getAiMedia);
+groupAgent.setRawMediaLoader(getRawMedia);
+// save_sticker mengunduh stiker yang di-reply bila belum pernah terkumpul.
+groupAgent.setStickerDownloader((stickerMessage) => downloadMedia({ message: { stickerMessage } }, { maxBytes: 2 * 1_048_576 }));
+
+// Voice note langsung dan yang di-reply → teks transkrip + mp3 untuk listen_audio.
+async function readVoiceNotes(m, { jid, isGroup, senderJid }) {
+  if (!groupAgent.isConfigured()) return null;
+  const direct = unwrapMediaWrappers(m.message)?.audioMessage || null;
+  const contextInfo = getContextInfo(m);
+  const quoted = unwrapMediaWrappers(contextInfo.quotedMessage)?.audioMessage || null;
+  if (!direct && !quoted) return null;
+  // Fitur "audio" mati: voice note tidak dikirim ke model audio sama sekali.
+  if (!featureSettings.isEnabled(isGroup ? jid : `${memoryStore.normalizePhone(senderJid)}@s.whatsapp.net`, "audio")) {
+    const label = (audio) => `[${audio.ptt === false ? "audio" : "voice note"} ${formatDuration(audio.seconds)}]`;
+    return { direct: direct ? { text: label(direct), audio: null } : null, quoted: quoted ? { text: label(quoted), audio: null } : null };
+  }
+  const chatKey = isGroup ? jid : directAgent.dmKey(senderJid);
+  const recentHistory = groupAgent.getHistory(chatKey);
+  const context = {
+    botName: groupAgent.config().botName,
+    participants: [...new Set(recentHistory.filter((item) => !item.is_bot).map((item) => item.sender))],
+    recent: recentHistory.slice(-5).map((item) => `[${item.sender}] ${item.text}`),
+  };
+  const read = (audioMessage, messageId) => processVoiceNote({
+    audioMessage,
+    messageId,
+    context,
+    download: () => downloadMedia({ message: { audioMessage } }, { maxBytes: Math.max(1, Number(process.env.AI_MAX_AUDIO_MB) || 16) * 1_048_576 }),
+  });
+  return {
+    direct: direct ? await read(direct, m.key?.id) : null,
+    quoted: quoted ? await read(quoted, contextInfo.stanzaId) : null,
+  };
+}
+
+// Grup aktif bot beserta status admin pengirim, dibaca langsung dari WhatsApp
+// (tanpa cache) supaya admin yang baru dicabut tidak bisa mengubah fitur.
+async function adminGroupsFor(identities, activeSock = sock) {
+  const groups = [];
+  for (const groupId of data.allowedGroups) {
+    let metadata = null;
+    try {
+      metadata = await activeSock?.groupMetadata?.(groupId);
+    } catch (error) {
+      console.warn("[FITUR] Gagal membaca metadata grup:", error.message);
+    }
+    if (metadata) groupMetadataCache.set(groupId, { at: Date.now(), value: metadata });
+    const participant = participantForIdentities(metadata, identities);
+    groups.push({
+      id: groupId,
+      subject: metadata?.subject || groupId,
+      admin: participant?.admin === "admin" || participant?.admin === "superadmin",
+    });
+  }
+  return groups;
+}
+
+// Pengumpulan stiker (Plan v2 §4a): hanya grup yang diizinkan dan DM yang
+// di-whitelist. Berjalan di latar supaya tidak menunda balasan.
+function observeStickerTraffic({ m, jid, isGroup, isAllowedGroup, text, senderJid, senderTag, senderPhoneVerified }) {
+  if (isGroup ? !isAllowedGroup : !memoryStore.canDirectMessage(senderJid)) return;
+  // DM dicatat memakai JID nomor (bukan LID) agar cocok dengan tujuan kirim Grad.
+  const chatId = isGroup || !senderPhoneVerified ? jid : `${memoryStore.normalizePhone(senderJid)}@s.whatsapp.net`;
+  if (!featureSettings.isEnabled(chatId, "stiker")) return;
+  const sticker = unwrapMediaWrappers(m.message)?.stickerMessage || null;
+  if (!sticker && (!text || /^[/!]/.test(text))) return;
+  getStickerCollector().observe({
+    chatId,
+    isDm: !isGroup,
+    senderId: senderPhoneVerified ? senderJid : null,
+    senderName: m.pushName || senderTag,
+    text,
+    sticker,
+    download: sticker ? () => downloadMedia({ message: { stickerMessage: sticker } }, { maxBytes: 2 * 1_048_576 }) : null,
+  }).catch((error) => console.warn("[STIKER] Gagal mencatat stiker:", error.message));
+}
+
+// Penanda teks untuk gambar/video/stiker saat fitur "media" mati.
+function visualPlaceholder(m) {
+  const content = unwrapMediaWrappers(m.message) || {};
+  if (content.stickerMessage) return "[mengirim stiker]";
+  if (content.videoMessage) return "[mengirim video]";
+  if (content.imageMessage) return "[mengirim gambar]";
+  return "";
+}
+
+// Teks riwayat untuk stiker manusia; stiker yang ada di koleksi Grad diberi maknanya.
+async function stickerHistoryText(m) {
+  const sticker = unwrapMediaWrappers(m.message)?.stickerMessage;
+  const sha = sticker ? stickerSha(sticker.fileSha256) : null;
+  if (!sha) return "[mengirim stiker]";
+  try {
+    const label = await getStickerLibrary().labelFor(sha);
+    return label ? `[mengirim stiker: ${label}]` : "[mengirim stiker]";
+  } catch {
+    return "[mengirim stiker]";
+  }
+}
+
 async function runLegacyMessageFlow({
   m,
   jid,
@@ -526,11 +665,22 @@ async function runLegacyMessageFlow({
 }) {
   const currentSock = activeSock || sock;
 
-  if (/^[/!]task(?:\s|$)/i.test(text)) {
-    if ((!isGroup && (fromOwner || memoryStore.canDirectMessage(senderJid))) || (isGroup && isAllowedGroup)) {
-      await currentSock.sendMessage(jid, { text: "Perintah /task ini belum tersedia di chat ini. Tidak ada catatan atau pengingat yang dibuat." });
+  observeStickerTraffic({ m, jid, isGroup, isAllowedGroup, text, senderJid, senderTag, senderPhoneVerified });
+
+  // /task hanyalah alias: isinya diperlakukan sebagai pesan yang ditujukan ke
+  // bot dan masuk agent loop seperti mention biasa (Plan v2 M1).
+  let forceAddressed = false;
+  const taskAlias = text.match(/^[/!]task(?:\s+([\s\S]*))?$/i);
+  if (taskAlias) {
+    const permitted = (!isGroup && (fromOwner || memoryStore.canDirectMessage(senderJid))) || (isGroup && isAllowedGroup);
+    if (!permitted) return;
+    if (!taskAlias[1]?.trim()) {
+      await currentSock.sendMessage(jid, { text: "Tulis permintaannya setelah /task, atau langsung mention aku aja." });
+      return;
     }
-    return;
+    text = taskAlias[1].trim();
+    cmd = text.toLowerCase();
+    forceAddressed = true;
   }
 
   // ===== VERIFIKASI OWNER =====
@@ -581,22 +731,56 @@ async function runLegacyMessageFlow({
       if (enabled) scheduler.start({ sock });
     } else if (arg === "clear") {
       await scheduler.clearJobs();
+    } else if (arg === "social") {
+      // /agent social on|off: jalur nimbrung sosial grup ini (jalur bantuan tetap jalan).
+      const value = cmd.split(/\s+/)[2];
+      if (!isGroup || !["on", "off"].includes(value)) {
+        await sock.sendMessage(jid, { text: "Pakai di dalam grup: /agent social on atau /agent social off" });
+        return;
+      }
+      featureSettings.setGroupFeature(jid, "sosial", value === "on", { phone: senderJid, role: "owner" });
+      if (value === "on") proactiveState.unmute(jid);
     }
     const state = await scheduler.status();
+    const social = isGroup ? proactiveState.status(jid) : null;
+    const usage = agentUsage.today();
+    const budget = agentUsage.budgetConfig();
     await sock.sendMessage(jid, {
       text: [
         "🤖 *STATUS AGEN GRAD*",
         `Aktif: ${state.enabled ? "ya" : "tidak"}`,
+        `Tugas hari ini: ${usage.tasks} (${usage.steps} langkah, ${usage.searches} pencarian web, ${usage.fetches} baca link, ${usage.audio} audio)`,
+        `Token: ${usage.tokens} · biaya $${usage.cost.toFixed(3)} dari budget harian $${budget.dailyUsd}${usage.cost >= budget.dailyUsd ? " (habis: tools dimatikan sampai besok)" : ""}`,
         `DM proaktif: ${state.proactive ? "boleh" : "tidak"}`,
         `Job menunggu: ${state.jobs}`,
         `DM proaktif hari ini: ${state.proactiveToday}/${state.dailyLimit}`,
-        `Jam tenang: ${state.quiet ? "ya (bot tidak memulai DM)" : "tidak"}`,
+        `Jam tenang: ${state.quiet ? "ya (bot tidak memulai DM atau nimbrung sosial)" : "tidak"}`,
+        ...(social ? [
+          `Nimbrung sosial di grup ini: ${featureSettings.isEnabled(jid, "sosial") ? "aktif" : "mati"}${social.mutedUntil ? ` · diminta diam sampai ${new Date(social.mutedUntil).toLocaleTimeString("id-ID", { timeZone: "Asia/Jayapura", hour: "2-digit", minute: "2-digit" })} WIT` : ""} · ${social.socialLastHour} kali dalam 1 jam`,
+          `Masuk untuk bantuan: ${social.help.ok ? "siap" : social.help.reason}`,
+        ] : []),
         "",
-        "Perintah: /agent on, /agent off, /agent clear, /agent status",
+        "Perintah: /agent on, /agent off, /agent clear, /agent status, /agent social on|off",
       ].join("\n"),
     });
     return;
   }
+
+  // ===== KOLEKSI STIKER GRAD (khusus owner) =====
+  if (await handleStickerCommand({ sock, jid, cmd, text, fromOwner })) return;
+
+  // ===== FITUR PER GRUP (admin WA grup lewat DM; di grup read-only) =====
+  if (await handleFeatureCommand({
+    sock,
+    jid,
+    isGroup,
+    isAllowedGroup,
+    cmd,
+    fromOwner,
+    senderPhone: senderJid,
+    listGroups: () => adminGroupsFor(senderIdentities, currentSock),
+    canReply: memoryStore.canDirectMessage(senderJid),
+  })) return;
 
   // ===== AKTIVASI GRUP (khusus owner) =====
   if (cmd === "/allow" || cmd === "/deny") {
@@ -624,20 +808,33 @@ async function runLegacyMessageFlow({
     return;
   }
 
+  // ===== VOICE NOTE: "telinga" Grad =====
+  // Voice note (langsung atau yang di-reply) ditranskrip Gemini sebelum Jev,
+  // hanya di grup yang diizinkan dan DM yang di-whitelist.
+  const voicePermitted = isGroup ? isAllowedGroup : (fromOwner || memoryStore.canDirectMessage(senderJid));
+  const voice = voicePermitted ? await readVoiceNotes(m, { jid, isGroup, senderJid }) : null;
+  if (voice?.direct && !text) text = voice.direct.text;
+  const quotedText = getQuotedText(m) || voice?.quoted?.text || "";
+  const audio = voice?.direct?.audio || voice?.quoted?.audio || null;
+
 // ===== CHAT PRIBADI (DM) =====
   if (!isGroup) {
     // Perintah tidak dikenal di DM diabaikan; media tanpa caption tetap diproses.
     if (text.startsWith("/")) return;
-    const dmMedia = earlyMedia || (await getAiMedia(m));
-    if (!text && !dmMedia) return;
+    // Fitur "media" mati: gambar/video tidak diunduh untuk AI, cukup penanda teks.
+    const dmMediaOn = featureSettings.isEnabled(`${memoryStore.normalizePhone(senderJid)}@s.whatsapp.net`, "media");
+    const dmMedia = dmMediaOn ? earlyMedia || (await getAiMedia(m)) : null;
+    const dmVisual = !dmMediaOn && visualPlaceholder(m);
+    if (!text && !dmMedia && !dmVisual) return;
     await directAgent.processDirectMessage({
       sock,
       message: m,
       phone: senderJid,
       senderName: m.pushName || senderTag,
-      text: text || (dmMedia?.kind === "sticker" ? "[mengirim stiker]" : dmMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
-      quotedText: getQuotedText(m),
+      text: text || dmVisual || (dmMedia?.kind === "sticker" ? await stickerHistoryText(m) : dmMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+      quotedText,
       media: dmMedia,
+      audio,
       isOwner: fromOwner,
     });
     return;
@@ -784,16 +981,18 @@ async function runLegacyMessageFlow({
 
   // ----- AI GROUP AGENT -----
   // Jev memilih diam/react/jawab; GLM hanya dipanggil untuk menulis jawaban.
-  const aiMedia = earlyMedia || (await getAiMedia(m));
-  if (!text && !aiMedia) return;
+  const mediaOn = featureSettings.isEnabled(jid, "media");
+  const aiMedia = mediaOn ? earlyMedia || (await getAiMedia(m)) : null;
+  const visual = !mediaOn && visualPlaceholder(m);
+  if (!text && !aiMedia && !visual) return;
   const contextInfo = getContextInfo(m);
   const mentioned = (contextInfo.mentionedJid || []).map(normalizeJid);
   const metadataMention = Boolean(botIdentities().some((id) => mentioned.includes(id)));
   const nameMention = groupAgent.textMentionsBotName(text);
-  const explicitMention = metadataMention || nameMention;
+  const explicitMention = metadataMention || nameMention || forceAddressed;
   const replyToBot = isReplyToBot(contextInfo);
   const decoratedText = decorateMentions(text, contextInfo, metadataCache);
-  const decoratedQuoted = decorateMentions(getQuotedText(m), contextInfo, metadataCache);
+  const decoratedQuoted = decorateMentions(quotedText, contextInfo, metadataCache);
 
   // Catat orang yang pernah aktif di grup agar Grad mengenalnya dan boleh
   // membalas/ memulai DM hanya kepada mereka.
@@ -809,10 +1008,11 @@ async function runLegacyMessageFlow({
     groupId: jid,
     senderId: senderPhoneVerified ? senderJid : "nomor-tidak-diketahui",
     senderName: m.pushName || senderTag,
-    text: decoratedText || (aiMedia?.kind === "sticker" ? "[mengirim stiker]" : aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+    text: decoratedText || visual || (aiMedia?.kind === "sticker" ? await stickerHistoryText(m) : aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
     explicitMention,
     replyToBot,
     media: aiMedia,
+    audio,
     quotedText: decoratedQuoted,
   });
 }
@@ -820,7 +1020,6 @@ async function runLegacyMessageFlow({
 async function dispatchInboundMessage(m, {
   sock: customSock = null,
   lifecycle: customLifecycle = null,
-  mediaLoader = getAiMedia,
 } = {}) {
   const activeSock = customSock || sock;
   if (!m?.message || m?.key?.fromMe) return null;
@@ -836,7 +1035,10 @@ async function dispatchInboundMessage(m, {
   if (!text) {
     if (isGroup && !isAllowedGroup) return null;
     earlyMedia = await getAiMedia(m);
-    if (!earlyMedia) return null;
+    // Stiker tetap dicatat koleksi walau unduhan untuk AI gagal; voice note
+    // diproses "telinga" Grad di runLegacyMessageFlow.
+    const content = unwrapMediaWrappers(m.message) || {};
+    if (!earlyMedia && !content.stickerMessage && !content.audioMessage) return null;
   }
 
   // identitas pengirim
@@ -950,7 +1152,7 @@ async function dispatchInboundMessage(m, {
   const nameMention = groupAgent.textMentionsBotName(text);
   const explicitMention = metadataMention || nameMention;
   const replyToBot = isReplyToBot(contextInfo);
-  const isDirectTaskCommand = /^[!/](task|catat|note|baca|readnote|ringkas|summarize|rangkum)\b/i.test(text);
+  const isDirectTaskCommand = /^[!/]task\b/i.test(text);
 
   const addressedToBot = !isGroup || explicitMention || replyToBot || isDirectTaskCommand;
 
@@ -973,126 +1175,29 @@ async function dispatchInboundMessage(m, {
     return { status: "rejected_dm_not_whitelisted", handled: false };
   }
 
-  // 5. Bounded Task Intent Router (Fase 3 allowlist: create_note, read_note, summarize_context)
-  const taskIntent = routeTaskIntent(text, { isGroup, fromOwner, addressedToBot });
-  if (!taskIntent) {
-    if (/^[/!]task(?:\s|$)/i.test(text) && currentLifecycle.isShadow()) {
-      return { status: "shadow_unsupported_task_intent", handled: true };
-    }
-    if (currentLifecycle.isShadow()) {
-      return { status: "shadow_casual_message_ignored", handled: true };
-    }
-    return runLegacyMessageFlow({
-      m,
-      jid,
-      isGroup,
-      isAllowedGroup,
-      text,
-      cmd,
-      senderJid,
-      senderTag,
-      senderIdentities,
-      senderPhoneVerified,
-      fromOwner,
-      loadSenderMetadata,
-      earlyMedia,
-      metadataCache,
-      senderParticipant,
-      activeSock,
-    });
+  // 5. Tidak ada lagi router regex: semua pesan masuk jalur yang sama, dan Jev +
+  //    agent loop yang memutuskan apakah itu tugas (Plan v2 M1).
+  if (currentLifecycle.isShadow()) {
+    return { status: "shadow_casual_message_ignored", handled: true };
   }
-
-  // 6. Canary Allowlist Guard pada Mode Agent
-  if (currentLifecycle.isAgent()) {
-    const canary = currentLifecycle.getCanaryManager();
-    const isAllowed = canary.isAllowed({
-      chatId: jid,
-      actorPn: senderJid,
-      engineMode: "agent",
-    });
-    if (!isAllowed) {
-      console.warn(`[RUNTIME] Agent canary allowlist ditolak (fail closed) untuk chat ${jid} / actor ${senderJid}`);
-      return { status: "rejected_canary_allowlist", handled: false };
-    }
-  }
-
-  // 7. Atomic Ingestion melalui InboxManager
-  const sourceEventId = m.key?.id || `evt_${Date.now()}`;
-  const dedupResult = await inboxManager.processInboundEvent({
-    transport: "baileys",
-    chatId: jid,
-    participantPn: senderJid,
-    sourceEventId,
-    payload: {
-      text,
-      senderName: m.pushName || senderTag,
-      isGroup,
-      fromOwner,
-    },
-    taskIntent: {
-      goal: taskIntent.goal,
-      acceptance_criteria: taskIntent.acceptanceCriteria || null,
-      scope: taskIntent.scope || "active_chat",
-      authorization_ref: fromOwner ? `owner_${senderJid}` : `member_${senderJid}`,
-      risk_level: taskIntent.risk_level || "low",
-      provenance: "runtime_inbound_message",
-    },
+  return runLegacyMessageFlow({
+    m,
+    jid,
+    isGroup,
+    isAllowedGroup,
+    text,
+    cmd,
+    senderJid,
+    senderTag,
+    senderIdentities,
+    senderPhoneVerified,
+    fromOwner,
+    loadSenderMetadata,
+    earlyMedia,
+    metadataCache,
+    senderParticipant,
+    activeSock,
   });
-
-  if (dedupResult.duplicate) {
-    return {
-      status: "duplicate_event",
-      duplicate: true,
-      eventId: dedupResult.eventId,
-      task: null,
-      handled: true,
-    };
-  }
-
-  if (["fetch_media_from_message", "make_sticker", "send_asset"].includes(taskIntent.intent) && dedupResult.task) {
-    const task = dedupResult.task;
-    try {
-      if (sourceEventId.length > 200 || !currentLifecycle.assetStore) throw new Error("media_scope_unavailable");
-      const media = earlyMedia || await mediaLoader(m);
-      const dataUrl = media?.frameDataUrl || media?.dataUrl;
-      const match = typeof dataUrl === "string" && /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
-      if (!match) throw new Error("media_image_unavailable");
-      const buffer = Buffer.from(match[2], "base64");
-      const mime = detectImageMime(buffer);
-      if (mime !== `image/${match[1]}`) throw new Error("media_magic_invalid");
-      const decoded = await validateImage(buffer);
-      if (decoded.mime !== mime) throw new Error("media_decode_mismatch");
-      const saved = await currentLifecycle.assetStore.put(buffer, { chatId: jid, taskId: task.task_id, mime });
-      dedupResult.task = await currentLifecycle.storage.updateTask(task.task_id, {
-        expectedVersion: task.version,
-        goal: `${task.goal} Sumber entry_id: ${sourceEventId}.`,
-        evidence_refs: [{ type: "source_media", entry_id: sourceEventId, asset_id: saved.assetId, sha256: saved.sha256, mime, source_type: media.type }],
-      });
-    } catch (error) {
-      await currentLifecycle.storage.updateTask(task.task_id, {
-        expectedVersion: task.version,
-        status: "failed",
-        evidence_refs: [{ type: "source_media_error", code: String(error.message || "media_unavailable").slice(0, 80) }],
-      });
-      return { status: "media_unavailable", handled: true, taskId: task.task_id };
-    }
-  }
-
-  // 8. Eksekusi Task melalui TaskRunner resmi
-  let taskExecutionResult = null;
-  const runner = currentLifecycle.getTaskRunner();
-  if (runner && dedupResult.task) {
-    taskExecutionResult = await runner.runTask(dedupResult.task.task_id);
-  }
-
-  return {
-    status: "task_enqueued_and_executed",
-    duplicate: false,
-    eventId: dedupResult.eventId,
-    task: dedupResult.task,
-    taskExecutionResult,
-    handled: true,
-  };
 }
 
 async function handleMessage(m, options = {}) {
@@ -1148,4 +1253,12 @@ if (require.main === module) {
     process.exit(0);
   });
   startBot();
+  // Dashboard owner lokal (127.0.0.1:7777). Gagal start tidak menghentikan bot.
+  require("./ai/dashboard/server").startDashboard({
+    startedAt,
+    isConnected: () => connectionOpen,
+    botUser: () => sock?.user?.id || null,
+    getData: () => data,
+    groupSubject: async (groupId) => (await getGroupMetadataSafe(groupId))?.subject || null,
+  });
 }

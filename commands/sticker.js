@@ -3,7 +3,7 @@ const sharp = require("sharp");
 // Kontrak downloadMedia(m): async, return Buffer media dari pesan m (current atau quoted) — disediakan integrator, bukan di sini.
 module.exports = {
   name: "sticker",
-  match: (text) => text === "/s" || text === "/stiker" || text === "/sticker",
+  match: (text) => text === "/s" || text === "/sticker",
   handler: async ({ sock, m, jid, text, downloadMedia }) => {
     try {
       const quotedImage = m.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage;

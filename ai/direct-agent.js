@@ -3,6 +3,10 @@ const memoryStore = require("./memory-store");
 const humanize = require("./humanize");
 const { createJevClient } = require("./providers/jev-client");
 const { createGlmClient } = require("./providers/glm-client");
+const activeLoops = require("./agent/active-loops");
+const { agentInstructions, runAgentLoop } = require("./agent/loop");
+const usageTracker = require("./agent/usage");
+const featureSettings = require("./features");
 
 const DM_PREFIX = "dm:";
 const dmPending = new Map();
@@ -161,19 +165,23 @@ async function decideDirectAction({ phone, latestMessage, quotedText, media, his
   };
 }
 
-function buildDirectMessages({ phone, latestMessage, quotedText, media, historySnapshot }) {
+function buildDirectMessages({ phone, latestMessage, quotedText, media, historySnapshot, toolsDisabled = false, stickerIndex = "", features = null, rememberedFacts = [] }) {
   const cfg = dmConfig();
   const { person, dm } = personContext(phone);
   const conversation = historySnapshot
-    .map((item) => `#${item.entry_id} ${item.sender} [${item.sender_id}]: ${item.text}${item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : ""}`)
+    .map((item) => `#${item.entry_id} ${item.sender} [${item.sender_id}]: ${item.text}${item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : ""}${item.audio ? " [audio tersimpan]" : ""}`)
     .join("\n");
-  const mediaPart = groupAgent.mediaContentPart(media);
+  const hasAudio = historySnapshot.some((item) => item.audio);
+  const hasStickers = Boolean(stickerIndex) && !toolsDisabled;
+  const canSaveStickers = !toolsDisabled && (!features || features.has("stiker")) && groupAgent.historyHasStickers(historySnapshot);
+  const mediaEnabled = !features || features.has("media");
+  const mediaPart = mediaEnabled ? groupAgent.mediaContentPart(media) : null;
   const latestHistoryEntry = historySnapshot.at(-1);
   const latestEntryIsCurrent = latestHistoryEntry
     && latestHistoryEntry.sender_id === latestMessage.sender_id
     && latestHistoryEntry.text === latestMessage.text;
   const historicalMedia = historySnapshot
-    .filter((item) => item.media && (!latestEntryIsCurrent || item.entry_id !== latestHistoryEntry.entry_id))
+    .filter((item) => mediaEnabled && item.media && (!latestEntryIsCurrent || item.entry_id !== latestHistoryEntry.entry_id))
     .map((item) => ({
       label: `Media lama dari #${item.entry_id} ${item.sender}: ${item.text}`,
       part: groupAgent.mediaContentPart(item.media),
@@ -196,8 +204,8 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
         ? "Ada video terlampir dari pengguna, namun isi visual video belum dianalisis. Jangan mengklaim telah menonton video tersebut."
         : ""),
     mediaPart ? `Klasifikasi media terbaru: ${media.kind || "attachment"}/${media.format || media.type}.` : "",
-    "Pilih reply_to_entry_id dari nomor # jika perlu mengutip pesan tertentu, atau null untuk chat biasa tanpa kutipan.",
-    "Jangan otomatis mengutip pesan terbaru.",
+    hasStickers ? `Koleksi stiker yang boleh kamu pakai di chat ini (id — makna [mood] · kapan · frekuensi):\n${stickerIndex}` : "",
+    rememberedFacts.length ? `Hal yang kamu ingat di chat ini (pakai bila relevan):\n${rememberedFacts.join("\n")}` : "",
   ].filter(Boolean).join("\n");
 
   return [
@@ -207,15 +215,15 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
         `Nama kamu ${cfg.botName}. Kamu ${cfg.botRole}.`,
         "Ini chat pribadi, jadi balas seperti orang yang sedang mengobrol berdua: hangat, natural, dan langsung ke inti.",
         "Gunakan bahasa yang sama dengan pengguna; bila campuran, pakai bahasa Indonesia santai dan sopan.",
-        "Jangan gunakan Markdown, heading, tabel, atau code fence.",
-        "Biasanya satu atau dua kalimat pendek saja. Jangan bertele-tele.",
+        "Jangan gunakan heading, tabel, code fence, atau link Markdown.",
+        "Untuk obrolan biasa cukup satu atau dua kalimat pendek. Jangan bertele-tele.",
         "Hindari emoji yang tidak perlu atau berlebihan; gunakan gaya percakapan teks santai dan bersahaja.",
         "Jangan mengaku manusia atau punya tubuh/perasaan; jangan membahas proses internal atau model AI.",
         "Jangan pernah menawarkan atau melakukan penyebaran pesan ke banyak orang, broadcast, atau forward. Kalau diminta, tolak singkat dan tawarkan bantu susun pesannya agar pengguna kirim sendiri.",
         "Jangan mengaku telah mencatat atau menjadwalkan pengingat kecuali sistem sudah memastikan penyimpanannya berhasil.",
         "Jika pengguna mengirim video, jangan mengaku telah menonton isinya; sampaikan secara wajar bahwa isi visual video belum dapat dianalisis pada fase ini.",
         "Boleh menyapa balik dan menanyakan kabar secara wajar, tetapi jangan memaksa topik.",
-        `Jawaban maksimum ${cfg.maxReplyChars} karakter.`,
+        agentInstructions({ maxReplyChars: cfg.maxReplyChars, hasAudio, hasStickers, canSaveStickers, toolsDisabled, features }),
       ].join(" "),
     },
     {
@@ -231,8 +239,18 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
   ];
 }
 
-async function generateDirectReply(args) {
+// DM memakai agent loop yang sama dengan grup (Plan v2 §3).
+async function generateDirectReply({ handle = null, sendProgress = null, sock = null, requestRef = null, ...args }) {
   const cfg = dmConfig();
+  const key = dmKey(args.phone);
+  const toolsDisabled = usageTracker.dailyBudgetLeft() <= 0;
+  const features = featureSettings.enabledSet(phoneJid(args.phone));
+  const stickers = toolsDisabled || !features.has("stiker") ? null : await groupAgent.stickerContext(phoneJid(args.phone));
+  const notes = features.has("memori") ? require("./memory/notebook").forChat({
+    chatId: phoneJid(args.phone),
+    sender: { phone: args.phone, name: args.latestMessage?.sender },
+    groupMemory: () => memoryStore.getDmMemory(args.phone).glm,
+  }) : null;
   const glm = createGlmClient({
     model: cfg.chatModel,
     apiKey: cfg.apiKey,
@@ -240,33 +258,39 @@ async function generateDirectReply(args) {
     baseURL: process.env.OPENROUTER_BASE_URL,
     reasoningEffort: cfg.reasoningEffort,
     supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
+    timeoutMs: 90_000,
   });
-
-  const response = await glm.chatCompletion({
+  const result = await runAgentLoop({
+    messages: buildDirectMessages({ ...args, toolsDisabled, stickerIndex: stickers?.index || "", features, rememberedFacts: notes?.promptFacts() || [] }),
+    glm,
     model: cfg.chatModel,
-    messages: buildDirectMessages(args),
-    responseFormat: {
-      type: "json_schema",
-      json_schema: {
-        name: "whatsapp_direct_reply",
-        strict: true,
-        schema: {
-          type: "object",
-          properties: {
-            text: { type: "string" },
-            reply_to_entry_id: { type: ["integer", "null"] },
-          },
-          required: ["text", "reply_to_entry_id"],
-          additionalProperties: false,
-        },
-      },
+    handle,
+    sendProgress,
+    maxReplyChars: cfg.maxReplyChars,
+    toolContext: {
+      toolsDisabled,
+      botName: cfg.botName,
+      hasAudio: (args.historySnapshot || []).some((item) => item.audio),
+      hasMedia: (args.historySnapshot || []).some((item) => item.media || item.has_image || item.has_video || item.media_kind),
+      mediaPart: groupAgent.mediaContentPart,
+      loadMedia: groupAgent.getMediaLoader(),
+      stickers,
+      features,
+      python: features.has("python") && require("./sandbox/python-runner").isReady() ? { run: ({ code }) => require("./sandbox/python-runner").runPython({ chatId: phoneJid(args.phone), code }) } : null,
+      outbox: { media: [] },
+      background: features.has("latar") && sock ? groupAgent.makeBackgroundControl({ chatId: phoneJid(args.phone), historyKey: key, isDm: true, latestMessage: args.latestMessage, requestRef, sock }) : null,
+      mediaEditor: features.has("edit_media") ? groupAgent.makeMediaEditor({ chatId: phoneJid(args.phone), historyKey: key }) : null,
+      hasStickerMessages: Boolean(stickers) && groupAgent.historyHasStickers(args.historySnapshot || []),
+      notebook: notes,
+      compactMemory: () => memoryStore.getDmMemory(args.phone).glm,
+      schedules: features.has("reminder") ? require("./agent/schedules").forChat({ chatId: phoneJid(args.phone), isDm: true, createdBy: args.phone }) : null,
+      saveSticker: stickers ? groupAgent.makeStickerSaver({ chatId: phoneJid(args.phone), historyKey: key, isDm: true, requester: args.latestMessage?.sender, requesterId: args.phone, stickers }) : null,
+      getHistory: () => groupAgent.getHistory(key),
     },
-    maxTokens: 160,
-    temperature: 0.4,
-    reasoningEffort: cfg.reasoningEffort,
-    supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
   });
-  return groupAgent.parseGeneratedReply(response.text, cfg.maxReplyChars);
+  usageTracker.recordTask({ steps: result.steps, tokens: result.usage.tokens, cost: result.usage.cost, searches: result.searches, fetches: result.toolCounts.web_fetch || 0 });
+  usageTracker.logTask(key, result);
+  return result;
 }
 
 async function generateProactive(phone, { reason = "menyapa" } = {}) {
@@ -337,12 +361,16 @@ async function deliverDirect(sock, jid, text, { message, cfg, split = true } = {
 
 async function evaluateDirectMessage(
   { sock, message, phone, senderName, text, quotedText, media, jid, isOwner },
-  { scheduledEpoch, historySnapshot },
+  { scheduledEpoch, historySnapshot, entry = null },
 ) {
   const cfg = dmConfig();
   const key = dmKey(phone);
   const target = jid || phoneJid(phone);
   if ((dmEpochs.get(key) || 0) !== scheduledEpoch) return { action: "superseded" };
+  if (entry?.absorbed) {
+    await groupAgent.markRead(sock, message);
+    return { action: "absorbed" };
+  }
 
   const latestMessage = { sender: senderName, sender_id: phone, text };
   let decision;
@@ -376,30 +404,7 @@ async function evaluateDirectMessage(
     memoryStore.setDmMemory(phone, { opt_out: false, proactive_consent: true, proactive_consent_at: Date.now(), proactive_consent_source: "dm_opt_in" });
   }
 
-  if (intent === "reminder") {
-    const reminder = humanize.parseReminderRequest(text);
-    let scheduled = false;
-    let response = "Aku belum bisa menjadwalkannya. Sebutkan waktu yang jelas, misalnya: ingetin aku besok jam 9 WIT untuk rapat.";
-    if (reminder) {
-      try {
-        const job = await require("./scheduler").scheduleJob({
-          type: "reminder",
-          fire_at: reminder.fireAt,
-          payload: { phone, text: reminder.text },
-        });
-        if (!job) throw new Error("Job tidak tersimpan");
-        scheduled = true;
-        const when = new Date(reminder.fireAt).toLocaleString("id-ID", { timeZone: "Asia/Jayapura", dateStyle: "medium", timeStyle: "short" });
-        response = `Oke, pengingat untuk ${reminder.text} sudah dijadwalkan pada ${when} WIT.`;
-      } catch (error) {
-        console.warn("[DM] Gagal menjadwalkan reminder:", error.message);
-        response = "Maaf, pengingatnya gagal disimpan. Belum ada pengingat yang terjadwal.";
-      }
-    }
-    const sent = await deliverDirect(sock, target, response, { message, cfg, split: false });
-    groupAgent.remember(key, { sender: cfg.botName, senderId: "BOT", text: response, isBot: true, messageKey: sent?.key, messageRef: sent });
-    return { action: scheduled ? "reminder_scheduled" : "reminder_not_scheduled", text: response, decision };
-  }
+  // Reminder DM ditangani agent loop lewat tool schedule (M3), bukan regex.
 
   // Di chat pribadi bot merespons lebih sering: hanya diam untuk spam atau
   // keputusan ignore yang sangat yakin.
@@ -408,27 +413,46 @@ async function evaluateDirectMessage(
   if (!shouldReply) return { action: "ignore", decision };
 
   await groupAgent.setTyping(sock, target, "composing");
+  const handle = activeLoops.begin(key);
+  handle.requesterId = phone;
+  const typingTimer = setInterval(() => groupAgent.setTyping(sock, target, "composing"), 8_000);
+  typingTimer.unref?.();
   try {
-    const generated = await generateDirectReply({ phone, latestMessage, quotedText, media, historySnapshot });
-    if ((dmEpochs.get(key) || 0) !== scheduledEpoch) return { action: "superseded", decision };
-    if (!generated.text) return { action: "ignore", decision };
-    const quotedMessage = groupAgent.replyTargetForEntry(historySnapshot, generated.replyToEntryId);
-    const sent = await deliverDirect(sock, target, generated.text, { message: quotedMessage, cfg });
-    groupAgent.remember(key, {
-      sender: cfg.botName,
-      senderId: "BOT",
-      text: generated.text,
-      isBot: true,
-      messageKey: sent?.key,
-      messageRef: sent,
+    const generated = await generateDirectReply({
+      phone, latestMessage, quotedText, media, historySnapshot, handle, sock, requestRef: message?.key ? message : null,
+      sendProgress: async (progressText) => {
+        const progressSent = await sock.sendMessage(target, { text: progressText });
+        groupAgent.remember(key, { sender: cfg.botName, senderId: "BOT", text: progressText, isBot: true, messageKey: progressSent?.key, messageRef: progressSent });
+        await groupAgent.setTyping(sock, target, "composing");
+      },
     });
+    if (generated.status === "aborted") return { action: "stopped", decision };
+    if ((dmEpochs.get(key) || 0) !== scheduledEpoch) return { action: "superseded", decision };
+    if (!generated.text && !generated.stickers?.length && !generated.media?.length) return { action: "ignore", decision };
+    const quotedMessage = groupAgent.replyTargetForEntry(historySnapshot, generated.replyToEntryId);
+    if (generated.text) {
+      // Jawaban berformat daftar (hasil tugas) dikirim utuh; obrolan boleh dipecah.
+      const sent = await deliverDirect(sock, target, generated.text, { message: quotedMessage, cfg, split: !generated.usedTools && !generated.text.includes("\n") });
+      groupAgent.remember(key, {
+        sender: cfg.botName,
+        senderId: "BOT",
+        text: generated.text,
+        isBot: true,
+        messageKey: sent?.key,
+        messageRef: sent,
+      });
+    }
+    const mediaSent = await groupAgent.sendOutboxMedia(sock, target, generated.media, { historyKey: key });
+    const stickersSent = await groupAgent.sendQueuedStickers(sock, target, generated.stickers, { isDm: true, historyKey: key, quoted: generated.text ? null : quotedMessage });
     memoryStore.noteBotDm(phone, { at: Date.now(), proactive: false });
     scheduleDmCompaction(phone);
-    return { action: "reply", text: generated.text, replyToEntryId: generated.replyToEntryId, decision };
+    return { action: generated.text ? "reply" : mediaSent.length ? "media" : "sticker", text: generated.text, media: mediaSent, stickers: stickersSent, replyToEntryId: generated.replyToEntryId, toolCounts: generated.toolCounts, decision };
   } catch (error) {
     console.error("[DM] GLM gagal:", error.response?.data?.error?.message || error.message);
     return { action: "error", decision };
   } finally {
+    clearInterval(typingTimer);
+    activeLoops.end(handle);
     await groupAgent.setTyping(sock, target, "paused");
   }
 }
@@ -446,7 +470,7 @@ function processDirectMessage(args) {
   const scheduledEpoch = dmEpochs.get(key) || 0;
   memoryStore.recordParticipant({ phone, name: args.senderName, at: witNow() });
 
-  groupAgent.remember(key, {
+  const entry = groupAgent.remember(key, {
     sender: args.senderName,
     senderId: phone,
     text: args.text,
@@ -455,9 +479,22 @@ function processDirectMessage(args) {
     hasImage: args.media?.type === "image",
     hasVideo: args.media?.type === "video",
     media: args.media,
+    audio: args.audio,
     messageKey: args.message?.key,
     messageRef: args.message,
   });
+
+  const active = activeLoops.get(key);
+  if (active) {
+    if (activeLoops.isStopCommand(args.text, dmConfig().botName)) {
+      active.abort();
+      entry.absorbed = true;
+      return Promise.resolve(args.sock?.sendMessage?.(args.jid || phoneJid(phone), { react: { text: "👍", key: args.message?.key } })
+        .catch(() => {}))
+        .then(() => ({ action: "stopped" }));
+    }
+    active.inject(entry);
+  }
 
   const previous = dmPending.get(key);
   if (previous) {
@@ -473,7 +510,7 @@ function processDirectMessage(args) {
       const run = previousRun.then(() => {
         if (dmPending.has(key)) return { action: "superseded" };
         if ((dmEpochs.get(key) || 0) !== scheduledEpoch) return { action: "superseded" };
-        return evaluateDirectMessage({ ...args, phone, key }, { scheduledEpoch, historySnapshot });
+        return evaluateDirectMessage({ ...args, phone, key }, { scheduledEpoch, historySnapshot, entry });
       });
       const finish = (result) => {
         if (dmChains.get(key) === run) dmChains.delete(key);

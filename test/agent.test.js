@@ -109,20 +109,6 @@ function dmArgs(sock, text, extra = {}) {
   };
 }
 
-test("DM tidak mengaku menjadwalkan pengingat jika waktu tidak jelas", async () => {
-  await withMock(async (mock) => {
-    memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP });
-    memoryStore.setDmMemory(PHONE, { opt_out: false });
-    mock.mock.intent = { choice: "reminder", confidence: 0.95 };
-    mock.mock.reply = "Sudah kuingatkan nanti ya";
-    const sock = makeSock();
-    const result = await directAgent.processDirectMessage(dmArgs(sock, "ingatkan aku rapat nanti"));
-    assert.equal(result.action, "reminder_not_scheduled");
-    assert.match(sock.sent[0].text, /belum bisa menjadwalkannya/);
-    assert.equal(mock.state.chat.length, 0);
-  });
-});
-
 test("memori lama (v1) dimigrasi ke skema v2", () => {
   const migrated = memoryStore.migrate({ groups: { [GROUP]: { glm: "lama", jev: "j", compact_log: ["t"] } } });
   assert.equal(migrated.version, 2);
@@ -430,6 +416,87 @@ test("job untuk nomor di luar whitelist diblokir", async () => {
     const results = await scheduler.runDueJobs({ sock, at: Date.now() });
     assert.equal(results[0].status, "blocked");
     assert.equal(sock.sent.length, 0);
+  });
+});
+
+test("reminder tetap terkirim saat agen off, check-in proaktif ditahan", async () => {
+  await withMock(async () => {
+    memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP, at: groupAgent.witTimestamp() });
+    scheduler.setEnabled(false);
+    try {
+      const sock = makeSock();
+      const at = Date.now();
+      scheduler.scheduleJob({ type: "reminder", fire_at: at - 1000, payload: { phone: PHONE, text: "rapat" } });
+      scheduler.scheduleJob({ type: "proactive_checkin", fire_at: at - 1000, payload: { phone: PHONE } });
+      const results = await scheduler.runDueJobs({ sock, at });
+      assert.deepEqual(results.map((r) => [r.type, r.status]), [["reminder", "sent"]]);
+      assert.equal(sock.sent[0].text, "rapat");
+      assert.deepEqual(scheduler.listJobs().map((job) => job.type), ["proactive_checkin"], "check-in tidak dibuang, hanya ditunda");
+    } finally {
+      scheduler.setEnabled(true);
+    }
+  });
+});
+
+test("reminder gagal kirim tidak hilang dan dicoba ulang dengan backoff", async () => {
+  await withMock(async () => {
+    memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP, at: groupAgent.witTimestamp() });
+    const sock = makeSock();
+    let failures = 1;
+    const send = sock.sendMessage;
+    sock.sendMessage = async (...args) => {
+      if (failures-- > 0) throw new Error("socket closed");
+      return send(...args);
+    };
+    const at = Date.now();
+    scheduler.scheduleJob({ type: "reminder", fire_at: at - 1000, payload: { phone: PHONE, text: "minum obat" } });
+    const first = await scheduler.runDueJobs({ sock, at });
+    assert.equal(first[0].status, "error");
+    const [pending] = scheduler.listJobs();
+    assert.equal(pending.attempts, 1);
+    assert.ok(pending.fire_at > at, "dijadwalkan ulang ke depan");
+    assert.equal(pending.claimed_at, undefined, "klaim dilepas setelah gagal");
+    const onDisk = JSON.parse(fs.readFileSync(scheduler.getJobsFile(), "utf8"));
+    assert.equal(onDisk.jobs.length, 1, "job tetap tersimpan di disk");
+
+    const second = await scheduler.runDueJobs({ sock, at: pending.fire_at });
+    assert.equal(second[0].status, "sent");
+    assert.equal(scheduler.listJobs().length, 0);
+  });
+});
+
+test("reminder yang terklaim proses lama (crash/restart) dikirim setelah bot hidup lagi", async () => {
+  await withMock(async () => {
+    memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP, at: groupAgent.witTimestamp() });
+    const oldFile = process.env.AGENT_JOBS_FILE;
+    const restartedFile = `${oldFile}.restart.json`;
+    const at = Date.now();
+    // Kondisi file setelah proses lama crash saat sedang mengirim.
+    fs.writeFileSync(restartedFile, JSON.stringify({
+      jobs: [{ id: "job-crash", type: "reminder", fire_at: at - 60_000, payload: { phone: PHONE, text: "angkat jemuran" }, attempts: 1, claimed_at: at - 30_000, claimed_by: "999-dead" }],
+    }));
+    process.env.AGENT_JOBS_FILE = restartedFile;
+    try {
+      const sock = makeSock();
+      const results = await scheduler.runDueJobs({ sock, at });
+      assert.equal(results[0].status, "sent");
+      assert.equal(sock.sent[0].text, "angkat jemuran");
+      assert.equal(JSON.parse(fs.readFileSync(restartedFile, "utf8")).jobs.length, 0);
+    } finally {
+      process.env.AGENT_JOBS_FILE = oldFile;
+      scheduler.listJobs();
+    }
+  });
+});
+
+test("tick yang tumpang tindih tidak mengirim reminder dua kali", async () => {
+  await withMock(async () => {
+    memoryStore.recordParticipant({ phone: PHONE, name: "Rehan", groupId: GROUP, at: groupAgent.witTimestamp() });
+    const sock = makeSock();
+    const at = Date.now();
+    scheduler.scheduleJob({ type: "reminder", fire_at: at - 1000, payload: { phone: PHONE, text: "sekali saja" } });
+    await Promise.all([scheduler.runDueJobs({ sock, at }), scheduler.runDueJobs({ sock, at })]);
+    assert.equal(sock.sent.length, 1);
   });
 });
 

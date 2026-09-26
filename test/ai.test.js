@@ -235,7 +235,7 @@ test("prompt GLM meminta gaya singkat tanpa Markdown", () => {
   });
 
   assert.equal(messages[0].role, "system");
-  assert.match(messages[0].content, /Jangan gunakan Markdown/);
+  assert.match(messages[0].content, /Jangan gunakan heading, tabel, code fence, link Markdown/);
   assert.match(messages[1].content, /Budi \[nomor-tidak-diketahui\]: Server masih 502/);
   assert.match(messages[1].content, /Ani: Terus cek apa/);
 });
@@ -767,6 +767,8 @@ test("pesan dalam jendela debounce yang sama digabung (superseded)", async () =>
 
 test("evaluasi antrean yang basi (ada pesan lebih baru) dilewati", async () => {
   await withMockAiServer(async (mock) => {
+    // Jendela waktu dilebarkan supaya tidak rapuh saat mesin sibuk (dipulihkan withMockAiServer).
+    process.env.AI_DEBOUNCE_MS = "200";
     const sock = makeAiSock();
     const p1 = agent.processGroupMessage({
       sock,
@@ -779,7 +781,7 @@ test("evaluasi antrean yang basi (ada pesan lebih baru) dilewati", async () => {
       replyToBot: false,
       quotedText: "",
     });
-    await sleep(150); // evaluasi m1 sedang berjalan
+    await sleep(250); // evaluasi m1 sedang berjalan
     const p2 = agent.processGroupMessage({
       sock,
       message: aiMessage("m2"),
@@ -791,7 +793,7 @@ test("evaluasi antrean yang basi (ada pesan lebih baru) dilewati", async () => {
       replyToBot: false,
       quotedText: "",
     });
-    await sleep(150); // evaluasi m2 masuk antrian
+    await sleep(250); // evaluasi m2 masuk antrian
     const p3 = agent.processGroupMessage({
       sock,
       message: aiMessage("m3"),

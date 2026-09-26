@@ -1,5 +1,9 @@
 const { setupIsolatedTestEnv } = require("./helpers/test-env");
 const { cleanup } = setupIsolatedTestEnv("wa-test-bot-");
+// AI dianggap terkonfigurasi, tetapi panggilan yang lolos gagal cepat tanpa jaringan.
+process.env.OPENROUTER_API_KEY = "test-key-no-network";
+process.env.OPENROUTER_BASE_URL = "http://127.0.0.1:9";
+process.env.OPENROUTER_MAX_RETRIES = "0";
 
 const test = require("node:test");
 const assert = require("node:assert");
@@ -64,14 +68,38 @@ const reset = (owner = null, groups = []) => {
   bot.games.clear();
 };
 
-test("/task yang tidak tersedia dijawab jujur di DM dan grup yang diizinkan", async () => {
-  reset(OWNER, [GROUP]);
-  const sock = makeSock();
-  bot.setSock(sock);
-  await bot.dispatchInboundMessage(msg({ chat: `${OWNER}@s.whatsapp.net`, from: OWNER, text: "/task Ramat Jumat jam 9 WIT" }), { sock });
-  await bot.dispatchInboundMessage(msg({ text: "/task baca" }), { sock });
-  assert.equal(sock.sent.length, 2);
-  for (const sent of sock.sent) assert.match(sent.text, /Tidak ada catatan atau pengingat yang dibuat/);
+test("/task adalah alias: isinya masuk agent loop dengan tools di grup dan DM", async () => {
+  const { createMockOpenRouter } = require("./helpers/mock-openrouter");
+  const mock = await createMockOpenRouter({ chat: ["Siap, rapatnya Jumat jam 9 WIT."] }).start();
+  const oldDebounce = [process.env.AI_DEBOUNCE_MS, process.env.AI_DM_DEBOUNCE_MS, process.env.AI_HUMAN_DELAY_SCALE];
+  process.env.AI_DEBOUNCE_MS = "0";
+  process.env.AI_DM_DEBOUNCE_MS = "0";
+  process.env.AI_HUMAN_DELAY_SCALE = "0";
+  try {
+    reset(OWNER, [GROUP]);
+    bot.groupAgent.resetHistories();
+    const sock = makeSock();
+    bot.setSock(sock);
+    await bot.dispatchInboundMessage(msg({ text: "/task cari jadwal rapat Jumat" }), { sock });
+    assert.equal(mock.state.decisions[0].state.signals.explicit_mention, true, "/task dianggap ditujukan ke bot");
+    const request = mock.state.chat[0];
+    assert.ok(request.tools.some((tool) => tool.type === "openrouter:web_search"), "web search bawaan OpenRouter terpasang");
+    assert.ok(request.tools.some((tool) => tool.function?.name === "web_fetch"));
+    assert.match(JSON.stringify(request.messages), /cari jadwal rapat Jumat/);
+    assert.doesNotMatch(JSON.stringify(request.messages), /\/task/);
+    assert.equal(last(sock).text, "Siap, rapatnya Jumat jam 9 WIT.");
+
+    await bot.dispatchInboundMessage(msg({ text: "/task" }), { sock });
+    assert.match(last(sock).text, /Tulis permintaannya setelah \/task/);
+
+    // DM owner: /task tidak lagi dibuang sebagai command tak dikenal.
+    await bot.dispatchInboundMessage(msg({ chat: `${OWNER}@s.whatsapp.net`, from: OWNER, text: "/task rapat Jumat jam 9 WIT" }), { sock });
+    assert.equal(mock.state.chat.length, 2);
+    assert.equal(last(sock).jid, `${OWNER}@s.whatsapp.net`);
+  } finally {
+    [process.env.AI_DEBOUNCE_MS, process.env.AI_DM_DEBOUNCE_MS, process.env.AI_HUMAN_DELAY_SCALE] = oldDebounce.map((v) => v ?? "");
+    await mock.stop();
+  }
 });
 
 test("/verify membuat kode dan menunggu input terminal", async () => {

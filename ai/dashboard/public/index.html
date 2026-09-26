@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Grad · Dashboard</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo">G</span>
+      <div>
+        <strong>Grad</strong>
+        <span id="conn" class="pill">memuat…</span>
+      </div>
+    </div>
+    <div class="top-actions">
+      <label class="switch" title="Agen on/off (reminder tetap jalan)">
+        <input type="checkbox" id="agent-enabled"><span>Agen</span>
+      </label>
+      <label class="switch danger" title="Hentikan semua job terjadwal">
+        <input type="checkbox" id="agent-paused"><span>Emergency pause</span>
+      </label>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="overview" class="active">Ringkasan</button>
+    <button data-tab="groups">Grup & fitur</button>
+    <button data-tab="activity">Aktivitas</button>
+    <button data-tab="stickers">Stiker</button>
+    <button data-tab="memory">Memori</button>
+    <button data-tab="jobs">Jadwal</button>
+    <button data-tab="settings">Pengaturan</button>
+  </nav>
+
+  <main>
+    <section id="tab-overview" class="tab active">
+      <div class="tiles" id="tiles"></div>
+      <div class="grid2">
+        <div class="card"><h3>Model</h3><dl id="models"></dl></div>
+        <div class="card"><h3>Aktivitas terbaru</h3><ul class="feed" id="overview-feed"></ul></div>
+      </div>
+    </section>
+
+    <section id="tab-groups" class="tab">
+      <div class="card">
+        <h3>Kunci global <small>🔒 = mati di semua grup, admin tidak bisa menyalakan</small></h3>
+        <div class="chips" id="global-locks"></div>
+      </div>
+      <div id="group-cards" class="grid2"></div>
+      <div class="card"><h3>Log perubahan fitur</h3><table class="table" id="feature-log"></table></div>
+    </section>
+
+    <section id="tab-activity" class="tab">
+      <div class="card">
+        <div class="row">
+          <h3>Aktivitas live</h3>
+          <select id="activity-filter">
+            <option value="">Semua</option>
+            <option value="task">Tugas agen</option>
+            <option value="sticker_sent">Stiker terkirim</option>
+            <option value="feature">Perubahan fitur</option>
+            <option value="curation">Kurasi</option>
+            <option value="review">Review</option>
+            <option value="proactive">Proaktif</option>
+            <option value="background">Tugas latar</option>
+            <option value="setting">Pengaturan</option>
+          </select>
+        </div>
+        <table class="table" id="activity-table"></table>
+      </div>
+    </section>
+
+    <section id="tab-stickers" class="tab">
+      <div class="card">
+        <div class="row">
+          <h3>Koleksi stiker</h3>
+          <div class="actions">
+            <button id="btn-curate">Kurasi sekarang</button>
+            <button id="btn-review" class="ghost">Review koleksi</button>
+          </div>
+        </div>
+        <p id="sticker-stats" class="muted"></p>
+        <div class="stickers" id="sticker-grid"></div>
+      </div>
+      <div class="card"><h3>Keputusan terakhir</h3><table class="table" id="sticker-decisions"></table></div>
+    </section>
+
+    <section id="tab-memory" class="tab">
+      <div id="memory-groups" class="grid2"></div>
+      <div class="card"><h3>Orang yang dikenal Grad</h3><table class="table" id="people"></table></div>
+    </section>
+
+    <section id="tab-jobs" class="tab">
+      <div class="card"><h3>Job & reminder aktif</h3><table class="table" id="jobs"></table></div>
+    </section>
+
+    <section id="tab-settings" class="tab">
+      <div id="settings" class="grid2"></div>
+      <p class="muted">Tersimpan di <code>data/runtime-settings.json</code> dan langsung berlaku. Secret (.env, API key, sesi WhatsApp) tidak bisa dilihat atau diubah dari sini.</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

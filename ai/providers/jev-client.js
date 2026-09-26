@@ -10,6 +10,8 @@ function createJevClient(options = {}) {
   const defaultModel = options.model || process.env.JEV_MODEL || "typesafe/jev-1.13";
   const openrouterClient = options.client || createOpenRouterClient(options);
 
+  // Pertanyaan boleh ditandai { optional: true } (tidak dikirim ke API): jawaban
+  // yang hilang tidak menggagalkan seluruh keputusan, cukup dilewati.
   async function decide({ model = defaultModel, sessionId, state, questions, user }) {
     if (!questions || typeof questions !== "object" || Object.keys(questions).length === 0) {
       throw new OpenRouterError("Parameter 'questions' wajib diisi untuk keputusan Jev", {
@@ -22,7 +24,7 @@ function createJevClient(options = {}) {
       model,
       session_id: String(sessionId || "default-session").slice(0, 256),
       state: state || {},
-      questions,
+      questions: Object.fromEntries(Object.entries(questions || {}).map(([key, { optional, ...question }]) => [key, question])),
     };
     if (user) payload.user = String(user);
 
@@ -46,6 +48,7 @@ function createJevClient(options = {}) {
     const validatedAnswers = {};
     for (const [key, qConfig] of Object.entries(questions)) {
       const ans = answers[key];
+      if ((!ans || typeof ans !== "object") && qConfig?.optional) continue;
       if (!ans || typeof ans !== "object") {
         throw new OpenRouterError(`Jawaban Jev untuk pertanyaan '${key}' tidak ditemukan`, {
           category: "malformed_response",
