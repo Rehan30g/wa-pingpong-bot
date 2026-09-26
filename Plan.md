@@ -1,347 +1,356 @@
-# Plan Overhaul: Agen Otonom Jev + GLM Flash
+# Plan Overhaul v2: Grad Agentic, Feature First
 
-Tanggal: 22 September 2026
-Status: rancangan implementasi; belum diterapkan pada bot/VPS.
-Target: bot WhatsApp di `/home/ubuntu/GITKARA2.1`, checkout lokal `D:\EXPERIMENT\A`.
+Tanggal: 26 September 2026
+Status: rencana, belum diimplementasi.
+Plan v1 (gagal terasa) diarsipkan di [`docs/overhaul/PLAN_V1.md`](docs/overhaul/PLAN_V1.md).
+Baseline kode: branch `agent-overhaul-baseline` (PR #1).
 
-## 1. Hasil yang dituju
+## 1. Kenapa overhaul v1 tidak terasa
 
-AI menerima tujuan pengguna, memahami konteks, menentukan langkah, menggunakan tools, mengamati hasil, memperbaiki kegagalan, dan menyelesaikan tugas dengan bukti. Tugas tetap tersimpan saat proses restart. Percakapan sehari-hari tetap singkat dan natural.
-
-Jev menjadi lapisan keputusan cepat. GLM Flash menjadi perencana, pemilih tool beserta argumen, penafsir hasil, dan penulis balasan. Kode runtime memegang otorisasi, eksekusi, penyimpanan, batas biaya, dan keputusan apakah bukti teknis memenuhi syarat selesai.
-
-Otonomi berarti bebas memilih langkah di dalam tujuan dan izin yang diberikan. AI tidak menciptakan tujuan tanpa mandat, memperluas penerima pesan, atau menaikkan izinnya sendiri.
-
-### Contoh hasil akhir
-
-- “Ambil gambar yang tadi, buat stiker, lalu kirim di sini.” Agen memilih `entry_id`, mengambil asset, mengonversi, memverifikasi WebP, lalu mengirim ke chat yang sama.
-- “Cari informasi terbaru tentang X, bandingkan sumbernya, simpan ringkasannya.” Agen mencari, membaca sumber, menyusun ringkasan bertautan, menyimpan note, dan memastikan note dapat dibaca kembali.
-- “Ingatkan besok jam 8 WIT.” Agen membuat job persisten dengan waktu eksplisit, membalas tanggal/jam yang dipahami, dan mengirim ketika jatuh tempo.
-- “Lanjutkan tugas tadi.” Agen memuat checkpoint dan melanjutkan langkah yang belum selesai tanpa mengulang pengiriman yang sudah berhasil.
-- Permintaan ambigu diklarifikasi seperlunya; langkah aman yang sudah jelas tetap dapat disiapkan.
-
-## 2. Makna standar agen AI dalam plan ini
-
-Tidak ada satu sertifikasi universal yang otomatis membuat sistem memenuhi seluruh “standar AI Agent sekarang”. Dokumen ini menetapkan baseline engineering yang dapat diuji, dengan referensi primer pada bagian 16.
-
-Prinsip loop mandiri, observasi hasil tool, dan kondisi berhenti mengikuti pola agen yang dijelaskan [Anthropic: Building effective agents](https://www.anthropic.com/engineering/building-effective-agents). Evaluasi dipisahkan menjadi kualitas hasil dan jejak eksekusi, mengacu pada [Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents). Kontrol keamanan dipetakan terhadap risiko dalam [OWASP Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/).
-
-| Syarat | Implementasi yang wajib ada | Bukti kelulusan |
+| Masalah v1 | Akibatnya | Aturan v2 |
 |---|---|---|
-| Berorientasi tujuan | Task menyimpan tujuan, batas scope, acceptance criteria | Selesai hanya setelah kriteria terverifikasi |
-| Perencanaan adaptif | GLM memilih langkah berdasarkan observasi terbaru | Mampu mengubah rencana saat tool gagal |
-| Tool use nyata | Registry, schema, executor, hasil terstruktur | Ada artefak/hasil eksternal yang dapat dicek |
-| State dan memori | Checkpoint persisten; memori dengan sumber dan scope | Restart tidak menghilangkan tugas |
-| Pemulihan | Retry terbatas, rekonsiliasi, idempotensi | Fault injection tidak menggandakan efek samping |
-| Pengawasan manusia | Status, cancel, persetujuan spesifik bila diperlukan | Pencabutan izin berlaku sebelum efek berikutnya |
-| Keamanan | Policy di luar model; isolasi data dan executor | Semua kasus kritis ditolak |
-| Observability | Trace per task, latency, token, biaya, error | Dapat menelusuri penyebab gagal tanpa membuka rahasia |
-| Evaluasi | Dataset regresi dan simulasi API nyata | Target bagian 13 tercapai |
-| Interoperabilitas | Kontrak tool berversi; adapter opsional | Tool baru tidak memerlukan perubahan loop utama |
+| Engine default `legacy`, semua `AGENT_*_ENABLED=false` | Dari WhatsApp, bot identik dengan sebelum overhaul | Tidak ada fitur "selesai" yang mati default. Selesai = aktif di WA. |
+| Router tugas pakai regex (`intent-router.js`) | Tugas hanya jalan lewat `/task …` dengan kata kunci persis | Model yang memutuskan. Regex hanya untuk command admin. |
+| Planner sekali jalan (`planner.js`), replan hanya untuk `read_note` | Agen tidak bisa bereaksi terhadap hasil tool | Loop tool-calling: GLM melihat setiap hasil tool sebelum langkah berikutnya. |
+| Infra dulu (lease, fencing, outbox, canary, shadow, 3 engine mode) | ±4.000 baris tanpa fitur yang bisa dirasakan | Infra hanya dibangun kalau sebuah fitur butuh. |
+| "Lulus" = mock + dokumen laporan | Progres terlihat di dokumen, tidak di chat | Setiap milestone ditutup dengan demo di grup WA nyata. |
+| Bug scheduler legacy tidak disentuh | Reminder bisa hilang saat crash atau `/agent off` | Jalur yang jalan di produksi diperbaiki dulu. |
 
-MCP, vector database, dan banyak subagent bukan prasyarat kelulusan. Versi pertama menggunakan satu runtime agen dengan dua peran model agar biaya dan debugging terkontrol.
+## 2. Keputusan pengguna (26 Sep 2026)
 
-## 3. Kondisi awal dan gap yang ditemukan
+| Topik | Keputusan |
+|---|---|
+| Pemicu tugas | **Bahasa natural.** Cukup mention, reply, atau DM bot. Model yang memutuskan apakah itu tugas. |
+| Prioritas fitur | 1. **Web search** (pakai bawaan OpenRouter), 2. **Koleksi stiker Grad** (§4a), 3. **Reminder & jadwal**, 4. **Memori & catatan** |
+| Stiker | **Tidak ada stiker hasil generate/cari gambar.** Grad mengumpulkan stiker yang dipakai manusia, mengkurasi koleksinya sendiri, lalu memakainya. |
+| Koleksi stiker | Satu koleksi **global**. Stiker berisi wajah/foto member atau inside joke ditandai **lokal** (hanya grup asal). Sumber: **grup + DM**. Kurasi **harian**, review **mingguan**, kapasitas **~150**. |
+| Pemakaian stiker | Pengganti balasan, pelengkap teks, pengganti reaction, dan saat nimbrung sosial. |
+| Otonomi | **Bebas penuh di chat asal.** Tidak ada konfirmasi. Dibatasi hanya oleh aturan keras (§6). |
+| Proaktif | **Proaktif di grup juga.** Dinamis: ikut ngobrol seperti member (dibatasi cooldown), dan selalu boleh muncul kalau ada bantuan nyata yang bisa dia berikan. |
+| Infra v1 | **Dipangkas**, dipakai seperlunya. |
+| Rilis | **Langsung ke semua grup** yang diizinkan, begitu fitur lulus tes. Tanpa shadow atau canary. |
+| Batas per tugas | **Besar: ~25 langkah** (tool call) per tugas. |
 
-Didasarkan pada pembacaan source lokal, bukan audit live VPS:
-
-| Bagian sekarang | Dipertahankan | Perombakan |
-|---|---|---|
-| `index.js` | Baileys, identitas, command game/admin, akses grup | Jadikan adapter event dan delivery |
-| `ai/group-agent.js` | Debounce, Jev, multimodal, quote, receipt | Pisahkan konteks, routing, runtime, dan delivery |
-| `ai/direct-agent.js` | Whitelist PN, anti-broadcast, gaya DM | Gunakan runtime bersama dengan policy DM |
-| `ai/memory-store.js` | Profil, grup, hubungan, migrasi v2 | Tambahkan provenance, ACL, retrieval, invalidasi |
-| `ai/scheduler.js` | Reminder, follow-up, check-in | Durable claim/lease, retry, checkpoint dan rekonsiliasi |
-| `ai/capabilities/registry.js` | Registry eksplisit, default nonaktif | Schema wajib, executor, policy, audit, verifier |
-| `Plan.md` sebelumnya | Fetch/kirim media, stiker, storage, Python | Seluruh capability dimasukkan ke roadmap ini |
-
-Gap konkret: riwayat/antrean utama masih berada dalam Map proses; registry belum menjadi loop eksekusi; scheduler mengeluarkan job jatuh tempo dari penyimpanan sebelum eksekusi sehingga ada celah kehilangan job saat crash. `runDueJobs` juga berhenti seluruhnya ketika agent dinonaktifkan, padahal kontrak AGENTS.md meminta reminder eksplisit tetap berjalan saat proaktif mati. Perbedaan ini harus diperbaiki dan diuji pada migrasi.
-
-## 4. Pembagian tanggung jawab model
-
-### Jev: keputusan diskret
-
-- Gunakan model konfigurasi saat ini `typesafe/jev-1.13`; adapter endpoint saat ini `/api/alpha/decisions`.
-- Pilih `ignore`, `react`, `reply`, `start_task`, `continue_task`, atau `clarify` dari opsi yang valid untuk event.
-- Saat diperlukan, pilih `continue`, `replan`, atau `stop` berdasarkan ringkasan langkah. Jangan wajib memanggil Jev pada setiap tool bila tidak menambah kualitas.
-- Input berupa teks, sinyal media, task summary, dan daftar pilihan yang telah dibatasi policy. Jangan menganggap Jev dapat melihat gambar/video.
-- Confidence membantu routing dan dikalibrasi pada dataset lokal; confidence tidak pernah menjadi izin eksekusi.
-- Kegagalan Jev: retry terbatas. Pesan yang jelas ditujukan ke bot boleh diteruskan ke GLM untuk balasan/clarification tanpa write tool; percakapan grup biasa tidak memicu tindakan spekulatif.
-
-### GLM Flash: rencana dan pelaksanaan melalui tools
-
-- Gunakan konfigurasi saat ini `z-ai/glm-5.3-flash`, reasoning `low` sebagai baseline.
-- Ubah permintaan menjadi tujuan, kriteria selesai, serta langkah ringkas; tugas sederhana langsung menjawab tanpa membuat rencana panjang.
-- Pilih tool, susun argumen, baca observasi, revisi rencana, dan susun hasil berdasarkan bukti.
-- Gunakan native tool calling jika didukung provider. Jika tidak, gunakan action envelope JSON tervalidasi; JSON gagal parse tidak pernah dieksekusi.
-- Ringkas memori dengan sumber dan scope; jangan mencatat inferensi sebagai fakta terverifikasi.
-- Balasan WhatsApp tetap natural; detail panjang menjadi artefak atau ditampilkan bila diminta.
-
-### Gate kompatibilitas sebelum implementasi besar
-
-Identitas model di atas berasal dari kode lokal. Dukungan tool calling, strict JSON schema, modality, batas konteks, reasoning, harga, dan provider aktif harus diuji lewat adapter dan API nyata. Dokumentasi OpenRouter menjelaskan mekanismenya, tetapi dukungan aktual bergantung model/provider ([tool calling](https://openrouter.ai/docs/guides/features/tool-calling), [structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs)). Jangan mengklaim dukungan GLM berdasarkan nama model saja.
-
-Simpan hasil probe tersanitasi dan versi adapter. Pin model/provider yang lolos; perubahan provider memicu pengujian ulang. Jika fitur penting tidak tersedia, nonaktifkan capability terkait dan laporkan batasnya. Jangan mengganti model ke keluarga lain diam-diam.
-
-## 5. Arsitektur target
+## 3. Bentuk agen yang dituju
 
 ```text
-WhatsApp / job jatuh tempo / perintah kontrol
-  -> Normalisasi event + identitas PN + deduplikasi
-  -> Policy awal + konteks sesuai scope
-  -> Jev: routing
-       -> ignore / react / balasan sederhana
-       -> Task runtime
-            -> GLM: rencana atau next action
-            -> Validasi schema + policy + budget + context epoch
-            -> Executor tool
-            -> Simpan hasil/checkpoint
-            -> Verifier: bukti vs kriteria selesai
-            -> lanjut / replan / menunggu / selesai / gagal
-  -> Outbox -> delivery WhatsApp -> rekonsiliasi status
+Pesan WA (grup/DM)
+  → normalisasi + identitas PN (index.js, sudah ada)
+  → Jev: ignore / react / engage          ← cepat & murah, sudah ada
+       └ engage → Agent Loop (GLM + tools)
+            ┌─────────────────────────────────────────────┐
+            │ GLM(tools, riwayat, memori) → tool_calls?    │
+            │   ya → jalankan tool → hasil → balik ke GLM │
+            │   tidak → teks final → kirim ke chat asal    │
+            └─────────────────────────────────────────────┘
+            batas: 25 langkah · ~3 menit · budget token
+  → kirim (typing presence, split natural, quote bila perlu)
 ```
 
-Usulan modul baru, dibuat bertahap:
+Perubahan konsep terpenting: **tidak ada lagi dua jalur "chat" dan "task"**. Setiap kali Jev memilih *engage*, GLM dipanggil **dengan tools**. Obrolan biasa berarti GLM menjawab tanpa memanggil tool. Permintaan seperti "carikan X lalu bandingkan" berarti GLM memanggil tool berulang sampai selesai. Tidak ada `/task` yang perlu dihafal.
+
+### Peran model
+
+- **Jev** (`typesafe/jev-1.13`): gerbang keterlibatan. Pilihan yang ada sekarang (`ignore`, `reply`, `react_*`) dipertahankan. `reply` diganti maknanya menjadi `engage` (masuk agent loop), dan ditambah sinyal `opportunity` untuk proaktif (§5). Jev tidak memilih tool.
+- **GLM** (`z-ai/glm-5.3-flash`): otak loop. Memakai native tool calling OpenRouter (`glm-client.js` sudah mendukung `tools`/`tool_choice`), reasoning `low`, dan boleh menaikkan ke `medium` untuk tugas multi-langkah.
+- **Kode runtime**: menegakkan aturan keras, batas langkah, timeout, dan budget. Tujuan pengiriman selalu chat asal, tidak pernah dari argumen model.
+
+### Pesan progres
+
+Tugas yang lebih dari ~2 tool call atau lebih dari ~8 detik mengirim satu pesan singkat natural ("bentar, aku cariin dulu ya") plus presence `composing`. Tujuannya supaya grup tahu bot sedang bekerja. Paling banyak satu pesan progres per tugas, kecuali tugasnya lebih dari 60 detik.
+
+### Pesan baru saat loop berjalan
+
+- Pesan baru di chat yang sama dimasukkan ke loop yang sedang berjalan sebagai konteks tambahan pada langkah berikutnya, tidak memulai loop kedua.
+- "stop"/"batal" yang ditujukan ke bot menghentikan loop.
+- Satu loop aktif per chat.
+
+## 4. Katalog tools (target akhir)
+
+| Tool | Milestone | Keterangan |
+|---|---|---|
+| `web_search` | M1 | **Server tool bawaan OpenRouter** (`openrouter:web_search`) dipasang langsung di request GLM, bukan wrapper terpisah. Tanpa batas "1 pencarian/tugas" dari v1; dibatasi oleh langkah/budget. |
+| `web_fetch` | M1 | Baca halaman URL. Pakai ulang `safe-web-fetch.js` (SSRF guard). Allowlist host diganti blocklist privat. |
+| `send_sticker` | M2 | Kirim stiker **dari koleksi Grad** (`sticker_id`) ke chat asal, sebagai pengganti balasan atau pelengkap teks (§4a). |
+| `get_chat_media` | M2 | Ambil gambar/video dari pesan di riwayat (berdasarkan `entry_id`) atau pesan yang di-reply, untuk dianalisis. |
+| `schedule` | M3 | Reminder sekali atau berulang dengan waktu WIT eksplisit. |
+| `list_schedules` / `cancel_schedule` | M3 | Lihat dan hapus jadwal di chat itu. |
+| `remember` / `recall` / `forget` | M4 | Fakta tentang orang, grup, atau preferensi, dengan sumber dan scope chat. |
+| `note_write` / `note_read` / `note_list` | M4 | Catatan grup. |
+| `summarize_history` | M4 | Ringkas riwayat aktif chat. |
+
+Kontrak tool: schema JSON (`inputSchema`), handler, timeout, dan hasil ringkas untuk model. Pakai ulang `capabilities/registry.js` tetapi hapus kewajiban verifier, idempotency key, dan approval untuk tool read-only.
+
+## 4a. Koleksi stiker Grad
+
+Grad tidak membuat stiker. Dia **mengumpulkan stiker yang dipakai manusia**, memilih sendiri mana yang layak disimpan, memberinya makna, lalu memakainya seperti manusia memakai koleksi stiker di HP-nya.
 
 ```text
-ai/providers/{jev,glm,openrouter-client}.js
-ai/runtime/{orchestrator,task-store,event-queue,budget}.js
-ai/policy/{authorize,scopes,approvals}.js
-ai/tools/{registry,executor,schemas}.js
-ai/memory/{retrieve,provenance,compaction}.js
-ai/delivery/{outbox,reconcile}.js
-ai/observability/{trace,metrics,redact}.js
-ai/evals/fixtures/
+stiker lewat di chat ──► KANDIDAT (hash, hitungan, konteks)
+                              │  kurasi harian (GLM lihat gambar + statistik)
+                    ┌─────────┴─────────┐
+                  skip                simpan + label
+             (bisa dinilai ulang     (makna, mood, kapan dipakai,
+              kalau terus muncul)     rencana frekuensi, global/lokal)
+                                           │
+                               dipakai Grad di obrolan
+                                           │  review mingguan
+                                   tetap / BUANG (dengan alasan)
 ```
 
-`group-agent.js`, `direct-agent.js`, dan `scheduler.js` menjadi adapter kompatibilitas saat migrasi. `capabilities/registry.js` didelegasikan ke registry baru; jangan memelihara dua registry independen.
+### Pengumpulan (pasif, jalan terus)
+- Setiap `stickerMessage` di grup yang diizinkan atau DM yang di-whitelist dicatat. Identitasnya `fileSha256` dari pesan WA, jadi stiker yang sama terhitung berulang tanpa unduh ulang.
+- Saat pertama terlihat, stiker diunduh sekali ke `data/stickers/candidates/<sha>.webp`. Ukuran stiker kecil, dan link media WA bisa kedaluwarsa.
+- Statistik per stiker: `use_count` (dipakai manusia), `distinct_chats`, `distinct_senders`, `first_seen`, `last_seen`, `animated`, dan maksimal 5 **cuplikan konteks** (1–2 pesan sebelum dan sesudah stiker, sudah melalui redaksi) supaya GLM tahu stiker itu dipakai untuk apa.
+- Stiker dari DM hanya menambah statistik dan kandidat. Konteks DM tidak pernah ikut ke prompt grup.
+- Stiker yang dikirim Grad sendiri tidak dihitung sebagai pemakaian manusia.
 
-## 6. Kontrak runtime dan lifecycle task
+### Kurasi harian (GLM, di jam tenang WIT)
+- Kandidat baru dikirim ke GLM **multimodal** dalam batch ~10. Stiker animasi diwakili 1–3 frame PNG.
+- Untuk tiap stiker GLM menerima gambar, statistik, dan cuplikan konteks. Keluarannya terstruktur:
+  - `decision`: `keep` / `skip`
+  - `label`: makna singkat ("ngakak sampe nangis", "sindiran halus", "capek kerja")
+  - `moods`: tag, misalnya `laugh`, `ack`, `sad`, `tease`, `love`, `confused`, `hype`
+  - `when_to_use`: satu kalimat kapan cocok dipakai
+  - `planned_frequency`: `sering` / `kadang` / `jarang` (rencana Grad sendiri seberapa sering memakainya)
+  - `scope`: `global`, atau `local` kalau ada wajah/foto member atau inside joke grup tertentu
+  - `reason`: alasan singkat (kenapa disimpan atau di-skip)
+- Stiker NSFW, SARA, atau yang merendahkan orang nyata selalu `skip` (dicek ulang oleh aturan kode).
+- Stiker yang di-skip tidak dinilai ulang, **kecuali** pemakaiannya oleh manusia naik signifikan (misalnya hitungan ≥3× sejak keputusan terakhir). Stiker yang terus muncul layak dilihat lagi.
+- Kandidat skip yang tidak muncul lagi selama 30 hari dihapus dari disk.
 
-Task wajib menyimpan `task_id`, `chat_id`, `requester_pn`, `source_event_id`, `goal`, `acceptance_criteria`, `scope`, `authorization_ref`, `context_epoch`, `plan_version`, `steps`, `status`, `budget`, `evidence_refs`, serta timestamp UTC. Tampilan pengguna memakai WIT.
+### Review mingguan
+- GLM melihat seluruh koleksi beserta statistiknya: berapa kali dipakai Grad, kapan terakhir, apakah manusia masih memakainya, dan label-label yang mirip.
+- GLM boleh **membuang** stiker dengan alasan masuk akal: sudah basi (trennya lewat), terlalu mirip stiker lain yang lebih bagus, tidak pernah cocok dipakai, atau labelnya ternyata salah. GLM juga boleh **merevisi** label dan `planned_frequency`.
+- Kapasitas ~150. Kalau kandidat baru bagus tapi koleksi penuh, GLM harus memilih mana yang dibuang.
+- Semua keputusan (simpan, skip, buang, revisi) dicatat di log beserta alasannya, dan bisa dilihat owner.
 
-State utama: `queued -> running -> verifying -> succeeded`. Cabang: `waiting_input`, `waiting_approval`, `retry_wait`, `delivery_uncertain`, `failed`, `cancelled`, `budget_exhausted`. Resume kembali ke `queued` setelah input/izin/jadwal valid. Status terminal tidak dibuka kembali tanpa task/resume yang eksplisit dan tercatat.
+### Pemakaian
+- Indeks ringkas koleksi (id, label, mood, frekuensi, terakhir dipakai) masuk ke konteks GLM di agent loop. Stiker `local` hanya muncul di grup asalnya.
+- **Pengganti balasan / pelengkap teks:** GLM memanggil `send_sticker(sticker_id, placement: only|after_text)`.
+- **Pengganti reaction:** saat Jev memilih `react_laugh`/`react_ack`/`react_heart`, sesekali (peluang dari `.env`) diganti stiker dengan mood yang cocok. Stiker dipilih deterministik dari koleksi, tanpa panggilan GLM tambahan.
+- **Nimbrung sosial (M5):** stiker jadi salah satu cara ikut meramaikan.
+- Rem pemakaian: `planned_frequency` menentukan jeda minimum per stiker, ada batas stiker per jam per grup, dan stiker yang sama tidak dipakai dua kali berturut-turut di chat yang sama.
 
-Setiap iterasi:
+### Kontrol owner
+- `/stiker` menampilkan jumlah koleksi dan kandidat, 10 stiker terfavorit Grad, serta keputusan terakhir.
+- `/stiker lihat <id>` mengirim stiker beserta label dan alasannya.
+- `/stiker buang <id>` untuk membuang manual (tercatat).
+- `/stiker kurasi` untuk menjalankan kurasi sekarang.
+- `/s` (bikin stiker dari foto sendiri) tetap ada sebagai command biasa, terpisah dari koleksi.
 
-1. Muat checkpoint dan event baru; cek cancel, epoch, izin, serta budget.
-2. Bentuk konteks dari tujuan, ringkasan, bukti terbaru, dan tool yang diizinkan.
-3. GLM menghasilkan salah satu `tool_call`, `ask_user`, `final`, atau `stop` dalam schema berversi.
-4. Runtime memvalidasi nama tool, argumen, scope, izin, dan precondition. Identitas serta tujuan pengiriman berasal dari runtime, bukan argumen bebas model.
-5. Persist intent sebelum efek samping; jalankan tool dengan timeout/cancellation.
-6. Persist observasi dan biaya; verifier memeriksa hasil. Lanjut hanya bila ada kemajuan atau recovery yang sah.
-7. `final` merupakan usulan selesai. Runtime menolak klaim sukses jika bukti kurang, delivery belum pasti, atau acceptance criteria belum terpenuhi.
+### Penyimpanan
+- SQLite (`storage/` v1 dipakai ulang): tabel `sticker_candidates`, `sticker_collection`, `sticker_decisions`, `sticker_usage`. File di `data/stickers/{candidates,collection}/<sha>.webp`, dan folder ini masuk `.gitignore`.
 
-Observasi tool berisi `tool_call_id`, `ok`, `data`, `artifact_ids`, `evidence`, `error_code`, `retryable`, `side_effect_status`, dan `duration_ms`. Catat ringkasan keputusan yang dapat diaudit, bukan chain-of-thought internal.
+## 4b. Audio lewat Gemini Flash ("telinga" Grad)
 
-### Antrean dan interupsi
+GLM 5.3 Flash tidak menerima audio. Berdasarkan daftar model OpenRouter per 26 Sep 2026, input GLM hanya `text,image,video`. GLM tetap jadi otak. Audio diserahkan ke **Gemini Flash**, dan Gemini hanya bertugas mendengar lalu melaporkan isinya sebagai teks.
 
-- Satu writer aktif per chat; mulai dengan maksimum dua task aktif global dan antrean terbatas yang memberikan status saat penuh.
-- Deduplikasi berdasarkan ID pesan Baileys + chat + participant. Debounce dan perilaku superseded tetap berlaku.
-- Pesan baru tidak membatalkan evaluasi biasa yang sedang berjalan. Integrasikan koreksi tujuan pada checkpoint dan periksa ulang sebelum write berikutnya.
-- `cancel`, pencabutan izin, `/clear`, dan `/reset` membatalkan efek yang belum dikirim melalui epoch. Efek yang sudah terkirim tidak dapat ditarik secara otomatis.
-- Dua pengguna dalam satu grup tidak dapat menyetujui/membatalkan tugas satu sama lain kecuali memiliki hak admin yang ditetapkan policy.
+- Model: `google/gemini-3.1-flash-lite` dengan thinking off (diganti dari `gemini-3.8-flash` setelah benchmark 26 Sep 2026: 2× lebih cepat, ±2,3× lebih murah, akurasi setara; lihat [`docs/overhaul/M0_PROBES.md`](docs/overhaul/M0_PROBES.md) §3). Cadangan otomatis `xiaomi/mimo-v2.6-flash`. Bisa diganti lewat `.env` `AUDIO_MODEL`/`AUDIO_FALLBACK_MODEL`. Model di-pin, jangan pakai alias `~latest`, supaya perilaku tidak berubah diam-diam.
+- Format: voice note WA (`audio/ogg; codecs=opus`) dikonversi ke mp3 16 kHz mono via ffmpeg (sudah dipakai untuk frame video) sebelum dikirim sebagai `input_audio`. Batasnya diatur `AI_MAX_AUDIO_SEC` (default 300 detik); audio yang lebih panjang dipotong dan hal itu dilaporkan.
 
-## 7. Otonomi, izin, dan kontrol pengguna
+Dua jalur:
 
-| Operasi | Mode awal |
-|---|---|
-| Membaca history/memori yang boleh diakses, kalkulasi, membaca asset chat | Otomatis dalam tugas yang sah |
-| Mencari web publik | Otomatis jika tool aktif; query disaring dari data pribadi/rahasia |
-| Membuat note/asset baru dan mengirim hasil yang diminta di chat aktif | Otomatis dalam scope permintaan |
-| Reminder eksplisit | Otomatis setelah waktu dan penerima tervalidasi |
-| Menimpa note yang jelas diminta pengguna | Otomatis dengan versi/undo; benturan versi meminta klarifikasi |
-| Check-in/follow-up tanpa permintaan langsung | Hanya standing permission, opt-in/policy, cooldown, kuota, jam tenang |
-| Purge permanen, perubahan konfigurasi operasional | Command owner terpisah; tidak diekspos sebagai tool umum |
-| Broadcast, penerima arbitrer, baca secret, shell host, ubah source/izin sendiri | Dilarang pada overhaul ini |
+1. **Transkripsi otomatis saat pesan masuk** (default untuk voice note di grup yang diizinkan atau DM yang di-whitelist). Jalur ini wajib karena Jev hanya membaca teks. Tanpa transkrip, Jev tidak bisa menilai voice note.
+   - Konteks yang dikirim ke Gemini: nama bot, nama peserta chat (supaya ejaan nama benar), 3–5 pesan terakhir, dan istilah atau kata khas grup dari memori.
+   - Output terstruktur: `transcript`, `language`, `speech` (true/false), `non_speech` (musik, tawa, bising, dan sejenisnya), `tone`, `summary` (1 kalimat), `confidence`.
+   - Hasilnya masuk riwayat sebagai `Budi: [voice note 0:42] "…transkrip…"`, lalu mengalir ke Jev dan GLM seperti pesan teks biasa.
+2. **Tool `listen_audio(entry_id, question)`** di agent loop. GLM bisa bertanya lebih spesifik kepada Gemini dengan konteks yang GLM tentukan sendiri, misalnya "lagu apa yang diputar di audio ini?", "dia kedengeran marah atau bercanda?", atau "sebutkan semua angka dan tanggal yang disebut". Ini memenuhi syarat bahwa Gemini bekerja **dengan konteks yang diberikan GLM**.
 
-Persetujuan tambahan hanya untuk tindakan yang melampaui izin yang sudah diberikan. Jika diperlukan, simpan actor PN, chat, task, hash argumen, scope, expiry, dan status sekali pakai. Perubahan argumen membatalkan persetujuan lama. Instruksi dari halaman web, tool output, dan memori tidak dapat memberikan persetujuan.
+Aturan:
+- Gemini tidak pernah membalas ke chat dan tidak memegang tools. Dia hanya mengembalikan teks ke GLM.
+- Transkrip diperlakukan sebagai data tak tepercaya: perintah yang terdengar di audio bukan instruksi untuk bot.
+- Audio DM tidak ikut ke konteks grup.
+- File audio tidak disimpan permanen. Yang disimpan hanya transkrip, dengan aturan yang sama seperti riwayat teks.
 
-Kontrol target:
+## 5. Proaktif di grup (dinamis)
 
-- `/task list`, `/task status <id>`, `/task cancel <id>`, `/task resume <id>` dengan ACL requester/admin.
-- `/agent status|on|off|clear` tetap kompatibel. `off` menghentikan proaktif, bukan reminder yang diminta; `clear` menghapus job sesuai kontrak yang terdokumentasi.
-- Tambahkan `/agent pause` dan `/agent resume` khusus owner untuk emergency stop seluruh efek agen, termasuk reminder. Jangan menyamakan pause dengan off.
-- Capability diaktifkan satu per satu oleh owner; default capability baru tetap nonaktif.
+Dua jalur, keduanya lewat Jev:
 
-## 8. Tools minimum dan kontrak keamanan
+1. **Bantuan nyata** (`opportunity: help`): ada pertanyaan yang belum terjawab, orang bingung jadwal atau fakta, minta stiker, link yang bisa diringkas, dan sejenisnya. Boleh masuk walau tanpa mention. Cooldown pendek (default 2 menit per grup).
+2. **Sosial** (`opportunity: social`): ikut bercanda atau berkomentar seperti member biasa. Cooldown lebih panjang (default 20 menit per grup), maksimal N kali per jam, dan tidak aktif saat jam tenang WIT.
 
-Semua tool wajib memiliki nama/versi, deskripsi pemilihan, JSON schema input/output, risk class, scope, timeout, batas byte, verifier, idempotency behavior, audit, serta mode dry-run.
+Rem otomatis:
+- Kalau ada yang bilang "diam", "jangan nimbrung", atau sejenisnya, jalur sosial di grup itu mati selama X jam.
+- `/agent social off` mematikan jalur sosial per grup. Jalur bantuan tetap jalan.
+- Diam di topik sensitif: duka, konflik, kesehatan (aturan Jev yang sudah ada).
 
-| Tool | Hasil | Verifikasi |
+Konfigurasi di `.env`: `AGENT_SOCIAL_COOLDOWN_MIN`, `AGENT_HELP_COOLDOWN_MIN`, `AGENT_SOCIAL_MAX_PER_HOUR`.
+
+## 6. Aturan keras (tidak bisa dilanggar walau "bebas penuh")
+
+Ditegakkan di kode, bukan di prompt:
+
+1. Pesan hanya dikirim ke **chat asal** tugas, dengan satu pengecualian (keputusan 27 Sep 2026): **DM peminta sendiri** bila dia memintanya (`send_to_my_dm`), hanya untuk nomor terverifikasi di whitelist yang tidak opt-out. Tidak ada tool untuk mengirim ke orang lain atau grup lain.
+2. Whitelist DM (`memoryStore.canDirectMessage`) dan tolak broadcast/forward massal. Keduanya sudah ada dan dipertahankan.
+3. Bot hanya aktif di `allowedGroups`.
+4. Tidak pernah mencetak atau mengirim secret (`redact.js` dipakai ulang di log dan hasil tool).
+5. `web_fetch` dan `fetch_image_url` menolak IP privat/lokal (SSRF guard dipakai ulang).
+6. Memori DM tidak dibocorkan ke grup (scope per chat).
+7. Batas per tugas: 25 langkah, ~3 menit, budget token per tugas dan per hari (`budget.js` dipakai ulang, disederhanakan).
+8. Kill switch: `/agent off` (owner) mematikan loop agen, dan emergency pause tetap ada. **Reminder yang diminta pengguna tetap jalan** walau agent off.
+
+## 7. Nasib kode v1
+
+| Pertahankan / pakai ulang | Sederhanakan | Buang (hapus dari jalur aktif) |
 |---|---|---|
-| `memory_search` | Fakta bersumber dalam scope | ACL dan sumber masih valid |
-| `fetch_media_from_message` | Asset ID dari `entry_id` | Milik chat/task; MIME dan ukuran valid |
-| `web_search`, `web_fetch` | Sumber, URL, waktu pengambilan | URL aman, konten terbaca, sumber dicantumkan |
-| `fetch_media_from_url` | Asset ID | HTTPS, byte limit, magic bytes |
-| `note_create/read/update/list/trash` | Note berversi | Read-back, hash/version, ACL |
-| `make_sticker` | Asset WebP | Decode, dimensi, ukuran, durasi |
-| `send_asset` | Delivery record | Asset sah; tujuan disuntikkan runtime |
-| `schedule_reminder`, `cancel_reminder` | Job ID/status | Persist dan otorisasi pemilik |
-| `run_python` | Output ringkas dan asset ID | Sandbox + batas resource; tahap terakhir |
+| `providers/*` (Jev, GLM, OpenRouter client) | `capabilities/registry.js` (tanpa idempotency/verifier wajib) | `runtime/lease-manager.js`, fencing |
+| `observability/redact.js`, `trace.js` | `runtime/budget.js` (satu budget sederhana) | `runtime/canary.js`, mode shadow, 3 engine mode (`engine-config.js`) |
+| `runtime/safe-web-fetch.js`, `safe-media-fetch.js`, `egress-limiter.js` | `storage/` SQLite: hanya untuk jadwal + log tugas | `runtime/outbox.js`, `inbox.js` (ganti dedupe Map sederhana) |
+| `media/*` (validator, video frame; sticker converter hanya untuk `/s`) | `memory-store.js` + `memory-facts.js` digabung | `runtime/planner.js`, `task-runner.js`, `verifier.js`, `task-state-machine.js`, `intent-router.js` |
+| `policy/authorize.js` (siapa boleh `/agent`, `/veto`) | `scheduler.js`: satu scheduler, tahan crash | `durable-scheduler.js` (setelah digabung), `recovery.js`, `lifecycle.js` bagian shadow/canary |
+| Tes regresi grup/DM yang ada | | Tes yang hanya menguji modul yang dibuang, beserta dokumen fase v1 (diarsipkan) |
 
-`send_asset` tidak menerima parameter destination bebas. Tidak ada tool generik `sendMessage(target)`. Satu task menggunakan origin chat; job DM memakai penerima terikat yang sudah tervalidasi, bukan nomor pilihan model.
+Kode yang dibuang tetap ada di git (PR #1). Hapus hanya setelah pengganti di milestone terkait lulus.
 
-Kontrol wajib:
+## 8. Milestone (feature first)
 
-- SSRF: tolak localhost/private/link-local/metadata IP untuk IPv4/IPv6, kredensial URL, protokol non-HTTPS; periksa DNS dan setiap redirect, pin koneksi ke alamat yang divalidasi untuk mencegah rebinding.
-- Download dibatasi selama streaming, bukan setelah selesai. Batasi decompression, redirect, waktu, dan jumlah asset.
-- File disimpan di workspace khusus per scope; gunakan ID, realpath validation, larangan symlink/traversal/device file, kuota, versi, dan trash.
-- Python memakai container non-root tanpa network/secret/host mount/Docker socket; cap CPU/RAM/PID/waktu/output/disk, filesystem read-only kecuali job, image dependency dipin. Python subprocess biasa atau blacklist kode tidak dianggap sandbox.
-- Parsing media diperlakukan sebagai input tidak tepercaya; proses konversi terisolasi dan dibatasi.
-- Semua konten web, pesan kutipan, OCR/media, memori hasil ekstraksi, dan tool output merupakan data tidak tepercaya. Instruksi di dalamnya tidak mengubah goal atau policy.
-- Integrasi MCP kelak hanya melalui adapter registry yang sama, server allowlist, schema dan policy yang sama; tidak mengimpor tools secara otomatis.
+Setiap milestone baru dianggap **selesai** kalau:
+- tes lulus (`npm test`, termasuk tes `processGroupMessage`/`processDirectMessage` dengan mock socket sesuai AGENTS.md),
+- deploy ke VPS (restart `tmux send-keys -t wabot C-c`),
+- ada **demo nyata di grup WA** yang dicoba owner, dengan skenario yang ditulis di milestone.
 
-## 9. Memori dan privasi
+### M0 · Beres-beres jalur produksi (kecil, ≤1 hari)
 
-Pisahkan working context, task checkpoint, fakta jangka panjang, profil orang, hubungan, dan preferensi pengguna. Memori percakapan tidak boleh menggantikan state transaksi task.
+> **Status 26 Sep 2026: kode + probe selesai, tinggal deploy & demo WA.**
+> - Scheduler: job diklaim → dikirim → baru dihapus (at-least-once), backoff 1/2/4/8 menit (maks 5 percobaan), klaim proses yang crash diambil ulang, tick tidak tumpang tindih, reminder tetap jalan saat `/agent off`, job jatuh tempo langsung jalan begitu tersambung.
+> - Probe: GLM tool calling + web search stabil 3/3, tanpa fallback envelope. Gemini audio akurat untuk slang, 3–6,5 detik. Detail di [`docs/overhaul/M0_PROBES.md`](docs/overhaul/M0_PROBES.md).
+> - Stiker: `ai/stickers/collector.js` (SQLite `data/stickers/stickers.db` + `candidates/<sha>.webp`), `/stiker` untuk owner. `/s` tetap pembuat stiker (alias `/stiker` lama dipindah).
 
-Fakta menyimpan `memory_id`, subject PN, teks, source chat/entry, scope pembaca, waktu kejadian/pencatatan, confidence, expiry, serta versi/koreksi. Simpan fakta yang relevan, bukan seluruh inferensi pribadi. Fakta konflik dipertahankan sebagai konflik sampai ada bukti koreksi.
+- Perbaiki `legacyRunDueJobs` di `ai/scheduler.js`: klaim job tanpa menghapus sebelum sukses, dan reminder tetap jalan saat agent off.
+- Probe OpenRouter: GLM + native tool calling + `openrouter:web_search` dalam satu request. Catat hasilnya (tanpa API key). Kalau tool calling GLM tidak stabil, fallback ke action envelope JSON tervalidasi Ajv, dengan loop yang sama.
+- Probe Gemini Flash audio: voice note ogg → mp3 → `input_audio`, cek kualitas transkrip bahasa Indonesia campur slang, dan cek latensi.
+- **Mulai pengumpulan stiker** (hanya tahap pengumpulan di §4a: hash, unduh, statistik, konteks). Tujuannya supaya kandidat sudah menumpuk saat M2 dimulai.
+- **Demo:**
+  - set reminder 2 menit, restart bot di tengah, dan reminder tetap datang
+  - `/stiker` menunjukkan kandidat bertambah setelah orang kirim stiker
 
-Retrieval memfilter ACL sebelum ranking. Mulai dengan pencarian teks dan metadata; embeddings opsional setelah baseline membuktikan kebutuhan. Filter ulang hasil sebelum prompt. Profil identitas bisa konsisten lintas grup, tetapi isi DM dan fakta privat tidak otomatis dibagikan ke grup atau orang lain.
+### M1 · Agent loop + Web search ⭐ fitur pertama
 
-Memori v2 yang tidak memiliki provenance diberi scope konservatif `legacy_private`; jangan menganggap aman untuk publikasi lintas chat. Backfill hanya dari sumber yang sah dan tersedia.
+> **Status 26 Sep 2026: kode selesai + divalidasi dengan API nyata, tinggal deploy & demo WA.**
+> - `ai/agent/{loop,tools,format,active-loops,usage}.js`, `ai/audio/{ears,voice-notes}.js`. Grup & DM memakai loop yang sama; `routeTaskIntent` dihapus dari `index.js`; `/task` = alias.
+> - Temuan: GLM mengabaikan `response_format` saat tools aktif → jawaban akhir teks bebas + penanda `[[reply:#id]]`. `safeWebFetch` v1 **tidak pernah berhasil di Node ≥20** (lookup `{all:true}`), sudah diperbaiki + tes regresi.
+> - Simulasi nyata (`npm run simulate:agent`): obrolan 2,6 s tanpa tool; harga iPhone 17 vs 16 = 1 web search, 7 s, $0,015; rangkum Wikipedia = 1 fetch, 14 s, $0,001; voice note "besok rapat jam berapa" dijawab dari riwayat; "ini lagu apa?" = listen_audio + web search verifikasi lirik, 63 s (2 pesan progres), $0,025.
 
-`/clear` mengosongkan history aktif dan menaikkan epoch; `/reset` juga menghapus compact memory sesuai scope. Hasil compaction/task lama ditolak bila epoch berubah. Job eksplisit tetap terpisah dari history, dapat dibatalkan lewat kontrol job; payload tidak boleh memulihkan history yang dihapus. `/memory` hanya menampilkan informasi yang actor berhak lihat.
+- `ai/agent/loop.js`: loop tool-calling (maks 25 langkah, timeout, budget, stop/batal, pesan progres).
+- Jev `reply` → `engage` → loop. Balasan biasa lewat loop yang sama (GLM boleh tidak memanggil tool).
+- Tools: `web_search` (server tool OpenRouter), `web_fetch`.
+- Hapus jalur `routeTaskIntent` dari `index.js`, dan jadikan `/task` alias ke loop.
+- Audio (§4b): transkripsi otomatis voice note via Gemini Flash dan tool `listen_audio`.
+- **Demo:**
+  - "@Grad harga iPhone 17 di Indonesia sekarang berapa? bandingin sama iPhone 16"
+  - "@Grad rangkum link ini <url>"
+  - kirim voice note "grad, besok rapat jam berapa?" → Grad paham dan menjawab
+  - reply voice note berisi musik: "@Grad ini lagu apa?" → GLM memanggil `listen_audio`
+  - obrolan biasa tetap natural, tanpa link atau format aneh.
 
-Default retensi usulan: asset sementara 24 jam, trace tersanitasi 14 hari, detail task selesai 30 hari; preferensi/izin bertahan sampai dicabut. Hapus asset turunan dan indeks saat sumber dihapus sesuai scope, dengan tombstone untuk menolak write lama. Runtime DB, asset, trace, `.env`, auth, dan payload pribadi tidak masuk Git.
+### M2 · Koleksi stiker Grad
 
-## 10. Persistence, recovery, dan scheduler
+> **Status 26 Sep 2026: kode selesai + divalidasi dengan GLM nyata, tinggal demo WA (lokal).**
+> - `ai/stickers/{library,curator,commands}.js`; tool `send_sticker` + `get_chat_media`; stiker pengganti reaction; penjadwal kurasi harian/review mingguan.
+> - Kurasi nyata (5 stiker uji): 3 stiker umum disimpan global, stiker lelucon member disimpan **lokal**, gambar acak di-skip dengan alasan; ±$0,001 per batch. Obrolan curhat lembur → teks + stiker "capek"; pertanyaan informatif → tanpa stiker.
+> - Karena bot jalan di laptop, kurasi harian juga jalan bila sudah ≥36 jam sejak kurasi terakhir (tidak hanya di jam tenang).
+- Kurasi harian dan review mingguan (§4a), log keputusan, dan kapasitas ~150.
+- Tool `send_sticker`, indeks koleksi di konteks GLM, stiker pengganti reaction, dan rem pemakaian.
+- Command `/stiker`, `/stiker lihat|buang|kurasi`.
+- Tool `get_chat_media` untuk menganalisis media di riwayat.
+- **Demo:**
+  - `/stiker kurasi` → GLM menyimpan sebagian kandidat dengan label masuk akal dan men-skip sisanya dengan alasan
+  - bercanda dengan Grad → dia kadang membalas pakai stiker koleksinya yang cocok
+  - stiker berisi wajah member grup A tidak pernah muncul di grup B
+  - `/stiker` menunjukkan keputusan buang dari review mingguan
 
-Gunakan SQLite transaksional untuk task, step, event inbox, job, approval, outbox, dan ledger biaya. Pilih driver kompatibel Node target melalui probe instalasi VPS; jangan mengandalkan built-in SQLite Node versi yang belum diverifikasi. Abstraksi storage menjaga opsi mengganti backend tanpa mengubah tools.
+### M2b · Fitur per grup (keputusan 26 Sep 2026)
 
-- Claim job memakai lease + owner worker + fencing/version agar worker lama tidak dapat menulis setelah lease diambil ulang.
-- Satu proses bot aktif dengan process lock; task resume menunggu koneksi WhatsApp siap.
-- Intent dan outbox dibuat dalam transaksi, lalu delivery dilakukan di luar transaksi. Simpan hasil dan status setelahnya.
-- Retry hanya error sementara, dengan backoff+jitter dan maksimum percobaan. Error policy/schema bukan retry tanpa perubahan.
-- Idempotency key stabil untuk operasi logis, bukan dibuat baru setiap retry. Argumen berubah berarti operasi baru dengan pemeriksaan izin ulang.
-- Untuk pengiriman WhatsApp, jangan menjanjikan exactly-once bila transport tidak menjaminnya. Simpan message ID bila tersedia dan rekonsiliasi. Crash sesudah send sebelum commit masuk `delivery_uncertain`; jangan blind resend. Bila status tidak bisa dibuktikan, tampilkan ketidakpastian dan minta tindakan pengguna bila diperlukan.
-- Reminder yang terlewat saat downtime memakai grace period usulan 24 jam, dikirim sekali dengan penanda terlambat; yang lebih lama menjadi expired. Reminder berulang belum masuk MVP.
-- Check-in basi dilewati, bukan ditumpuk. Opt-out tetap menghentikan DM; reminder yang sudah diminta tetap tunduk whitelist dan opt-out sesuai kontrak saat ini.
-- Restart tidak mengosongkan job. Backup konsisten dan restore wajib diuji dengan database, asset references, serta versi schema.
+> **Status 26 Sep 2026: kode selesai + tes, tinggal demo WA (lokal).** Termasuk tambahan: tool `save_sticker` (simpan stiker atas permintaan lalu langsung pakai).
 
-## 11. Budget dan observability
+- Setiap kemampuan Grad bisa dinyalakan/dimatikan per grup. Ditegakkan di kode: tools fitur yang mati tidak dikirim ke GLM, dan proses non-tool (transkripsi audio, pengumpulan stiker, stiker pengganti reaction) ikut berhenti.
+- Fitur dan default: `web` on, `audio` on, `stiker` on, `media` on, `reminder` on (M3), `sosial` off (M5), `workspace` off, `python` on, `skill` on (M4b; diperbarui 27 Sep 2026).
+- Dua level: **owner** mengunci/membuka fitur secara global; **admin WA grup** + owner mengatur per grup, hanya dalam batas yang dibuka owner. Status admin dicek langsung ke metadata grup setiap command.
+- Pengaturan lewat **DM** supaya tidak meramaikan grup: `/grup` (daftar grup yang dia admin-i), `/fitur <no>` (status), `/fitur <no> <fitur> on|off`. Owner juga bisa `/fitur global <fitur> kunci|buka`.
+- Perubahan **senyap** (tidak diumumkan). Di grup, siapa pun bisa kirim `/fitur` untuk melihat status (read-only). Semua perubahan dicatat (siapa, kapan, sebelum/sesudah).
+- Pemegang `/veto` tidak ikut mengatur fitur.
+- **Demo:** admin grup DM `/fitur 1 stiker off` → Grad berhenti memakai dan mengumpulkan stiker di grup itu; `/fitur` di grup menampilkan status; owner mengunci `web` → admin tidak bisa menyalakannya.
 
-Angka berikut merupakan default awal yang harus dikalibrasi, bukan klaim performa model:
+### M2c · Dashboard owner (lokal)
 
-| Batas | Usulan awal |
+> **Status 26 Sep 2026: kode selesai + tes keamanan, dicek di browser dengan data contoh.** Buka lewat link yang dicetak `npm start` atau `npm run dashboard:link`.
+
+- Server HTTP di dalam proses bot, hanya `127.0.0.1:7777` (`DASHBOARD_HOST`/`DASHBOARD_PORT`). Satu halaman HTML + JS tanpa framework, update live via Server-Sent Events.
+- Keamanan: token akses di `data/dashboard-token` (tetap walau restart), link dicetak saat start dan lewat `npm run dashboard:link`; header `Host`/`Origin` dicek (anti CSRF/DNS rebinding); secret (`.env`, API key, `auth/`) tidak pernah tampil/berubah.
+- Isi: ringkasan (koneksi WA, uptime, model, agen on/off, pemakaian & biaya hari ini), grup (fitur per grup, kunci global, log perubahan), aktivitas (log tugas live), stiker (galeri, kandidat, keputusan, tombol kurasi/review/buang), memori (per grup, profil, clear/reset), jadwal (job aktif, batalkan), pengaturan runtime (budget, peluang stiker, kapasitas) yang disimpan di file pengaturan, bukan `.env`.
+- Di VPS diakses lewat SSH tunnel: `ssh -N -L 7777:127.0.0.1:7777 -p 18173 ubuntu@<vps>`, lalu buka `http://127.0.0.1:7777`. Alternatif: Tailscale (`DASHBOARD_HOST` = IP Tailscale). Tidak pernah membuka port publik.
+- **Demo:** buka dashboard di laptop → matikan fitur grup, lihat log tugas masuk live saat ada yang mention Grad, lihat galeri stiker dan jalankan kurasi.
+
+### M3 · Reminder & jadwal
+
+> **Status 26 Sep 2026 (malam): kode selesai + divalidasi API nyata, tinggal demo WA.** Tool schedule/list/cancel, reminder & tugas berulang ke chat asal (grup/DM), tugas mingguan menjalankan loop (uji: jadwal bola → web search → daftar per hari).
+
+- Tools: `schedule` (sekali/berulang, WIT), `list_schedules`, `cancel_schedule`, di atas scheduler M0.
+- Saat jatuh tempo, job boleh **menjalankan loop agen** ("tiap pagi jam 7 kirim ringkasan berita X"), tetap hanya ke chat asal.
+- **Demo:**
+  - "ingetin grup ini besok jam 8 buat rapat"
+  - "tiap Senin jam 7 cariin jadwal bola minggu ini"
+  - "jadwal apa aja yang aktif?" / "batalin yang rapat"
+
+### M4b · Workspace, Python sandbox & skill
+
+> **Status 27 Sep 2026: Python sandbox selesai tanpa Docker (Pyodide + permission model Node), divalidasi API nyata: QR, cicilan anuitas, grafik kurs USD/IDR dari API frankfurter. Uji pembobolan (.env, run_js, spawn, fetch langsung, mount, SSRF, loop) semua tertahan.** **Update malam 27 Sep: `python` kini aktif default (keluhan "Grad nggak punya tool QR"), dan 11 skill bawaan jalan (use_skill + indeks di prompt), divalidasi API nyata: QR teks/WiFi, kurs, cuaca, jadwal sholat, patungan, cicilan flat.** Belum: tools `ws_*` terpisah dan `write_skill` (skill buatan Grad + persetujuan owner).
+- `workspace/<chat>/files/` per grup/DM, tools `ws_list`/`ws_read`/`ws_write` (path dikunci ke folder chat). Catatan grup M4 menjadi file di sini.
+- `run_python(code)` di container Docker sekali pakai: hanya mount workspace chat itu, tanpa `.env`/`auth/`/folder project, batas CPU/RAM/waktu, internet keluar tanpa IP privat. Butuh Docker (Desktop/WSL2 di laptop). Fitur `python` terkunci global secara default.
+- Skill ala Hermes: `workspace/skills/<nama>/SKILL.md` (frontmatter name, description, scope, pembuat). Indeks (name + description) masuk prompt; `read_skill` memuat isi saat dibutuhkan; `write_skill` membuat/memperbarui setelah tugas berhasil. Skill baru lokal ke chat pembuatnya; menjadi global hanya lewat persetujuan owner (dashboard atau `/skill setujui`).
+- Semua di bawah toggle M2b (`workspace`, `python`, `skill`).
+
+### Lanjutan 27 Sep 2026 · FFmpeg, DM peminta, tugas latar
+
+> **Status: kode selesai + divalidasi API nyata.**
+> - `media_edit` (FFmpeg, operasi dikurasi): video/GIF → stiker animasi, potong, kompres, mp3, frame, teks, speed, reverse, crop, gabung. Uji: stiker 3 detik bertulisan "GAS", audio → MP3.
+> - `send_to_my_dm`: hasil/teks ke DM peminta sendiri (hasil media bisa dipindah dari grup). Uji: rangkuman obrolan ke DM, grup hanya konfirmasi.
+> - `start_background_task` / `background_tasks`: subagent latar (40 langkah, 15 menit, $0,5), ack cepat, hasil me-reply permintaan. Uji: riset 3 laptop gaming + grafik, ack 9 dtk, hasil 25 dtk kemudian.
+
+### M4 · Memori & catatan
+
+> **Status 26 Sep 2026 (malam): kode selesai + divalidasi API nyata, tinggal demo WA.** remember/recall/forget + note_* + summarize_history, scope per chat, fakta masuk konteks (uji: alergi udang → rekomendasi makanan tanpa seafood; catatan rapat ditulis & dibaca ulang).
+
+- Tools: `remember`/`recall`/`forget`, `note_*`, `summarize_history`.
+- Compact memori yang ada tetap jalan, dan fakta hasil compact bisa dicari lewat `recall`.
+- **Demo:**
+  - "inget ya aku alergi udang" lalu beberapa hari kemudian "rekomendasiin makanan buat aku"
+  - "catat keputusan rapat tadi" / "catatan kemarin apa aja?"
+
+### M5 · Proaktif grup dinamis
+
+> **Status 26 Sep 2026 (malam): kode selesai + disimulasikan dengan gaya obrolan grup Yy & Tes Bot <3.** Sinyal Jev `opportunity`, jalur bantuan & sosial dengan rem, "grad diem dulu" menahan semua respons ke pesan yang tidak memanggil bot, `/agent social on|off`. Simulasi: "Aku bosaaaan" → stiker bosen; "HAHAHA malu banget" → stiker ngakak; sebagian momen dilewati (tidak spam). Sosial mati di jam tenang (22–07 WIT).
+
+- Sinyal `opportunity` di Jev, cooldown dua jalur, rem otomatis, `/agent social on|off`.
+- **Demo:** ada yang bertanya fakta tanpa mention → bot menjawab. Ada candaan → bot sesekali ikut. Ada yang bilang "grad diem dulu" → bot diam.
+
+### M6 · Pangkas v1
+- Hapus modul di kolom "Buang" §7 beserta tesnya, arsipkan dokumen fase v1, perbarui AGENTS.md dan README.
+
+## 9. Observabilitas minimum
+
+- Satu baris log per tugas: chat, jumlah langkah, tools yang dipakai, token, durasi, dan status. Tanpa isi pesan pribadi atau secret.
+- `/agent status`: status on/off, jumlah tugas hari ini, token terpakai, dan cooldown per grup.
+- Trace detail per tugas (`trace.js`) hanya untuk debugging lokal.
+
+## 10. Risiko dan mitigasi
+
+| Risiko | Mitigasi |
 |---|---|
-| Langkah tool per task | 8 |
-| Replan | 2 |
-| Retry error sementara per operasi | 2 tambahan; tetap dihitung ke budget |
-| Timeout model / tool biasa | 30 detik / 20 detik |
-| Wall time aktif task | 180 detik; waktu waiting tidak dihitung |
-| Total panggilan model per task | 12, termasuk Jev, GLM, repair, verification |
-| Langkah identik tanpa kemajuan | 2 lalu berhenti/replan |
-| Pengingat status | Maksimal satu saat tugas lama, kemudian perubahan bermakna |
+| Biaya: 25 langkah × semua grup | Budget harian di `.env`. Setelah budget habis, loop turun ke balasan tanpa tools. Log token per tugas. |
+| Proaktif sosial terasa spam | Cooldown, kuota per jam, rem "diam", `/agent social off`. Mulai dengan nilai konservatif. |
+| Tool calling GLM tidak stabil | Probe di M0, fallback action envelope JSON. |
+| Stiker tidak pantas masuk koleksi | GLM wajib skip NSFW/SARA/merendahkan, dan owner bisa `/stiker buang`. Semua keputusan tercatat. |
+| Stiker wajah member tersebar ke grup lain | Scope `local` ditetapkan GLM saat kurasi. Kalau GLM ragu, default-nya `local`. |
+| Grad jadi spam stiker | Jeda per stiker sesuai `planned_frequency` dan batas stiker per jam per grup. |
+| Biaya kurasi multimodal | Hanya sekali sehari, batch ~10, dan stiker yang sama tidak dinilai ulang tanpa alasan. |
+| Prompt injection dari halaman web | Hasil tool diberi label data tak tepercaya. Tidak ada tool yang mengirim ke luar chat asal, jadi dampaknya terbatas. |
+| Rilis langsung ke semua grup | Kill switch `/agent off`, dan rollback via git + restart tmux. |
+| Loop dan balasan biasa jadi lebih lambat | Jev tetap menyaring dulu. Obrolan biasa tanpa tool = satu panggilan GLM seperti sekarang. |
 
-Biaya USD per task/hari menjadi konfigurasi owner sebelum mode write aktif, setelah harga aktual diverifikasi. Reserve perkiraan worst-case sebelum panggilan; reconcile usage setelahnya. Jika harga/usage tidak tersedia, terapkan batas token/panggilan konservatif dan jangan menganggap biaya nol. Budget habis menyimpan checkpoint dan status jelas, tidak meminta budget tambahan berulang otomatis.
+## 11. Yang sengaja tidak dikerjakan (sekarang)
 
-Trace mencatat task/event/step/tool IDs, model/provider dan versi prompt, policy decision, token/biaya, latency, error tersanitasi, bukti, dan delivery state. Jangan mencatat API key, raw auth, base64 media, atau request/response lengkap secara default. Status pengguna menunjukkan kemajuan, bukan detail internal model.
-
-Pantau success rate, unsupported rate, false completion, duplicate send, rejection policy, task macet, antrean, reminder laten, biaya per task, dan latency p50/p95. Circuit breaker provider mencegah banjir retry; tidak pernah fallback OpenRouter direct jika proxy VPS gagal.
-
-## 12. Kompatibilitas yang wajib dipertahankan
-
-- Command game/admin, allowedGroups, owner/veto, dan izin admin tetap bekerja.
-- PN terverifikasi menjadi identitas; raw LID tidak pernah menjadi whitelist atau penerima.
-- Orang asing di DM tidak memperoleh respons. Permintaan broadcast tetap ditolak dengan template tetap.
-- Quote memakai `reply_to_entry_id`; null menghasilkan bubble standalone.
-- Jenis sticker/attachment serta image/video/GIF/WebP dan konteks media terdahulu tetap tersedia sesuai batas.
-- Debounce tidak membatalkan evaluasi berjalan; superseded yang belum dievaluasi tidak ditandai sudah dibaca oleh aplikasi.
-- Read receipt dikirim setelah keputusan Jev, termasuk ignore; presence tersedia dan heartbeat tetap dijaga. Jumlah centang yang terlihat tetap bergantung layanan/perangkat WhatsApp, bukan jaminan runtime.
-- Percakapan lanjutan dengan bot dan ack singkat tidak hilang karena threshold rendah.
-- Auto-compact tetap diam, dan tidak menghidupkan kembali konteks setelah clear/reset.
-- Rahasia `.env` dan `auth/` tidak diedit/dihapus; `data.json` tidak diedit manual saat bot aktif.
-- OpenRouter VPS wajib melalui Privoxy/WARP. WhatsApp/GitHub tidak diarahkan ke proxy tersebut.
-
-## 13. Evaluasi dan release gate
-
-Buat dataset sintetis atau tersanitasi, gunakan mock clock/socket/executor, dan jalankan simulasi API nyata melalui proxy. Evaluasi memeriksa hasil/artefak dan jejak tindakan; penilaian GLM sendiri tidak cukup sebagai bukti sukses.
-
-Minimum 60 skenario: 10 chat/routing, 15 multi-step tools, 10 memori/privasi, 10 crash/retry/delivery, 10 serangan/izin, 5 scheduler/budget. Ulangi skenario model-dependent tiga kali. Catat model/provider, versi prompt, tanggal, fixture, denominator, latency, serta biaya tiap run. Angka kelulusan berlaku pada suite ini, bukan jaminan terhadap seluruh serangan di dunia nyata.
-
-| Gate | Target rilis awal |
-|---|---|
-| Critical safety | 100% kasus whitelist, lintas-chat, secret, broadcast, approval palsu, SSRF, sandbox ditolak |
-| Efek samping ganda | 0 pada seluruh fault-injection suite |
-| Klaim selesai palsu | 0; bukti wajib untuk success |
-| Tugas yang didukung | >=90% sukses agregat; laporkan juga konsistensi 3/3 |
-| Routing | >=95% pada dataset; laporkan false ignore pesan langsung terpisah |
-| Restart/cancel/epoch | Seluruh kasus deterministik lulus |
-| Reminder | <=60 detik dari due saat sistem sehat, tanpa duplikat |
-| Balasan sederhana | Target p95 <=15 detik di kondisi sehat; pisahkan delay natural dan latency provider |
-| Anggaran | Tidak ada pemanggilan baru setelah batas runtime tercapai |
-| Naturalness | >=90% sampel diterima reviewer manusia menurut rubrik singkat/relevan/tidak repetitif |
-
-Skenario wajib: media quoted dan lama; PN/LID ambigu; nama sama nomor berbeda; memori DM mencoba bocor ke grup; prompt injection dalam web/stiker/note; clear/reset saat compaction; pesan cepat saat task berjalan; izin dicabut sebelum send; crash sebelum/sesudah efek; proxy mati; JSON rusak; provider unsupported; opt-out; off versus pause; reminder saat restart; budget habis.
-
-Validasi implementasi:
-
-```bash
-node --check index.js
-node --check ai/group-agent.js
-node --check ai/direct-agent.js
-node --check ai/scheduler.js
-npm test
-npm run simulate:ai
-npm run simulate:burst
-npm run simulate:memory
-npm run simulate:dm
-git diff --check
-```
-
-Tambahkan test runtime baru ke script `npm test` secara eksplisit karena script saat ini hanya menyebut tiga file. Tambahkan simulator task/recovery sebagai script baru; jangan mengklaim sudah tersedia. Tes alur pesan harus memanggil `processGroupMessage` dan `processDirectMessage` langsung dengan mock socket. Simulasi memakai penerima/transport tes, tidak mengirim ke pengguna produksi.
-
-## 14. Urutan implementasi dan kriteria selesai
-
-| Fase | Pekerjaan | Gate sebelum lanjut |
-|---|---|---|
-| 0. Baseline | Inventaris source, baseline test, model/provider probe, kontrak izin dan biaya | Baseline terdokumentasi; batas API terbukti |
-| 1. Fondasi | Adapter model, schema validator, policy, budget, trace redaction, registry tunggal | Policy negatif lulus; invalid JSON tidak dieksekusi |
-| 2. Runtime durable | Task loop, SQLite, queue, checkpoint, lease, outbox, cancellation | Crash/restart/cancel dan delivery-uncertain lulus |
-| 3. Agen MVP | Note, memory scoped, kalkulasi terkontrol, reminder; routing Jev + GLM | Tugas 3+ langkah selesai berdasarkan bukti, termasuk satu skenario replan |
-| 4. Media dan web | Asset store, fetch, stiker, send asset, pencarian bersumber | SSRF/ACL/media limits lulus; artefak terkirim dan tervalidasi |
-| 5. Memori dan proaktif | Provenance, migrasi v2, retrieval, expiry, standing permission | Tidak ada bocor lintas scope; off/opt-out/jam tenang lulus |
-| 6. Sandbox opsional | Python/container dan output artefak | Semua tes isolasi/resource lulus; tetap nonaktif jika infrastruktur belum memadai |
-| 7. Rilis bertahap | Shadow, canary, fault injection, evaluasi, rollback drill | Seluruh release gate dan observasi canary lulus |
-
-Deliverable tiap fase: source, test langsung, fixture/simulasi relevan, laporan gate dengan bukti, migrasi/rollback bila ada, pembaruan README/AGENTS.md dan `.env.example` tanpa rahasia. Jangan menyalakan fase berikutnya hanya karena kode berhasil build.
-
-MVP agen otonom tercapai pada fase 3. Overhaul produksi utama selesai setelah fase 4, 5, dan 7. Python merupakan capability tambahan, bukan syarat untuk menyebut runtime sebagai agen.
-
-## 15. Migrasi, deployment, dan rollback
-
-1. Tambahkan feature flag engine `legacy|shadow|agent` dan allowlist canary. Legacy tetap tersedia selama transisi.
-2. Siapkan backup konsisten memory/jobs dan metadata versi schema; jangan membaca/menyalin isi auth ke log. Uji migrasi menggunakan fixture, bukan data produksi terlebih dahulu.
-3. Cutover storage memakai maintenance singkat: hentikan claim job baru, drain task dan delivery, snapshot, import dalam transaksi, validasi jumlah/ID/checksum logis. Tidak ada dua writer aktif ke JSON dan SQLite.
-4. JSON lama dipertahankan sebagai backup read-only. Task/jobs baru memakai DB; facade memory lama dapat dipertahankan sampai migrasi memori selesai dengan pemilik write yang tunggal.
-5. Shadow minimal 24 jam: nilai proposal tanpa mengirim, menulis memori produksi, membuat job, atau menggandakan receipt/presence. Gunakan storage terpisah dan batasi biaya.
-6. Canary satu grup dan DM tester yang sah minimal 48 jam, dengan sekurangnya 30 tugas beragam, tanpa insiden kritis. Waktu saja tidak cukup bila sampel belum terpenuhi.
-7. Restart bot lewat `tmux send-keys -t wabot C-c`; verifikasi log, satu instance Node, koneksi WhatsApp, DB recovery, dan kesehatan proxy. Jangan menggunakan `/reboot` WhatsApp.
-8. Perluas bertahap setelah gate. Rilis capability satu per satu; hentikan rollout jika ada kebocoran, duplicate send, false success, atau lonjakan biaya.
-
-Rollback: pause claim dan write, drain/rekonsiliasi outbox, simpan snapshot DB terbaru, ubah engine ke legacy, lalu restart sesuai prosedur. Gunakan adapter ekspor untuk memory/jobs yang kompatibel beserta ledger deduplikasi; jangan memulihkan JSON lama secara buta karena reminder baru bisa hilang atau terkirim ulang. Task baru yang tidak dipahami legacy dibekukan, dilaporkan, dan tidak dipaksa dikonversi. Uji prosedur ini sebelum canary.
-
-## 16. Referensi primer
-
-Diakses 22 September 2026. Referensi digunakan sebagai prinsip desain; angka budget, pilihan SQLite, scope WhatsApp, dan gate di dokumen ini merupakan keputusan proyek.
-
-- [Anthropic — Building effective agents](https://www.anthropic.com/engineering/building-effective-agents): perbedaan workflow dan agent, loop berbasis observasi, stopping condition. Artikel fondasional; bukan katalog teknologi terbaru.
-- [Anthropic — Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents): evaluasi hasil, trajectory, dan variasi antar percobaan.
-- [OWASP — Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/): acuan threat model agen.
-- [OpenRouter — Tool calling](https://openrouter.ai/docs/guides/features/tool-calling): protokol pemanggilan tool dan pengembalian hasil.
-- [OpenRouter — Structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs): schema output dan ketergantungan dukungan provider.
-- [OpenRouter — Jev 1.13](https://openrouter.ai/typesafe/jev-1.13/api): peran Jev sebagai model keputusan terstruktur berbasis teks.
-
-## 17. Definition of done
-
-- [ ] Jev dan GLM Flash menjalankan pembagian peran melalui adapter teruji.
-- [ ] Agen menyelesaikan tugas multi-step dengan tools nyata, replan, dan bukti hasil.
-- [ ] Task/job selamat dari restart, cancel dan pencabutan izin efektif, serta ketidakpastian delivery ditangani jujur.
-- [ ] Memori bersumber dan sesuai scope; clear/reset tidak memulihkan konteks lama.
-- [ ] Seluruh invariants WhatsApp/DM dan fitur lama tetap lulus regresi.
-- [ ] Anggaran, trace tersanitasi, status, emergency pause, dan kontrol owner bekerja.
-- [ ] Seluruh gate kritis dan target kualitas lulus dengan laporan hasil nyata.
-- [ ] Migrasi, restore, rollback, shadow, dan canary berhasil diverifikasi.
-- [ ] Dokumentasi membedakan capability aktif, nonaktif, dan yang belum didukung.
+- Eksekusi kode/Python sebelum M4b (sandbox Docker + toggle M2b wajib ada lebih dulu).
+- Mengirim pesan ke chat lain atau membuat grup.
+- Multi-agent paralel / spesialis beda model, vector DB, MCP. (Subagent **tugas latar** sudah ada sejak 27 Sep 2026.)

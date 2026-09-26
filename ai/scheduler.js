@@ -183,7 +183,38 @@ async function sendDirect(sock, phone, text, { proactive = false, at = Date.now(
   return { jid, text };
 }
 
+// Tugas terjadwal (M3) menjalankan agent loop; runner dipasang group-agent
+// supaya scheduler tidak bergantung langsung pada modul AI.
+let chatTaskRunner = null;
+function setChatTaskRunner(fn) {
+  chatTaskRunner = typeof fn === "function" ? fn : null;
+}
+
+async function runChatJob(job, { sock, at }) {
+  const { chatId, isDm, text } = job.payload || {};
+  if (!chatId) return { ...job, status: "invalid" };
+  const features = require("./features");
+  if (!features.isEnabled(chatId, "reminder")) return { ...job, status: "feature_off" };
+  if (isDm) {
+    const phone = memoryStore.normalizePhone(chatId);
+    if (!memoryStore.canDirectMessage(phone)) return { ...job, status: "blocked" };
+  }
+  if (job.type === "chat_task") {
+    if (!chatTaskRunner) throw new Error("chat_task_runner_unavailable");
+    const result = await chatTaskRunner({ sock, chatId, isDm, prompt: text, at });
+    return { ...job, status: result?.sent ? "sent" : "empty" };
+  }
+  const message = `⏰ ${text}`;
+  const sent = await sock.sendMessage(chatId, { text: message });
+  const groupAgent = require("./group-agent");
+  groupAgent.remember(isDm ? `dm:${memoryStore.normalizePhone(chatId)}` : chatId, {
+    sender: groupAgent.config().botName, senderId: "BOT", text: message, isBot: true, messageKey: sent?.key, messageRef: sent,
+  });
+  return { ...job, status: "sent" };
+}
+
 async function legacyRunJob(job, { sock, at = Date.now() } = {}) {
+  if (job.type === "chat_reminder" || job.type === "chat_task") return runChatJob(job, { sock, at });
   const cfg = agentConfig();
   const phone = memoryStore.normalizePhone(job.payload?.phone);
   if (!phone) return { ...job, status: "invalid" };
@@ -207,29 +238,72 @@ async function legacyRunJob(job, { sock, at = Date.now() } = {}) {
   return { ...job, status: "unknown_type" };
 }
 
-async function legacyRunDueJobs({ sock = activeSock, at = Date.now() } = {}) {
+// Reminder diminta pengguna, jadi tetap dikirim walau agen dimatikan owner.
+const USER_REQUESTED_TYPES = new Set(["reminder", "chat_reminder", "chat_task"]);
+const MAX_JOB_ATTEMPTS = 5;
+// Token proses ini. Klaim dengan token lain berasal dari proses yang sudah mati
+// (crash/restart di tengah pengiriman), jadi job itu boleh diklaim ulang.
+const RUN_TOKEN = `${process.pid}-${Date.now().toString(36)}`;
+let dueJobsQueue = Promise.resolve();
+
+function isClaimedByLiveRun(job) {
+  return Boolean(job.claimed_at) && job.claimed_by === RUN_TOKEN;
+}
+
+// Job diklaim (ditandai + disimpan) sebelum dijalankan dan baru dihapus setelah
+// selesai, supaya crash di tengah pengiriman tidak menghilangkan reminder.
+// Konsekuensinya at-least-once: crash tepat setelah terkirim bisa mengirim ulang.
+async function legacyRunDueJobsOnce({ sock, at }) {
   if (emergencyPaused) return [];
   const cfg = agentConfig();
-  if (!cfg.enabled) return [];
   const s = getStore();
-  const due = s.jobs.filter((job) => job.fire_at <= at);
+  const due = s.jobs.filter((job) => job.fire_at <= at
+    && !isClaimedByLiveRun(job)
+    && (cfg.enabled || USER_REQUESTED_TYPES.has(job.type)));
   if (!due.length) return [];
-  const remaining = s.jobs.filter((job) => job.fire_at > at);
-  s.jobs = remaining;
+  for (const job of due) {
+    job.claimed_at = at;
+    job.claimed_by = RUN_TOKEN;
+    job.attempts = (job.attempts || 0) + 1;
+  }
   saveLegacy();
 
   const results = [];
   for (const job of due) {
+    const { claimed_at, claimed_by, ...clean } = job;
     try {
-      results.push(await legacyRunJob(job, { sock, at }));
+      results.push(await legacyRunJob(clean, { sock, at }));
+      // Jadwal berulang (M3) maju ke kejadian berikutnya, bukan dihapus.
+      const next = clean.payload?.recurrence ? require("./agent/schedules").nextOccurrence(clean.payload.recurrence, Math.max(at, clean.fire_at)) : null;
+      if (next) {
+        delete job.claimed_at;
+        delete job.claimed_by;
+        job.fire_at = next;
+        job.attempts = 0;
+      } else {
+        s.jobs = s.jobs.filter((item) => item.id !== job.id);
+      }
     } catch (error) {
-      console.error(`[AGENT] Job ${job.type} gagal:`, error.response?.data?.error?.message || error.message);
-      results.push({ ...job, status: "error" });
-      s.jobs.push({ ...job, attempts: (job.attempts || 0) + 1, fire_at: at + 5 * MINUTE });
+      console.error(`[AGENT] Job ${job.type} gagal (percobaan ${job.attempts}):`, error.response?.data?.error?.message || error.message);
+      results.push({ ...clean, status: "error" });
+      if (job.attempts >= MAX_JOB_ATTEMPTS) {
+        s.jobs = s.jobs.filter((item) => item.id !== job.id);
+      } else {
+        delete job.claimed_at;
+        delete job.claimed_by;
+        job.fire_at = at + Math.min(60, 2 ** (job.attempts - 1)) * MINUTE;
+      }
     }
+    saveLegacy();
   }
-  saveLegacy();
   return results;
+}
+
+function legacyRunDueJobs({ sock = activeSock, at = Date.now() } = {}) {
+  // Tick yang tumpang tindih diantrikan agar job yang sama tidak jalan dua kali.
+  const run = dueJobsQueue.catch(() => {}).then(() => legacyRunDueJobsOnce({ sock, at }));
+  dueJobsQueue = run;
+  return run;
 }
 
 function legacyMaybeScheduleProactive({ at = Date.now() } = {}) {
@@ -260,14 +334,18 @@ async function legacyTick({ sock = activeSock, at = Date.now() } = {}) {
   return results;
 }
 
+// Timer selalu jalan (juga saat agen off) karena reminder pengguna tetap dikirim;
+// gerbang enabled diterapkan per job di legacyRunDueJobsOnce.
 function legacyStart({ sock } = {}) {
   legacyStop();
   if (sock) activeSock = sock;
-  if (!agentConfig().enabled) return null;
-  timer = setInterval(() => {
+  const runTick = () => {
     legacyTick({ sock: activeSock }).catch((error) => console.error("[AGENT] Tick gagal:", error.message));
-  }, agentConfig().tickMs);
+  };
+  timer = setInterval(runTick, agentConfig().tickMs);
   if (typeof timer.unref === "function") timer.unref();
+  // Reminder yang jatuh tempo saat bot mati langsung dikirim begitu tersambung.
+  if (activeSock) setImmediate(runTick);
   return timer;
 }
 
@@ -410,7 +488,6 @@ function setEnabled(value) {
   }
   memoryStore.setAgentSettings({ enabled: Boolean(value) });
   if (engineConfig.isLegacy()) {
-    if (!value) legacyStop();
     return agentConfig().enabled;
   }
   const ds = getDurableScheduler();
@@ -485,6 +562,7 @@ function tick(opts) {
 
 module.exports = {
   agentConfig,
+  setChatTaskRunner,
   canProactivelyMessage,
   cancelJob,
   clearJobs,

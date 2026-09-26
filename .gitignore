@@ -24,3 +24,11 @@ runtime*.db*
 test/*.db*
 backups/
 traces/
+data/stickers/
+features.json
+features.json.*.tmp
+data/dashboard-token
+data/runtime-settings.json
+data/notebook.json
+data/pyodide-cache/
+data/workspace/

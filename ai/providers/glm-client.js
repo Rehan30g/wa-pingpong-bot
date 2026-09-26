@@ -39,6 +39,7 @@ function createGlmClient(options = {}) {
     temperature = 0.3,
     reasoningEffort = defaultReasoningEffort,
     supportsVideoDataUrl = defaultSupportsVideo,
+    signal,
   }) {
     if (!Array.isArray(messages) || messages.length === 0) {
       throw new OpenRouterError("Parameter 'messages' wajib berupa array tidak kosong", {
@@ -54,6 +55,7 @@ function createGlmClient(options = {}) {
       messages: finalMessages,
       temperature,
       reasoning: { effort: reasoningEffort, exclude: true },
+      usage: { include: true },
     };
 
     if (Number.isInteger(maxTokens) && maxTokens > 0) {
@@ -69,7 +71,7 @@ function createGlmClient(options = {}) {
       payload.response_format = responseFormat;
     }
 
-    const response = await openrouterClient.post("/api/v1/chat/completions", payload);
+    const response = await openrouterClient.post("/api/v1/chat/completions", payload, signal ? { signal } : undefined);
     const latencyMs = Date.now() - start;
 
     if (!response || typeof response !== "object") {
@@ -137,6 +139,9 @@ function createGlmClient(options = {}) {
       finishReason: choice?.finish_reason || "stop",
       text,
       toolCalls,
+      // Pesan asisten mentah dipakai ulang oleh agent loop (tool_calls harus dikirim balik apa adanya).
+      message,
+      annotations: Array.isArray(message.annotations) ? message.annotations : [],
       usage: {
         promptTokens,
         completionTokens,

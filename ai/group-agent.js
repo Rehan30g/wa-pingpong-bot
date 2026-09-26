@@ -1,9 +1,334 @@
+const fs = require("node:fs");
 const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const memoryStore = require("./memory-store");
 const { createOpenRouterClient } = require("./providers/openrouter-client");
 const { createJevClient, choiceConfidence } = require("./providers/jev-client");
 const { createGlmClient } = require("./providers/glm-client");
+const activeLoops = require("./agent/active-loops");
+const { agentInstructions, loopConfig, runAgentLoop } = require("./agent/loop");
+const usageTracker = require("./agent/usage");
+const { REACTION_MOODS, getStickerLibrary, stickerConfig } = require("./stickers/library");
+const featureSettings = require("./features");
+const schedules = require("./agent/schedules");
+const notebook = require("./memory/notebook");
+const proactive = require("./agent/proactive");
+const pythonRunner = require("./sandbox/python-runner");
+const skillLibrary = require("./skills");
+const { witParts } = require("./humanize");
+
+// Peserta chat berdasarkan nama (untuk remember "tentang Budi").
+function personResolver(historyKey) {
+  return (name) => {
+    const target = String(name || "").trim().toLowerCase();
+    const entry = [...getHistory(historyKey)].reverse().find((item) => !item.is_bot && String(item.sender).toLowerCase() === target);
+    return entry ? { phone: entry.sender_id, name: entry.sender } : null;
+  };
+}
+
+// Loader media dari pesan WA mentah (dipasang index.js) untuk get_chat_media.
+let mediaLoader = null;
+function setMediaLoader(fn) {
+  mediaLoader = typeof fn === "function" ? fn : null;
+}
+
+function getMediaLoader() {
+  return mediaLoader;
+}
+
+// Koleksi stiker yang boleh dipakai di chat ini untuk satu tugas agent loop.
+async function stickerContext(chatId) {
+  try {
+    const library = getStickerLibrary();
+    const usable = await library.usableForChat(chatId);
+    return { usable: new Map(usable.map((sticker) => [sticker.id, sticker])), queue: [], index: library.indexText(usable) };
+  } catch (error) {
+    console.warn("[STIKER] Koleksi tidak bisa dibaca:", error.message);
+    return null;
+  }
+}
+
+// Kirim stiker koleksi ke chat asal, catat pemakaian Grad dan riwayat.
+async function sendCollectionSticker(sock, chatId, sticker, { quoted = null, isDm = false, historyKey = chatId } = {}) {
+  const library = getStickerLibrary();
+  const buffer = library.readFile(sticker);
+  const sent = await sock.sendMessage(chatId, { sticker: buffer }, quoted ? { quoted } : undefined);
+  await library.recordBotUse(sticker.sha, chatId, { isDm });
+  require("./observability/activity").record("sticker_sent", { chat: chatId, sticker: sticker.id, label: sticker.label });
+  remember(historyKey, { sender: config().botName, senderId: "BOT", text: `[mengirim stiker: ${sticker.label}]`, isBot: true, messageKey: sent?.key, messageRef: sent });
+  return sent;
+}
+
+// Pengunduh stiker dari pesan WA mentah (dipasang index.js) untuk save_sticker.
+let stickerDownloader = null;
+function setStickerDownloader(fn) {
+  stickerDownloader = typeof fn === "function" ? fn : null;
+}
+
+// stickerMessage dari entri riwayat: stiker itu sendiri, atau stiker yang di-reply.
+function stickerMessageFrom(ref) {
+  const message = ref?.message || {};
+  if (message.stickerMessage) return message.stickerMessage;
+  for (const part of Object.values(message)) {
+    const quoted = part?.contextInfo?.quotedMessage;
+    if (quoted?.stickerMessage) return quoted.stickerMessage;
+  }
+  return null;
+}
+
+function historyHasStickers(history) {
+  return history.some((item) => !item.is_bot && stickerMessageFrom(item.message_ref));
+}
+
+/**
+ * save_sticker: simpan stiker atas permintaan pengguna tanpa menunggu kurasi.
+ * Aturan sama dengan kurasi: tidak aman ditolak, kapasitas dijaga, tercatat.
+ * Stiker yang tersimpan langsung masuk `stickers.usable` loop yang sedang jalan.
+ */
+function makeStickerSaver({ chatId, historyKey = chatId, isDm = false, requester = "pengguna", requesterId = null, stickers }) {
+  return async ({ entry_id: entryId, label, moods, when_to_use: whenToUse, planned_frequency: plannedFrequency, scope, safety, replace_sticker_id: replaceId }) => {
+    const { stickerSha } = require("./stickers/collector");
+    const entry = getHistory(historyKey).find((item) => item.entry_id === entryId);
+    const stickerMessage = entry && stickerMessageFrom(entry.message_ref);
+    const sha = stickerMessage && stickerSha(stickerMessage.fileSha256);
+    if (!sha) return { error: `pesan #${entryId} bukan stiker atau tidak me-reply stiker` };
+    const library = getStickerLibrary();
+    if (safety !== "ok") {
+      await library.logDecision(sha, "skip", { label, reason: `[aturan keamanan: ${safety}] ditolak saat diminta ${requester}`, source: "request" });
+      return { error: `stiker tidak disimpan karena tidak aman (${safety}); jelaskan dengan sopan` };
+    }
+    const existing = (await library.listCollection()).find((sticker) => sticker.sha === sha);
+    if (!existing) {
+      const collection = await library.listCollection();
+      if (collection.length >= stickerConfig().capacity) {
+        const victim = replaceId && collection.find((sticker) => sticker.id === String(replaceId).slice(0, 8));
+        if (!victim) return { error: `koleksi penuh (${collection.length}); isi replace_sticker_id dengan stiker koleksi yang mau dibuang, atau bilang koleksinya penuh` };
+        await library.remove(victim.sha, { reason: `diganti stiker baru atas permintaan ${requester}`, source: "request" });
+      }
+      try {
+        await library.importCandidate(sha, {
+          chatId,
+          isDm,
+          senderId: requesterId,
+          download: stickerDownloader ? () => stickerDownloader(stickerMessage) : null,
+        });
+      } catch {
+        return { error: "file stikernya sudah tidak bisa diunduh; minta dikirim ulang" };
+      }
+      await library.keep(sha, {
+        label, moods, when_to_use: whenToUse, planned_frequency: plannedFrequency,
+        // Stiker permintaan dari DM tidak pernah jadi global.
+        scope: isDm ? "local" : scope,
+        reason: `disimpan atas permintaan ${requester}`,
+      }, { source: "request" });
+    }
+    const saved = (await library.listCollection()).find((sticker) => sticker.sha === sha);
+    if (stickers && saved) stickers.usable.set(saved.id, saved);
+    return { ok: true, sticker_id: saved.id, label: saved.label, scope: saved.scope, already_in_collection: Boolean(existing), note: "sudah bisa dikirim dengan send_sticker" };
+  };
+}
+
+async function runScheduledTask({ sock, chatId, isDm = false, prompt }) {
+  const historyKey = isDm ? `dm:${memoryStore.normalizePhone(chatId)}` : chatId;
+  const latestMessage = { sender: "Jadwal", sender_id: "SCHEDULER", text: `Tugas terjadwal yang diminta sebelumnya: ${prompt}. Kerjakan sekarang dan kirim hasilnya ke chat ini, tanpa menyebut bahwa ini tugas terjadwal secara kaku.` };
+  const generated = await generateReply({ groupId: historyKey, chatId, isDm, latestMessage, quotedText: "", media: null, historySnapshot: getHistory(historyKey), memorySnapshot: getGroupMemory(historyKey) });
+  if (generated.text) {
+    const sent = await sock.sendMessage(chatId, { text: generated.text });
+    remember(historyKey, { sender: config().botName, senderId: "BOT", text: generated.text, isBot: true, messageKey: sent?.key, messageRef: sent });
+  }
+  const mediaSent = await sendOutboxMedia(sock, chatId, generated.media, { historyKey });
+  const stickersSent = await sendQueuedStickers(sock, chatId, generated.stickers, { isDm, historyKey });
+  return { sent: Boolean(generated.text || stickersSent.length || mediaSent.length), text: generated.text };
+}
+
+// Scheduler menjalankan tugas terjadwal lewat fungsi ini (tanpa dependensi melingkar).
+require("./scheduler").setChatTaskRunner(runScheduledTask);
+
+// Hasil run_python / media_edit (folder out/) dikirim ke chat setelah teks,
+// sesuai jenisnya: gambar, video, GIF (mp4 gifPlayback), audio, atau stiker.
+const MEDIA_LABEL = { image: "gambar", video: "video", gif: "GIF", audio: "audio", sticker: "stiker" };
+function mediaMessage(item) {
+  const buffer = fs.readFileSync(item.path);
+  switch (item.kind) {
+    case "video": return { video: buffer, mimetype: "video/mp4" };
+    case "gif": return { video: buffer, mimetype: "video/mp4", gifPlayback: true };
+    case "audio": return { audio: buffer, mimetype: item.mime || "audio/mpeg" };
+    case "sticker": return { sticker: buffer };
+    default: return { image: buffer, mimetype: item.mime };
+  }
+}
+
+// Isi media yang baru dikirim per chat (sha256 → waktu). GLM kadang membuat ulang
+// file lama (mis. QR dibuat lagi sebelum dijadikan stiker); hasil sampingan yang
+// isinya identik tidak dikirim dua kali.
+const recentMediaHashes = new Map();
+const RECENT_MEDIA_MS = 3 * 3_600_000;
+
+function mediaHash(file) {
+  return require("node:crypto").createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+async function sendOutboxMedia(sock, chatId, items, { historyKey = chatId } = {}) {
+  const sent = [];
+  const seen = new Set();
+  const recent = recentMediaHashes.get(chatId) || new Map();
+  for (const [hash, at] of recent) if (Date.now() - at > RECENT_MEDIA_MS) recent.delete(hash);
+  const pending = (items || []).filter((item) => {
+    if (seen.has(item.path) || !fs.existsSync(item.path)) return false;
+    seen.add(item.path);
+    item.hash = mediaHash(item.path);
+    return true;
+  });
+  // Ulangan identik hanya dikirim bila memang satu-satunya hasil (pengguna minta kirim ulang).
+  const fresh = pending.filter((item) => !recent.has(item.hash));
+  const toSend = fresh.length ? fresh : pending;
+  for (const item of toSend) {
+    try {
+      recent.set(item.hash, Date.now());
+      recentMediaHashes.set(chatId, recent);
+      const message = await sock.sendMessage(chatId, mediaMessage(item));
+      // Nama file teknis hasil media_edit tidak perlu masuk riwayat.
+      const label = item.name.startsWith("edit_") ? "" : `: ${item.name}`;
+      remember(historyKey, { sender: config().botName, senderId: "BOT", text: `[mengirim ${MEDIA_LABEL[item.kind] || "media"}${label}]`, isBot: true, messageKey: message?.key, messageRef: message });
+      sent.push(item.name);
+    } catch (error) {
+      console.warn("[MEDIA] Gagal mengirim hasil:", error.message);
+    }
+  }
+  return sent;
+}
+
+// DM ke peminta sendiri (atas permintaannya): satu-satunya pengecualian aturan
+// "kirim hanya ke chat asal". Nomor harus terverifikasi, di whitelist, tidak opt-out.
+function requesterDmRelay(senderId) {
+  const phone = memoryStore.normalizePhone(senderId);
+  if (!/^\d{8,15}$/.test(phone) || !memoryStore.canDirectMessage(phone) || memoryStore.getDmMemory(phone).opt_out) return null;
+  return { phone, texts: [], moveResults: false };
+}
+
+async function deliverToRequesterDm(sock, relay, media = []) {
+  const jid = `${relay.phone}@s.whatsapp.net`;
+  const historyKey = `dm:${relay.phone}`;
+  for (const text of relay.texts) {
+    const sent = await sock.sendMessage(jid, { text });
+    remember(historyKey, { sender: config().botName, senderId: "BOT", text, isBot: true, messageKey: sent?.key, messageRef: sent });
+  }
+  const mediaSent = await sendOutboxMedia(sock, jid, media, { historyKey });
+  memoryStore.noteBotDm(relay.phone, { at: Date.now(), proactive: false });
+  require("./observability/activity").record("dm_relay", { chat: jid, texts: relay.texts.length, media: mediaSent.length });
+  return mediaSent;
+}
+
+// Soket terbaru: tugas latar bisa selesai setelah koneksi WA tersambung ulang.
+let latestSock = null;
+
+/**
+ * Subagent tugas latar: loop yang sama dengan batas lebih besar, tanpa pesan
+ * progres dan tanpa bisa memulai subagent lagi. Hasil me-reply permintaannya.
+ */
+async function runBackgroundTask(task, fallbackSock) {
+  const bg = require("./agent/background");
+  const cfg = bg.backgroundConfig();
+  const deliverSock = () => latestSock || fallbackSock;
+  task.onError = async (error) => {
+    try {
+      await deliverSock()?.sendMessage(task.chatId, { text: `Maaf, tugas latar "${task.goal.slice(0, 60)}" gagal diselesaikan (${String(error.message).slice(0, 80)}).` }, task.requestRef ? { quoted: task.requestRef } : undefined);
+    } catch {}
+  };
+  const handle = { signal: task.controller.signal, get aborted() { return task.controller.signal.aborted; }, drain: () => [] };
+  const latestMessage = {
+    sender: task.requesterName,
+    sender_id: task.requesterId,
+    text: `Tugas latar dari ${task.requesterName}: ${task.goal}\nKerjakan tuntas sekarang (kamu punya waktu dan langkah lebih banyak). Jawaban akhirmu adalah laporan hasil yang langsung dikirim ke chat sambil me-reply permintaannya, jadi jangan bilang "nanti".`,
+  };
+  const generated = await generateReply({
+    groupId: task.historyKey,
+    chatId: task.chatId,
+    isDm: task.isDm,
+    latestMessage,
+    quotedText: "",
+    media: null,
+    historySnapshot: getHistory(task.historyKey),
+    memorySnapshot: getGroupMemory(task.historyKey),
+    handle,
+    background: true,
+    loopOverrides: { maxSteps: cfg.maxSteps, timeoutMs: cfg.timeoutMs, taskBudgetUsd: cfg.budgetUsd },
+  });
+  if (task.controller.signal.aborted || generated.status === "aborted") return generated;
+  const sock = deliverSock();
+  if (generated.text) {
+    const sent = await sock.sendMessage(task.chatId, { text: generated.text }, task.requestRef ? { quoted: task.requestRef } : undefined);
+    remember(task.historyKey, { sender: config().botName, senderId: "BOT", text: generated.text, isBot: true, messageKey: sent?.key, messageRef: sent });
+  }
+  await sendOutboxMedia(sock, task.chatId, generated.dmRelay?.moveResults ? [] : generated.media, { historyKey: task.historyKey });
+  if (generated.dmRelay) await deliverToRequesterDm(sock, generated.dmRelay, generated.dmRelay.moveResults ? generated.media : []);
+  await sendQueuedStickers(sock, task.chatId, generated.stickers, { isDm: task.isDm, historyKey: task.historyKey });
+  return generated;
+}
+
+function makeBackgroundControl({ chatId, historyKey, isDm, latestMessage, requestRef, sock }) {
+  const bg = require("./agent/background");
+  return {
+    start: ({ goal }) => bg.start({
+      chatId, historyKey, isDm, goal,
+      requesterId: latestMessage.sender_id,
+      requesterName: latestMessage.sender,
+      requestRef,
+      run: (task) => runBackgroundTask(task, sock),
+    }),
+    list: () => bg.listForChat(chatId),
+    cancel: (id) => bg.cancel(chatId, id),
+  };
+}
+
+// Loader media asli dari pesan WA (dipasang index.js) untuk media_edit.
+let rawMediaLoader = null;
+function setRawMediaLoader(fn) {
+  rawMediaLoader = typeof fn === "function" ? fn : null;
+}
+
+/** Editor media terikat satu chat: sumber dari riwayat (#) atau file workspace. */
+function makeMediaEditor({ chatId, historyKey = chatId }) {
+  return async ({ sources = [], steps = [], output, frames, target_mb: targetMb }) => {
+    const { editMedia } = require("./media/media-edit");
+    const workdir = pythonRunner.workspaceFor(chatId);
+    const inputs = [];
+    for (const [index, source] of sources.slice(0, 4).entries()) {
+      if (source.file) {
+        inputs.push(String(source.file));
+        continue;
+      }
+      const entry = getHistory(historyKey).find((item) => item.entry_id === source.entry_id);
+      if (!entry?.message_ref) return { error: `pesan #${source.entry_id} tidak ada di riwayat aktif` };
+      if (!rawMediaLoader) return { error: "pengunduh media tidak tersedia" };
+      let raw;
+      try {
+        raw = await rawMediaLoader(entry.message_ref);
+      } catch (error) {
+        return { error: String(error.message).slice(0, 200) };
+      }
+      if (!raw) return { error: `pesan #${source.entry_id} tidak membawa media (atau medianya sudah kedaluwarsa)` };
+      const name = `in_${source.entry_id}_${index}.${raw.ext}`;
+      fs.writeFileSync(require("node:path").join(workdir, name), raw.buffer);
+      inputs.push(name);
+    }
+    const result = await editMedia({ workdir, inputs, steps, output, frames, targetMb });
+    return result;
+  };
+}
+
+async function sendQueuedStickers(sock, chatId, queue, options = {}) {
+  const sent = [];
+  for (const item of queue || []) {
+    try {
+      await sendCollectionSticker(sock, chatId, item, options);
+      sent.push(item.id);
+    } catch (error) {
+      console.warn("[STIKER] Gagal mengirim stiker koleksi:", error.message);
+    }
+  }
+  return sent;
+}
 
 const DEFAULT_HISTORY_LIMIT = 24;
 const histories = new Map();
@@ -35,6 +360,7 @@ function config() {
     compactTrigger,
     compactRetain,
     historyMediaLimit: Math.max(1, Math.min(historyLimit, envNumber("AI_HISTORY_MEDIA_LIMIT", 4))),
+    historyAudioLimit: Math.max(0, envNumber("AI_HISTORY_AUDIO_LIMIT", 3)),
     replyConfidence: envNumber("AI_REPLY_CONFIDENCE", 0.55),
     reactConfidence: envNumber("AI_REACT_CONFIDENCE", 0.70),
     directReactConfidence: envNumber("AI_DIRECT_REACT_CONFIDENCE", 0.30),
@@ -66,12 +392,21 @@ function isConfigured() {
   return Boolean(key && !key.includes("GANTI_") && !key.includes("YOUR_"));
 }
 
+// "Gradd", "Graaad", "GRAD!!", "grad2" = panggilan yang sama: huruf berulang
+// diringkas dan angka di ujung dibuang. Kata lain yang mirip ("Grab", "gratis",
+// "gradasi") tetap tidak cocok karena yang dibandingkan adalah kata utuh.
+function collapseName(word) {
+  return String(word || "").toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "")
+    .replace(/\d+$/, "").replace(/(\p{L})\1+/gu, "$1");
+}
+
 function textMentionsBotName(text, botName = config().botName) {
   const name = String(botName || "").trim();
   if (!name || name.includes("GANTI_")) return false;
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_])@?${escaped}(?=$|[^\\p{L}\\p{N}_])`, "iu");
-  return pattern.test(String(text || ""));
+  const aliases = [name, ...String(process.env.BOT_NAME_ALIASES || "").split(",")]
+    .map((alias) => collapseName(alias.trim())).filter(Boolean);
+  const words = String(text || "").split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
+  return words.some((word) => aliases.includes(collapseName(word)));
 }
 
 function httpClient() {
@@ -96,6 +431,13 @@ function trimHistory(groupId) {
     retainedMedia++;
     if (retainedMedia > cfg.historyMediaLimit) history[index].media = null;
   }
+  // Audio mentah hanya disimpan di memori untuk listen_audio, beberapa terbaru saja.
+  let retainedAudio = 0;
+  for (let index = history.length - 1; index >= 0; index--) {
+    if (!history[index].audio) continue;
+    retainedAudio++;
+    if (retainedAudio > cfg.historyAudioLimit) history[index].audio = null;
+  }
   histories.set(groupId, history);
   return history;
 }
@@ -117,8 +459,10 @@ function remember(groupId, entry) {
     media: mediaContentPart(entry.media)
       ? { type: entry.media.type, kind: entry.media.kind, format: entry.media.format, dataUrl: entry.media.dataUrl, frameDataUrl: entry.media.frameDataUrl }
       : null,
+    audio: Buffer.isBuffer(entry.audio?.mp3) ? { mp3: entry.audio.mp3, seconds: entry.audio.seconds || null } : null,
     message_key: entry.messageKey || null,
     message_ref: entry.messageRef || null,
+    at: Number.isFinite(entry.at) ? entry.at : Date.now(),
   };
   history.push(saved);
   histories.set(groupId, history);
@@ -139,6 +483,7 @@ function dropHistoryEntries(groupId, entryIds) {
 }
 
 function resetHistories() {
+  recentMediaHashes.clear();
   const affectedGroups = new Set([
     ...histories.keys(),
     ...pendingGroups.keys(),
@@ -157,6 +502,7 @@ function resetHistories() {
 
 function clearConversation(groupId) {
   histories.delete(groupId);
+  activeLoops.get(groupId)?.abort();
   const pending = pendingGroups.get(groupId);
   if (pending) {
     clearTimeout(pending.timer);
@@ -471,18 +817,36 @@ async function decideAction({
           not_gratitude: "Pesan bukan ucapan terima kasih atau apresiasi.",
         },
       },
+      // M5: peluang bot ikut masuk walau TIDAK dipanggil.
+      opportunity: {
+        type: "choice",
+        optional: true,
+        instructions: [
+          "Nilai apakah bot pantas ikut masuk ke percakapan pada pesan terakhir walaupun tidak di-mention atau dibalas.",
+          "Bot adalah anggota grup yang membantu dan kadang ikut bercanda, tapi tidak boleh terasa menyela atau spam.",
+          "Jangan pilih help atau social untuk topik sensitif (duka, konflik, kesehatan serius, keluhan pribadi yang berat) atau percakapan pribadi dua orang.",
+        ].join(" "),
+        criteria: {
+          none: "Tidak ada alasan kuat bot ikut: obrolan antarmanusia yang lancar, pertanyaan untuk orang tertentu, sudah terjawab, sensitif, atau bot tidak punya kontribusi berarti.",
+          help: "Ada bantuan nyata yang bisa bot berikan sekarang: pertanyaan fakta/jadwal/cara/harga yang belum terjawab dan terbuka untuk siapa saja, orang bingung atau salah info yang jelas, minta stiker, atau link yang bisa diringkas.",
+          social: "Momen santai yang hidup (candaan, cerita lucu, kabar gembira, keluhan ringan seperti bosan/capek/lapar) di mana member biasa wajar menimpali singkat atau dengan stiker tanpa terasa mengganggu.",
+        },
+      },
     },
     user: latestMessage.sender_id,
   });
 
   const answer = response.answers?.action;
   const gratitudeAnswer = response.answers?.gratitude_target;
+  const opportunityAnswer = response.answers?.opportunity;
   return {
     action: answer?.choice || "ignore",
     confidence: choiceConfidence(answer),
     probabilities: answer?.probabilities || {},
     gratitudeTarget: gratitudeAnswer?.choice || "not_gratitude",
     gratitudeConfidence: choiceConfidence(gratitudeAnswer),
+    opportunity: opportunityAnswer?.choice || "none",
+    opportunityConfidence: choiceConfidence(opportunityAnswer),
   };
 }
 
@@ -498,6 +862,30 @@ function mediaContentPart(media) {
   return null;
 }
 
+// Arahan saat bot masuk sendiri tanpa dipanggil (M5).
+const PROACTIVE_HINTS = {
+  help: "PENTING: kamu TIDAK dipanggil. Kamu masuk sendiri karena ada bantuan nyata yang bisa kamu berikan. Bantu sesingkat mungkin dan langsung ke inti, seperti member yang kebetulan tahu. Kalau ternyata sudah terjawab, tidak jelas, atau kamu tidak yakin, balas KOSONG (tanpa teks sama sekali).",
+  social: "PENTING: kamu TIDAK dipanggil; ini momen santai. Ikut nimbrung seperti member biasa: lebih baik satu stiker yang maknanya pas (send_sticker placement 'only'), atau satu kalimat pendek santai. Jangan menjelaskan, jangan bertanya balik panjang, jangan menawarkan bantuan, jangan menyebut dirimu bot. Kalau tidak ada yang pas, balas KOSONG.",
+};
+
+// Jam WIT per pesan supaya GLM tahu "tadi", "barusan", atau "kemarin" dengan benar.
+function historyStamp(at, now = Date.now()) {
+  if (!Number.isFinite(at)) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  const dayKey = (parts) => `${parts.year}-${parts.month}-${parts.day}`;
+  const p = witParts(at);
+  const clock = `${pad(p.hour)}:${pad(p.minute)}`;
+  if (dayKey(p) === dayKey(witParts(now))) return `[${clock}] `;
+  if (dayKey(p) === dayKey(witParts(now - 86_400_000))) return `[kemarin ${clock}] `;
+  return `[${pad(p.day)}/${pad(p.month)} ${clock}] `;
+}
+
+function historyLine(item) {
+  const media = item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : "";
+  const audio = item.audio ? " [audio tersimpan]" : "";
+  return `#${item.entry_id} ${historyStamp(item.at)}${formatIdentity(item)}: ${item.text}${media}${audio}`;
+}
+
 function buildChatMessages({
   groupId,
   latestMessage,
@@ -505,19 +893,27 @@ function buildChatMessages({
   media,
   historySnapshot = getHistory(groupId),
   memorySnapshot = getGroupMemory(groupId),
+  toolsDisabled = false,
+  stickerIndex = "",
+  features = null,
+  rememberedFacts = [],
+  proactiveMode = null,
 }) {
   const cfg = config();
-  const conversation = historySnapshot
-    .map((item) => `#${item.entry_id} ${formatIdentity(item)}: ${item.text}${item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : ""}`)
-    .join("\n");
+  const conversation = historySnapshot.map(historyLine).join("\n");
+  const hasAudio = historySnapshot.some((item) => item.audio);
+  const hasStickers = Boolean(stickerIndex) && !toolsDisabled;
+  const canSaveStickers = !toolsDisabled && (!features || features.has("stiker")) && historyHasStickers(historySnapshot);
 
-  const mediaPart = mediaContentPart(media);
+  // Fitur "media" mati → tidak ada gambar/frame yang dikirim ke GLM.
+  const mediaEnabled = !features || features.has("media");
+  const mediaPart = mediaEnabled ? mediaContentPart(media) : null;
   const latestHistoryEntry = historySnapshot.at(-1);
   const latestEntryIsCurrent = latestHistoryEntry
     && latestHistoryEntry.sender_id === latestMessage.sender_id
     && latestHistoryEntry.text === latestMessage.text;
   const historicalMedia = historySnapshot
-    .filter((item) => item.media && (!latestEntryIsCurrent || item.entry_id !== latestHistoryEntry.entry_id))
+    .filter((item) => mediaEnabled && item.media && (!latestEntryIsCurrent || item.entry_id !== latestHistoryEntry.entry_id))
     .map((item) => ({
       label: `Media lama dari ${formatIdentity(item)}: ${item.text || (item.has_video ? "[mengirim video]" : "[mengirim gambar]")}`,
       part: mediaContentPart(item.media),
@@ -526,8 +922,8 @@ function buildChatMessages({
 
   const userText = [
     "Konteks percakapan grup:",
-    `Memori terperinci sebelumnya:\n${memorySnapshot.glm}`,
-    conversation || "(belum ada konteks)",
+    `Memori terperinci sebelumnya (ringkasan obrolan lebih lama, waktunya tidak pasti):\n${memorySnapshot.glm}`,
+    conversation ? `Riwayat aktif (jam WIT di depan tiap pesan):\n${conversation}` : "(belum ada konteks)",
     quotedText ? `Pesan yang dibalas: ${quotedText}` : "",
     `Pesan terbaru dari ${latestMessage.sender}: ${latestMessage.text}`,
     mediaPart
@@ -538,8 +934,9 @@ function buildChatMessages({
         ? "Video terlampir adalah pesan terbaru; namun analisis visual video belum didukung pada fase ini. Jangan mengklaim telah melihat atau menonton videonya."
         : ""),
     mediaPart ? `Klasifikasi media terbaru: ${media.kind || "attachment"}/${media.format || media.type}.` : "",
-    "Pilih reply_to_entry_id dari nomor # pesan aktif jika balasan perlu mengutip pesan tertentu. Pilih null untuk mengirim chat biasa tanpa kutipan.",
-    "Jangan otomatis mengutip pesan terbaru; kutip hanya jika membantu memperjelas target balasan.",
+    hasStickers ? `Koleksi stiker yang boleh kamu pakai di chat ini (id — makna [mood] · kapan · frekuensi):\n${stickerIndex}` : "",
+    rememberedFacts.length ? `Hal yang kamu ingat di chat ini (pakai bila relevan):\n${rememberedFacts.join("\n")}` : "",
+    PROACTIVE_HINTS[proactiveMode] || "",
   ].filter(Boolean).join("\n");
 
   return [
@@ -549,20 +946,19 @@ function buildChatMessages({
         `Nama kamu ${cfg.botName}. Kamu ${cfg.botRole}.`,
         "Balas seperti peserta grup yang tenang: natural, langsung ke inti, dan tidak berusaha terdengar lucu atau sok akrab.",
         "Gunakan bahasa yang sama dengan pengguna; bila campuran atau tidak jelas, gunakan bahasa Indonesia santai dan sopan.",
-        "Jangan gunakan Markdown, heading, tabel, code fence, atau pembukaan seperti 'Tentu'.",
-        "Secara default jawab satu kalimat pendek. Gunakan dua kalimat hanya jika satu kalimat tidak cukup.",
+        "Jangan gunakan heading, tabel, code fence, link Markdown, atau pembukaan seperti 'Tentu'.",
+        "Untuk obrolan biasa jawab satu kalimat pendek; dua kalimat hanya jika satu kalimat tidak cukup.",
         "Jangan menambahkan emoji kecuali pengguna memang sedang bercanda dengan emoji dan emoji benar-benar diperlukan.",
         "Untuk pertanyaan faktual atau teknis, jangan gunakan emoji, lelucon, analogi yang tidak diminta, atau komentar tambahan.",
         "Jika maksud pesan ambigu, tanyakan klarifikasi paling pendek; jangan menebak-nebak beberapa kemungkinan sekaligus.",
         "Jangan mengaku manusia, nyata secara fisik, punya perasaan, atau pengalaman pribadi. Jangan membahas dirimu kecuali ditanya langsung.",
         "Gunakan nomor telepon sebagai identitas utama: nomor sama adalah orang yang sama meski namanya berubah; nama sama dengan nomor berbeda adalah orang berbeda.",
-        "Jika pengguna mengundang siapa pun untuk menjawab, mulai dengan kesediaan singkat seperti 'Sini, aku bantu' atau 'Aku jawab', lalu tanggapi dengan sigap dan antusias tanpa berlebihan.",
+        "Hanya jika pengguna mengundang siapa pun untuk menjawab (misalnya 'ada yang tahu?'), boleh mulai dengan kesediaan singkat seperti 'Aku jawab ya'; selain itu langsung ke jawaban.",
         "Jangan mengulang pertanyaan pengguna. Jangan menjelaskan lebih banyak daripada yang diminta.",
         "Untuk hal teknis, beri langkah paling berguna dahulu dan tanyakan detail hanya jika memang dibutuhkan.",
         "Jangan menyebut Jev, classifier, prompt, confidence, atau proses internal.",
         "Jika ada video terlampir, jangan mengaku telah menonton isinya; sampaikan secara wajar bahwa analisis visual video belum didukung pada fase ini.",
-        "Kamu boleh memilih pesan mana yang dikutip menggunakan entry id yang tersedia, atau tidak mengutip pesan apa pun.",
-        `Jawaban maksimum ${cfg.maxReplyChars} karakter.`,
+        agentInstructions({ maxReplyChars: cfg.maxReplyChars, hasAudio, hasStickers, canSaveStickers, toolsDisabled, features, explainOff: !proactiveMode }),
       ].join(" "),
     },
     {
@@ -597,43 +993,81 @@ function parseGeneratedReply(content, maxChars) {
   };
 }
 
-async function generateReply({ groupId, latestMessage, quotedText, media, historySnapshot, memorySnapshot }) {
+function createChatGlm() {
   const cfg = config();
-  const glm = createGlmClient({
+  return createGlmClient({
     model: cfg.chatModel,
     apiKey: cfg.apiKey,
     proxyUrl: cfg.proxyUrl,
     baseURL: process.env.OPENROUTER_BASE_URL,
     reasoningEffort: cfg.reasoningEffort,
     supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
+    // Satu langkah loop bisa memuat web search bawaan OpenRouter (±10 detik).
+    timeoutMs: 90_000,
   });
+}
 
-  const response = await glm.chatCompletion({
+/**
+ * Engage = agent loop (Plan v2 §3). Obrolan biasa berakhir di langkah pertama
+ * tanpa tool; tugas memanggil tools berulang sampai selesai.
+ * sendProgress dipakai untuk pesan "bentar ya" ke chat asal.
+ */
+// groupId = kunci riwayat/memori; chatId = JID tujuan kirim (beda untuk DM: "dm:<no>" vs "<no>@s.whatsapp.net").
+async function generateReply({ groupId, chatId = groupId, isDm = false, latestMessage, quotedText, media, historySnapshot, memorySnapshot, handle = null, sendProgress = null, proactiveMode = null, background = false, loopOverrides = null, requestRef = null, sock = null }) {
+  const cfg = config();
+  const toolsDisabled = usageTracker.dailyBudgetLeft() <= 0;
+  const snapshot = historySnapshot || getHistory(groupId);
+  const enabledFeatures = featureSettings.enabledSet(chatId);
+  // Nimbrung sosial hanya boleh berupa teks singkat atau stiker: tanpa web, jadwal, atau memori.
+  const features = proactiveMode === "social" ? new Set([...enabledFeatures].filter((name) => name === "stiker")) : new Set(enabledFeatures);
+  // Sandbox belum disiapkan (npm run python:setup) = python tidak bisa dipakai; skill-nya ikut tersembunyi.
+  if (!pythonRunner.isReady()) features.delete("python");
+  const stickers = toolsDisabled || !features.has("stiker") ? null : await stickerContext(chatId);
+  const notes = features.has("memori") ? notebook.forChat({
+    chatId,
+    sender: { phone: latestMessage.sender_id, name: latestMessage.sender },
+    resolvePerson: personResolver(groupId),
+    groupMemory: () => (isDm ? memoryStore.getDmMemory(memoryStore.normalizePhone(chatId)).glm : getGroupMemory(groupId).glm),
+  }) : null;
+  const result = await runAgentLoop({
+    config: loopOverrides ? { ...loopConfig(), ...loopOverrides } : loopConfig(),
+    messages: buildChatMessages({ groupId, latestMessage, quotedText, media, historySnapshot: snapshot, memorySnapshot, toolsDisabled, stickerIndex: stickers?.index || "", features, rememberedFacts: notes?.promptFacts() || [], proactiveMode }),
+    glm: createChatGlm(),
     model: cfg.chatModel,
-    messages: buildChatMessages({ groupId, latestMessage, quotedText, media, historySnapshot, memorySnapshot }),
-    responseFormat: {
-      type: "json_schema",
-      json_schema: {
-        name: "whatsapp_reply",
-        strict: true,
-        schema: {
-          type: "object",
-          properties: {
-            text: { type: "string" },
-            reply_to_entry_id: { type: ["integer", "null"] },
-          },
-          required: ["text", "reply_to_entry_id"],
-          additionalProperties: false,
-        },
-      },
+    handle,
+    sendProgress,
+    maxReplyChars: cfg.maxReplyChars,
+    toolContext: {
+      toolsDisabled,
+      botName: cfg.botName,
+      hasAudio: snapshot.some((item) => item.audio),
+      hasMedia: snapshot.some((item) => item.media || item.has_image || item.has_video || item.media_kind),
+      mediaPart: mediaContentPart,
+      loadMedia: mediaLoader,
+      stickers,
+      features,
+      hasStickerMessages: Boolean(stickers) && historyHasStickers(snapshot),
+      schedules: features.has("reminder") ? schedules.forChat({ chatId, isDm, createdBy: latestMessage.sender_id }) : null,
+      notebook: notes,
+      compactMemory: () => getGroupMemory(groupId).glm,
+      allowEmpty: Boolean(proactiveMode),
+      python: features.has("python") ? { run: ({ code }) => pythonRunner.runPython({ chatId, code }) } : null,
+      skills: features.has("skill") ? skillLibrary.forFeatures(features) : null,
+      outbox: { media: [] },
+      mediaEditor: features.has("edit_media") ? makeMediaEditor({ chatId, historyKey: groupId }) : null,
+      // Subagent latar tidak bisa memulai subagent lagi; nimbrung/jadwal juga tidak.
+      background: features.has("latar") && !background && !proactiveMode && latestMessage.sender_id !== "SCHEDULER" && sock
+        ? makeBackgroundControl({ chatId, historyKey: groupId, isDm, latestMessage, requestRef, sock })
+        : null,
+      dmRelay: !isDm && !proactiveMode && latestMessage.sender_id !== "SCHEDULER" ? requesterDmRelay(latestMessage.sender_id) : null,
+      saveSticker: stickers ? makeStickerSaver({ chatId, historyKey: groupId, isDm, requester: latestMessage.sender, requesterId: latestMessage.sender_id, stickers }) : null,
+      // Riwayat hidup: voice note yang datang saat loop berjalan tetap bisa didengar.
+      getHistory: () => getHistory(groupId),
     },
-    maxTokens: 180,
-    temperature: 0.35,
-    reasoningEffort: cfg.reasoningEffort,
-    supportsVideoDataUrl: process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true",
   });
-
-  return parseGeneratedReply(response.text, cfg.maxReplyChars);
+  usageTracker.recordTask({ steps: result.steps, tokens: result.usage.tokens, cost: result.usage.cost, searches: result.searches, fetches: result.toolCounts.web_fetch || 0 });
+  usageTracker.logTask(groupId, result);
+  return result;
 }
 
 function replyTargetForEntry(historySnapshot, entryId) {
@@ -670,12 +1104,18 @@ async function setTyping(sock, groupId, state) {
 
 async function evaluateGroupMessage(
   { sock, message, groupId, senderId, senderName, text, explicitMention, replyToBot, quotedText, media },
-  { scheduledEpoch, historySnapshot, memorySnapshot },
+  { scheduledEpoch, historySnapshot, memorySnapshot, entry = null },
 ) {
   const cfg = config();
   // Epoch diambil saat evaluasi dijadwalkan, bukan saat mulai. Karena itu
   // /clear dan /reset juga membatalkan pekerjaan yang masih mengantre.
   if ((contextEpochs.get(groupId) || 0) !== scheduledEpoch) return { action: "superseded" };
+  // Pesan ini sudah dibaca loop agen yang berjalan sebelumnya sebagai konteks
+  // tambahan; balasannya sudah tercakup di jawaban loop itu.
+  if (entry?.absorbed) {
+    await markRead(sock, message);
+    return { action: "absorbed" };
+  }
   const latestMessage = {
     sender: senderName,
     sender_id: senderId,
@@ -724,8 +1164,11 @@ async function evaluateGroupMessage(
   }
 
   if (decision.action === "react_heart" && decision.gratitudeTarget !== "bot") {
-    // Heart khusus apresiasi yang memang ditujukan ke bot.
-    return { action: "ignore", decision };
+    // Heart khusus apresiasi yang memang ditujukan ke bot. Tapi pesan yang
+    // memanggil bot langsung (mis. "@Grad aku lulus ujian!!") tidak boleh
+    // berakhir diam: tanggapi lewat agent loop (ucapan dan/atau stiker).
+    // Tanpa mention: jangan "mencuri" heart, tapi jalur proaktif (M5) masih boleh menimbang.
+    decision.action = directlyAddressed ? "reply" : "ignore";
   }
   if (
     decision.action === "react_ack" &&
@@ -738,13 +1181,52 @@ async function evaluateGroupMessage(
     decision.confidence = Math.max(decision.confidence, decision.gratitudeConfidence || 0);
   }
 
+  // Diminta diam ("grad diem dulu"): hanya pesan yang memanggil bot yang ditanggapi.
+  if (proactive.isMuted(groupId) && !directlyAddressed) {
+    if (decision.opportunity !== "none") require("./observability/activity").record("proactive", { chat: groupId, mode: "skip", opportunity: decision.opportunity, reason: "muted" });
+    return { action: "ignore", muted: true, decision };
+  }
+
   const shouldReply =
     (decision.action === "reply" &&
       (decision.confidence >= cfg.replyConfidence || directlyAddressed || inBotDialogue)) ||
     (decision.action === "ignore" && directlyAddressed);
 
-  if (shouldReply) {
+  const emoji = REACTIONS[decision.action];
+  const directReaction = (directlyAddressed || inBotDialogue) && decision.confidence >= cfg.directReactConfidence;
+  const reactionQualifies = Boolean(emoji && (decision.confidence >= cfg.reactConfidence || directReaction));
+
+  // M5: tidak dipanggil dan tidak ada reaction yang pas → pertimbangkan masuk
+  // sendiri bila Jev melihat peluang (bantuan nyata atau momen sosial).
+  let proactiveMode = null;
+  if (!shouldReply && !reactionQualifies && !directlyAddressed && !inBotDialogue) {
+    const pcfg = proactive.proactiveConfig();
+    const confident = decision.opportunityConfidence >= pcfg.confidence;
+    if (confident && decision.opportunity === "help" && proactive.checkHelp(groupId).ok) {
+      proactiveMode = "help";
+      proactive.markHelp(groupId);
+    } else if (confident && decision.opportunity === "social" && featureSettings.isEnabled(groupId, "sosial") && proactive.checkSocial(groupId).ok) {
+      proactiveMode = "social";
+      proactive.markSocial(groupId);
+    }
+    if (proactiveMode) require("./observability/activity").record("proactive", { chat: groupId, mode: proactiveMode, confidence: decision.opportunityConfidence });
+    // Alasan TIDAK masuk dicatat juga (tanpa isi pesan), supaya "kenapa Grad diam" bisa dilihat di dashboard.
+    else if (decision.opportunity !== "none") {
+      const check = decision.opportunity === "help" ? proactive.checkHelp(groupId) : proactive.checkSocial(groupId);
+      const reason = !confident ? "confidence_rendah"
+        : decision.opportunity === "social" && !featureSettings.isEnabled(groupId, "sosial") ? "fitur_sosial_mati"
+          : check.reason || "ditahan";
+      require("./observability/activity").record("proactive", { chat: groupId, mode: "skip", opportunity: decision.opportunity, reason, confidence: decision.opportunityConfidence });
+    }
+  }
+
+  if (shouldReply || proactiveMode) {
     await setTyping(sock, groupId, "composing");
+    const handle = activeLoops.begin(groupId);
+    handle.requesterId = senderId;
+    // Presence "mengetik" WhatsApp kedaluwarsa sendiri; segarkan selama loop jalan.
+    const typingTimer = setInterval(() => setTyping(sock, groupId, "composing"), 8_000);
+    typingTimer.unref?.();
     try {
       const generated = await generateReply({
         groupId,
@@ -753,32 +1235,72 @@ async function evaluateGroupMessage(
         media,
         historySnapshot,
         memorySnapshot,
+        handle,
+        proactiveMode,
+        sock,
+        requestRef: message?.key ? message : null,
+        sendProgress: proactiveMode ? null : async (progressText) => {
+          const progressSent = await sock.sendMessage(groupId, { text: progressText });
+          remember(groupId, { sender: cfg.botName, senderId: "BOT", text: progressText, isBot: true, messageKey: progressSent?.key, messageRef: progressSent });
+          await setTyping(sock, groupId, "composing");
+        },
       });
+      if (generated.status === "aborted") return { action: "stopped", decision };
       if ((contextEpochs.get(groupId) || 0) !== scheduledEpoch) return { action: "superseded", decision };
-      if (!generated.text) return { action: "ignore", decision };
+      if (!generated.text && !generated.stickers?.length && !generated.media?.length && !generated.dmRelay) return { action: proactiveMode ? "proactive_skip" : "ignore", proactive: proactiveMode, decision };
       const quoteKey = replyTargetForEntry(historySnapshot, generated.replyToEntryId);
-      const sendOptions = quoteKey ? { quoted: quoteKey } : undefined;
-      const sent = await sock.sendMessage(groupId, { text: generated.text }, sendOptions);
-      remember(groupId, {
-        sender: cfg.botName,
-        senderId: "BOT",
+      if (generated.text) {
+        const sendOptions = quoteKey ? { quoted: quoteKey } : undefined;
+        const sent = await sock.sendMessage(groupId, { text: generated.text }, sendOptions);
+        remember(groupId, {
+          sender: cfg.botName,
+          senderId: "BOT",
+          text: generated.text,
+          isBot: true,
+          messageKey: sent?.key,
+          messageRef: sent,
+        });
+      }
+      // Stiker dikirim setelah teks; stiker pengganti balasan boleh mengutip pesan target.
+      // Hasil yang diminta ke DM tidak ikut dikirim ke grup.
+      const mediaSent = await sendOutboxMedia(sock, groupId, generated.dmRelay?.moveResults ? [] : generated.media);
+      if (generated.dmRelay) await deliverToRequesterDm(sock, generated.dmRelay, generated.dmRelay.moveResults ? generated.media : []);
+      const stickersSent = await sendQueuedStickers(sock, groupId, generated.stickers, { quoted: generated.text ? null : quoteKey });
+      return {
+        action: generated.text ? "reply" : mediaSent.length ? "media" : "sticker",
+        media: mediaSent,
+        proactive: proactiveMode,
         text: generated.text,
-        isBot: true,
-        messageKey: sent?.key,
-        messageRef: sent,
-      });
-      return { action: "reply", text: generated.text, replyToEntryId: generated.replyToEntryId, decision };
+        stickers: stickersSent,
+        replyToEntryId: generated.replyToEntryId,
+        toolCounts: generated.toolCounts,
+        decision,
+      };
     } catch (error) {
       console.error("[AI] GLM gagal:", error.response?.data?.error?.message || error.message);
       return { action: "error", decision };
     } finally {
+      clearInterval(typingTimer);
+      activeLoops.end(handle);
       await setTyping(sock, groupId, "paused");
     }
   }
 
-  const emoji = REACTIONS[decision.action];
-  const directReaction = (directlyAddressed || inBotDialogue) && decision.confidence >= cfg.directReactConfidence;
-  if (emoji && (decision.confidence >= cfg.reactConfidence || directReaction)) {
+  if (reactionQualifies) {
+    // Sesekali reaction diganti stiker koleksi dengan mood yang cocok, dipilih
+    // deterministik tanpa panggilan GLM (Plan v2 §4a).
+    const mood = REACTION_MOODS[decision.action];
+    if (mood && featureSettings.isEnabled(groupId, "stiker") && Math.random() < stickerConfig().reactionChance) {
+      try {
+        const sticker = await getStickerLibrary().pickForMood(mood, groupId);
+        if (sticker) {
+          await sendCollectionSticker(sock, groupId, sticker, { quoted: message?.key ? message : null });
+          return { action: "sticker", sticker: sticker.id, replacedReaction: emoji, decision };
+        }
+      } catch (error) {
+        console.warn("[STIKER] Stiker pengganti reaction gagal:", error.message);
+      }
+    }
     await sock.sendMessage(groupId, { react: { text: emoji, key: message.key } });
     return { action: "react", emoji, decision };
   }
@@ -788,10 +1310,11 @@ async function evaluateGroupMessage(
 
 function processGroupMessage(args) {
   if (!isConfigured()) return Promise.resolve({ action: "disabled" });
+  if (args.sock) latestSock = args.sock;
 
   const { groupId, senderId, senderName, text, explicitMention, replyToBot, media } = args;
   const scheduledEpoch = contextEpochs.get(groupId) || 0;
-  remember(groupId, {
+  const entry = remember(groupId, {
     sender: senderName,
     senderId,
     text,
@@ -800,9 +1323,40 @@ function processGroupMessage(args) {
     hasImage: media?.type === "image",
     hasVideo: media?.type === "video",
     media,
+    audio: args.audio,
     messageKey: args.message?.key,
     messageRef: args.message,
   });
+
+  // Rem M5: "grad diem dulu" / "jangan nimbrung" → jalur proaktif mati beberapa jam
+  // (panggilan langsung tetap dijawab). Loop yang sedang jalan ikut dihentikan.
+  if (proactive.isMuteRequest(text, { addressed: explicitMention || replyToBot })) {
+    const until = proactive.mute(groupId);
+    activeLoops.get(groupId)?.abort();
+    entry.absorbed = true;
+    require("./observability/activity").record("proactive", { chat: groupId, mode: "muted", until });
+    // Pesan yang direspons (reaction) juga harus berstatus dibaca.
+    return Promise.resolve(args.sock ? markRead(args.sock, args.message) : null)
+      .then(() => args.sock?.sendMessage?.(groupId, { react: { text: "🤐", key: args.message?.key } }))
+      .catch(() => {})
+      .then(() => ({ action: "muted", until }));
+  }
+
+  // Satu loop aktif per chat: "stop" dari peminta atau yang ditujukan ke bot
+  // menghentikannya; pesan lain menjadi konteks tambahan loop tersebut.
+  const active = activeLoops.get(groupId);
+  if (active) {
+    const addressed = explicitMention || replyToBot || senderId === active.requesterId;
+    if (addressed && activeLoops.isStopCommand(text, config().botName)) {
+      active.abort();
+      entry.absorbed = true;
+      return Promise.resolve(args.sock ? markRead(args.sock, args.message) : null)
+        .then(() => args.sock?.sendMessage?.(groupId, { react: { text: "👍", key: args.message?.key } }))
+        .catch(() => {})
+        .then(() => ({ action: "stopped" }));
+    }
+    active.inject(entry);
+  }
 
   // Pesan baru dalam jendela debounce yang sama menggantikan pesan lama.
   // Evaluasi yang sedang berjalan TIDAK dibatalkan; pesan baru mengantri
@@ -826,7 +1380,7 @@ function processGroupMessage(args) {
         // biarkan pesan terbaru yang mewakili (konteksnya sudah lengkap).
         if (pendingGroups.has(groupId)) return { action: "superseded" };
         if ((contextEpochs.get(groupId) || 0) !== scheduledEpoch) return { action: "superseded" };
-        return evaluateGroupMessage(args, { scheduledEpoch, historySnapshot, memorySnapshot });
+        return evaluateGroupMessage(args, { scheduledEpoch, historySnapshot, memorySnapshot, entry });
       });
       const finish = (result) => {
         if (evaluationChains.get(groupId) === run) evaluationChains.delete(groupId);
@@ -845,6 +1399,20 @@ function processGroupMessage(args) {
 
 module.exports = {
   buildChatMessages,
+  historyStamp,
+  makeBackgroundControl,
+  makeMediaEditor,
+  setRawMediaLoader,
+  sendOutboxMedia,
+  runScheduledTask,
+  historyHasStickers,
+  makeStickerSaver,
+  setStickerDownloader,
+  sendCollectionSticker,
+  sendQueuedStickers,
+  setMediaLoader,
+  getMediaLoader,
+  stickerContext,
   clearConversation,
   choiceConfidence,
   cleanReply,

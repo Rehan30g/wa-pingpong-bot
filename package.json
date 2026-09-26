@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js test/foundation.test.js test/runtime-storage.test.js test/runtime-recovery.test.js test/runtime-lifecycle.test.js test/autonomous-task-loop.test.js test/media-web.test.js test/web-search.test.js test/headless-agent.test.js",
+    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js test/foundation.test.js test/runtime-storage.test.js test/runtime-recovery.test.js test/runtime-lifecycle.test.js test/autonomous-task-loop.test.js test/media-web.test.js test/web-search.test.js test/headless-agent.test.js test/stickers.test.js test/agent-loop.test.js test/sticker-collection.test.js test/features.test.js test/dashboard.test.js test/schedules.test.js test/notebook.test.js test/proactive.test.js test/python-sandbox.test.js test/media-edit.test.js test/dm-relay.test.js test/background.test.js test/skills.test.js",
     "simulate:ai": "node scripts/simulate-ai.js",
     "simulate:burst": "node scripts/simulate-burst.js",
     "simulate:memory": "node scripts/simulate-memory.js",
@@ -13,7 +13,13 @@
     "simulate:replan": "node scripts/simulate-replan.js",
     "simulate:web-search": "node scripts/simulate-web-search.js",
     "evaluate:release": "node scripts/evaluate-release.js",
-    "agent:headless": "node scripts/headless-agent.js"
+    "agent:headless": "node scripts/headless-agent.js",
+    "probe:tools": "node scripts/probe-openrouter-tools.js",
+    "probe:audio": "node scripts/probe-audio.js",
+    "simulate:skills": "node scripts/simulate-skills.js",
+    "simulate:agent": "node scripts/simulate-agent-loop.js",
+    "dashboard:link": "node scripts/dashboard-link.js",
+    "python:setup": "node scripts/python-setup.js"
   },
   "dependencies": {
     "@libsql/client": "0.18.0",
@@ -23,6 +29,7 @@
     "dotenv": "^18.0.1",
     "https-proxy-agent": "^9.1.0",
     "pino": "^9.4.0",
+    "pyodide": "314.0.7",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "sharp": "^0.35.4"

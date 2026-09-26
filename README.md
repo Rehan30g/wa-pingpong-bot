@@ -1,62 +1,84 @@
-# WA Group Agent
+# Grad — agen WhatsApp grup
 
-Bot WhatsApp grup berbasis Baileys. Jev 1.13 membaca konteks percakapan dan memilih untuk diam, memberi reaction, atau menjawab. GLM 5.3 Flash hanya dipanggil ketika jawaban teks diperlukan.
-
-## Menjalankan
-
-1. Gunakan Node.js 20.
-2. Jalankan `npm install`.
-3. Salin `.env.example` menjadi `.env` dan ganti placeholder API key, nama, serta peran bot.
-4. Jalankan `npm start`, lalu scan QR WhatsApp dari terminal.
-5. Kirim `/verify`, masukkan kode di terminal, lalu kirim `/allow` di grup tujuan.
-
-Bot menyimpan maksimal 10 pesan terbaru per grup di memori proses. Pesan cepat dikumpulkan selama 1,2 detik agar Jev membaca rangkaian percakapan, bukan chat satuan. Mention/reply eksplisit diprioritaskan; percakapan antarmanusia secara default dibiarkan tanpa interupsi.
-
-Pesan dalam jendela debounce yang sama digabung; pesan yang datang saat Jev sedang mengevaluasi/membalas mengantri dan diproses setelahnya, dan evaluasi antrean yang basi (ada pesan lebih baru) dilewati. Read receipt (centang biru) dikirim setelah Jev menghasilkan keputusan untuk pesan itu, termasuk saat keputusannya ignore/ditolak; pesan yang belum pernah dievaluasi tetap belum terbaca, tetapi tetap mendapat centang abu-abu (delivered) saat diterima bot. Lanjutan percakapan langsung dengan bot dijawab meski confidence Jev rendah, dan konfirmasi singkat ("iyap", "sip") dalam dialog bot diberi reaction ack. Status bot dijaga tetap online lewat `markOnlineOnConnect` dan heartbeat presence berkala. Saat menjawab, bot menampilkan status mengetik selama GLM menyusun balasan. Reasoning GLM dikunci ke `low` melalui `GLM_REASONING_EFFORT`.
-
-Saat menulis jawaban, GLM juga memilih `reply_to_entry_id`: ia dapat mengutip pesan aktif mana pun yang relevan, atau memilih `null` untuk mengirim bubble biasa tanpa quote. Pesan terbaru tidak otomatis dikutip.
-
-Setelah percakapan aktif mencapai ambang compact, GLM diam-diam memperbarui dua memori persisten: konteks terperinci untuk GLM dan konteks keputusan ringkas untuk Jev. `/clear`, `/reset`, dan `/memory` dapat digunakan owner, admin grup WhatsApp, atau anggota yang diberi akses veto oleh owner. Owner memberi akses dengan reply `/veto` atau `/veto 628xxx`, mencabutnya dengan `/unveto`, dan melihatnya lewat `/veto list`. Clear/reset juga membatalkan evaluasi AI lama yang masih berjalan atau mengantre.
-
-## Alur AI
+Bot WhatsApp (Baileys) bernama **Grad** yang ikut ngobrol di grup dan DM seperti anggota biasa, tapi bisa bekerja: mencari di web, mendengar voice note, mengingat, membuat jadwal, mengolah media, menjalankan Python, dan mengoleksi stiker sendiri. Tidak ada perintah yang perlu dihafal — cukup mention, sebut namanya, atau reply.
 
 ```text
-Pesan grup -> Jev -> diam / reaction / reply -> GLM 5.3 Flash (hanya untuk reply)
+Pesan WA ─► Jev (typesafe/jev-1.13): diam · reaction · balas · masuk sendiri (bantu/nimbrung)
+               └─► Agent loop GLM (z-ai/glm-5.3-flash) + tools ─► kirim ke chat asal
+Voice note ─► Gemini Flash Lite (telinga) ─► transkrip ─► Jev/GLM
 ```
 
-Jika Jev gagal, bot hanya mencoba menjawab bila pesan me-mention bot atau merupakan reply ke pesan bot. Jika GLM gagal, bot tidak mengirim jawaban palsu.
+## Yang bisa dilakukan
 
-Gambar, GIF, dan stiker (langsung atau dikutip/reply) dikirim sebagai `image_url`. Video dikonversi menjadi satu frame JPEG dengan ffmpeg; jika ffmpeg tidak tersedia atau konversi gagal, bot hanya memakai metadata dan tidak mengklaim telah menonton video. Video base64 tidak dikirim ke OpenRouter. Media aktif terbaru dibatasi `AI_HISTORY_MEDIA_LIMIT` (default 4). Jev menerima klasifikasi media; ukuran unduhan dibatasi `AI_MAX_MEDIA_MB` (default 20 MB).
+| Kemampuan | Contoh | Fitur (`/fitur`) |
+|---|---|---|
+| Cari info terbaru & rangkum link | "@Grad harga iPhone 17 sekarang? bandingin sama 16" | `web` |
+| Dengar voice note | kirim VN "grad besok rapat jam berapa?" | `audio` |
+| Lihat gambar/video | reply foto "@Grad ini error apa?" | `media` |
+| Koleksi stiker sendiri | "@Grad simpan stiker ini", "kirim stiker dong", sesekali membalas pakai stiker | `stiker` |
+| Pengingat & jadwal (sekali/berulang, WIT) | "ingetin grup besok jam 8 rapat", "tiap Senin jam 7 cariin jadwal bola" | `reminder` |
+| Ingat fakta & catatan | "inget ya aku alergi udang", "catat keputusan rapat tadi" | `memori` |
+| Edit video/GIF/audio (FFmpeg) | "jadiin stiker video ini, 3 detik pertama, tulis GAS", "ambil audionya jadi mp3" | `edit_media` |
+| Python: hitung, grafik, QR, API | "bikin grafik kurs USD/IDR 7 hari terakhir", "bikinin QR buat link ini" | `python` |
+| Tugas latar panjang (subagent) | "riset mendalam bandingin 3 laptop gaming + grafik harga" | `latar` |
+| Ikut nimbrung / bantu tanpa dipanggil | Grad kadang menimpali candaan (sering pakai stiker) atau menjawab pertanyaan terbuka | `sosial` |
+| Skill siap pakai | "250 dolar berapa rupiah?", "cuaca jayapura besok", "maghrib jam berapa", "patungan dong: …", "qr wifi RumahKita pw …", "bikin notulen rapat tadi" | `skill` |
+| Hasil ke DM peminta | "kirim ke DM aku aja" | — |
 
-Runtime agen memiliki `web_search`, `web_fetch`, `fetch_media_from_url`, `fetch_media_from_message`, `make_sticker`, dan `send_asset` yang nonaktif secara default. Owner mengaktifkan flag masing-masing di `.env`; dua capability URL juga memerlukan allowlist hostname HTTPS. `/task cari web <query>` mencari informasi publik lewat OpenRouter dengan sitasi sumber; query yang tampak mengandung rahasia/data pribadi ditolak. Perintah `/task media` membaca gambar pada pesan sumber atau kutipannya; `/task stiker` membuat asset WebP 512×512; `/task kirim stiker` mengantrekan pengiriman ke chat asal melalui outbox. Task pengiriman tetap `verifying` sampai receipt transport diterima, dan menjadi `delivery_uncertain` bila proses terputus setelah send. Asset dibatasi scope chat/task dan TTL; shadow memakai root terpisah.
+Hentikan tugas yang sedang jalan: "stop"/"batal". Minta Grad berhenti nimbrung: "grad diem dulu".
 
-Gate lokal otomatis Fase 4 lulus; kuota egress tersimpan di SQLite, gambar diverifikasi dengan decode terpisah, dan mock transport telah menguji receipt serta pemulihan crash. Ini belum mencakup uji WhatsApp langsung oleh pengguna atau izin rollout. Lihat [`PHASE4_MEDIA_WEB_REPORT.md`](./docs/overhaul/PHASE4_MEDIA_WEB_REPORT.md) untuk batas bukti dan hasil tes.
+## Menjalankan (laptop atau VPS)
 
-Rencana capability file/media/storage/Python tersedia di [`Plan.md`](./Plan.md). Scaffolding nonaktif-by-default berada di `ai/capabilities/`.
+1. Node.js 20+ (dev memakai 26), `ffmpeg` + `ffprobe` di PATH.
+2. `npm install`
+3. Salin `.env.example` ke `.env`, isi `OPENROUTER_API_KEY`, `BOT_NAME`, `BOT_ROLE`. Kosongkan `OPENROUTER_PROXY_URL` bila mesin bisa akses OpenRouter langsung (VPS di AGENTS.md butuh proxy).
+4. Opsional, untuk Python: `npm run python:setup` (unduh paket Pyodide ±22 MB sekali).
+5. `npm start`, scan QR, kirim `/verify` dari WhatsApp, masukkan kode di terminal, lalu `/allow` di grup.
+6. Dashboard owner: buka link `http://127.0.0.1:7777/?t=…` yang dicetak di terminal (atau `npm run dashboard:link`). Di VPS lewat SSH tunnel: `ssh -N -L 7777:127.0.0.1:7777 <user>@<vps>`.
 
-## Chat Pribadi, Memori, dan Agen
+## Perintah
 
-Grad menyimpan memori terpisah per grup, per orang, dan antar hubungan di `ai-memory.json` (versi 2). Saat compact grup, GLM juga mengekstrak profil orang dan ringkasan hubungan sehingga Grad terasa satu AI yang mengenal siapa-siapa.
+| Siapa | Perintah |
+|---|---|
+| Semua | `/menu`, `/react <emoji>`, `/qr <teks>`, `/s` (reply gambar → stiker), `/fitur` (status fitur grup), game `/start` `pong` `/score` `/stop` |
+| Owner, admin grup, pemegang veto | `/memory`, `/clear`, `/reset` |
+| Admin grup (via DM ke Grad) | `/grup`, `/fitur <no>`, `/fitur <no> <fitur> on\|off` |
+| Owner | `/agent status\|on\|off\|clear`, `/agent social on\|off`, `/stiker` (+ `lihat\|buang <id>`, `kurasi`, `review`), `/fitur global [<fitur> kunci\|buka]`, `/allow`, `/deny`, `/veto` `/unveto` `/veto list`, `/owner`, `/verify`, `/reboot` |
 
-Di chat pribadi, mekaniknya berbeda: karena pesan jelas ditujukan ke bot, Grad membalas lebih sering (bukan menunggu disebut), namun tetap natural — jeda balas, presence mengetik, dan sesekali memecah balasan. Reminder sederhana seperti "ingetin aku 30 menit lagi" otomatis terjadwal.
+`/task <permintaan>` masih diterima sebagai alias mention.
 
-**Safety DM yang wajib dipertahankan:**
+## Keamanan (ditegakkan di kode)
 
-- Grad hanya boleh membalas atau memulai DM ke nomor yang pernah mengirim pesan di grup yang diizinkan. Orang asing yang DM dibiarkan tanpa balasan.
-- Permintaan menyebarkan/mem-forward pesan ke banyak orang ditolak dengan template tetap. Tidak ada API kirim ke target selain lawan chat.
+- Balasan hanya ke **chat asal**; satu pengecualian: **DM peminta sendiri** bila dia memintanya. Tidak ada tool untuk mengirim ke orang atau grup lain.
+- DM hanya untuk nomor yang pernah aktif di grup yang diizinkan (whitelist); opt-out dihormati; permintaan broadcast ditolak.
+- Fitur bisa dimatikan per grup (admin/owner) dan dikunci global (owner); tools fitur yang mati tidak pernah dikirim ke model.
+- `web_fetch`/HTTP Python menolak IP privat/lokal di setiap redirect (anti SSRF).
+- Python jalan di Pyodide + permission model Node: tanpa akses file bot, tanpa jaringan langsung, tanpa env rahasia. FFmpeg hanya lewat operasi yang dikurasi.
+- Batas per tugas (langkah, waktu, biaya) dan budget harian; "stop" menghentikan loop.
+- Secret tidak pernah dicetak atau ditampilkan di dashboard.
 
-`ai/scheduler.js` menjalankan job persisten (`reminder`, `follow_up`, `proactive_checkin`). DM proaktif melewati gerbang whitelist, `opt_out`, jam tenang WIT, cooldown per orang, dan kuota harian. Owner mengontrol lewat `/agent status`, `/agent on`, `/agent off`, dan `/agent clear`.
+## Struktur
 
-## Tes
+| Path | Isi |
+|---|---|
+| `index.js` | koneksi WhatsApp, identitas pengirim, command, pengiriman ke agen |
+| `ai/group-agent.js`, `ai/direct-agent.js` | alur grup & DM: Jev → agent loop → kirim |
+| `ai/agent/` | loop, tools, format WA, jadwal, proaktif, tugas latar, pemakaian/budget |
+| `ai/audio/` | transkripsi voice note (telinga) |
+| `ai/stickers/` | koleksi stiker: pengumpulan, kurasi, pemakaian, command |
+| `ai/memory/notebook.js`, `ai/memory-store.js` | fakta, catatan, memori compact |
+| `ai/sandbox/` | Python sandbox + HTTP aman |
+| `ai/skills/` | skill bawaan (`builtin/*.md`); skill tambahan owner di `data/skills/` |
+| `ai/media/media-edit.js` | editor FFmpeg |
+| `ai/features*.js`, `ai/runtime-settings.js` | fitur per grup, pengaturan runtime |
+| `ai/dashboard/` | dashboard owner lokal |
+| `Plan.md` | rencana & status milestone |
+| `AGENTS.md` | panduan teknis lengkap untuk agen/pengembang |
+
+## Tes & simulasi
 
 ```bash
 npm test
 ```
 
-## Demo agen tanpa WhatsApp
-
-Jalankan `npm run agent:headless` untuk mencoba `/task catat`, `/task baca`, dan `/task ringkas` di terminal. Ini memakai API GLM asli, SQLite sementara di direktori temp, dan mode shadow tanpa socket WhatsApp. Ketik `/exit` untuk menutup sesi; data demo dihapus. Untuk satu tugas: `npm run agent:headless -- --once "/task catat: Rapat Jumat jam 9 WIT"`. Siapkan `OPENROUTER_API_KEY` seperti simulasi lain; key tidak dicetak. Demo ini terpisah dari `RUNTIME_ENGINE_MODE` bot WhatsApp.
-
-# Status overhaul AI Agent
-
-Runtime produksi tetap `legacy`. Gate lokal Fase 0–5 sudah dilaporkan; Fase 6 `run_python` sengaja tidak disertakan karena sandbox container belum teruji. Fase 7 belum lulus shadow/canary WhatsApp. Semua laporan overhaul ada di [`docs/overhaul/`](./docs/overhaul/): [`STATUS_OVERHAUL.md`](./docs/overhaul/STATUS_OVERHAUL.md), [`PHASE5_MEMORY_PROACTIVE_REPORT.md`](./docs/overhaul/PHASE5_MEMORY_PROACTIVE_REPORT.md), [`PHASE6_SANDBOX_DECISION.md`](./docs/overhaul/PHASE6_SANDBOX_DECISION.md), dan [`PHASE7_RELEASE_GATE_REPORT.md`](./docs/overhaul/PHASE7_RELEASE_GATE_REPORT.md). Jalankan `npm run evaluate:release` untuk evaluasi 60 skenario lokal; hasilnya tidak mengaktifkan rilis.
+Tes tidak pernah memakai API key asli. Validasi dengan API nyata (tanpa WhatsApp): `npm run simulate:agent`, `npm run simulate:skills`, `npm run probe:tools`, `npm run probe:audio -- <file>`. Dokumen overhaul v1 (arsip) ada di [`docs/overhaul/`](./docs/overhaul/).
