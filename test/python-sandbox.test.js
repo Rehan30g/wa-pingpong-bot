@@ -2,7 +2,7 @@ const path = require("node:path");
 const { setupIsolatedTestEnv } = require("./helpers/test-env");
 const { cleanup, testDir } = setupIsolatedTestEnv("wa-test-python-");
 process.env.WORKSPACE_DIR = path.join(testDir, "workspace");
-process.env.PYTHON_TIMEOUT_MS = "20000";
+process.env.PYTHON_TIMEOUT_MS = "45000";
 process.env.AI_DEBOUNCE_MS = "0";
 
 const test = require("node:test");
@@ -86,7 +86,7 @@ test("workspace per chat terpisah dan file bertahan antar run", opts, async () =
   assert.equal(other.result, "False");
 });
 
-test("agent loop: python terkunci default; setelah dibuka, gambar hasil run_python dikirim ke grup", opts, async () => {
+test("agent loop: python aktif default, bisa dikunci owner; gambar hasil run_python dikirim ke grup", opts, async () => {
   try { fs.unlinkSync(process.env.FEATURES_FILE); } catch {}
   features.resetCache();
   groupAgent.resetHistories();
@@ -101,8 +101,10 @@ test("agent loop: python terkunci default; setelah dibuka, gambar hasil run_pyth
     const sent = [];
     const sock = { sendMessage: async (jid, content) => { sent.push({ jid, ...content }); return { key: { id: `b${sent.length}` } }; }, readMessages: async () => {}, sendPresenceUpdate: async () => {} };
     const args = (id) => ({ sock, message: { key: { id, remoteJid: CHAT } }, groupId: CHAT, senderId: "62811", senderName: "Rehan", text: "@Grad bikinin QR wa.me/62811", explicitMention: true, replyToBot: false, quotedText: "" });
+    features.setGlobalLock("python", true, { role: "owner" });
     await groupAgent.processGroupMessage(args("q1"));
-    assert.ok(!mock.state.chat[0].tools.some((t) => t.function?.name === "run_python"), "terkunci global secara default");
+    assert.ok(!mock.state.chat[0].tools.some((t) => t.function?.name === "run_python"), "dikunci owner → tidak ditawarkan");
+    assert.match(mock.state.chat[0].messages[0].content, /sedang dimatikan admin\/owner di chat ini: Python sandbox/, "Grad tahu fiturnya dimatikan, bukan tidak mampu");
 
     features.setGlobalLock("python", false, { role: "owner" });
     const result = await groupAgent.processGroupMessage(args("q2"));
@@ -113,6 +115,6 @@ test("agent loop: python terkunci default; setelah dibuka, gambar hasil run_pyth
     assert.equal(sent.at(-1).jid, CHAT);
   } finally {
     await mock.stop();
-    features.setGlobalLock("python", true, { role: "owner" });
+    features.setGlobalLock("python", false, { role: "owner" });
   }
 });

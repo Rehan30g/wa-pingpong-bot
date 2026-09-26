@@ -19,9 +19,10 @@ Voice note ─► Gemini Flash Lite (telinga) ─► transkrip ─► Jev/GLM
 | Pengingat & jadwal (sekali/berulang, WIT) | "ingetin grup besok jam 8 rapat", "tiap Senin jam 7 cariin jadwal bola" | `reminder` |
 | Ingat fakta & catatan | "inget ya aku alergi udang", "catat keputusan rapat tadi" | `memori` |
 | Edit video/GIF/audio (FFmpeg) | "jadiin stiker video ini, 3 detik pertama, tulis GAS", "ambil audionya jadi mp3" | `edit_media` |
-| Python: hitung, grafik, QR, API | "bikin grafik kurs USD/IDR 7 hari terakhir", "bikinin QR buat link ini" | `python` (terkunci default) |
+| Python: hitung, grafik, QR, API | "bikin grafik kurs USD/IDR 7 hari terakhir", "bikinin QR buat link ini" | `python` |
 | Tugas latar panjang (subagent) | "riset mendalam bandingin 3 laptop gaming + grafik harga" | `latar` |
 | Ikut nimbrung / bantu tanpa dipanggil | Grad kadang menimpali candaan (sering pakai stiker) atau menjawab pertanyaan terbuka | `sosial` |
+| Skill siap pakai | "250 dolar berapa rupiah?", "cuaca jayapura besok", "maghrib jam berapa", "patungan dong: …", "qr wifi RumahKita pw …", "bikin notulen rapat tadi" | `skill` |
 | Hasil ke DM peminta | "kirim ke DM aku aja" | — |
 
 Hentikan tugas yang sedang jalan: "stop"/"batal". Minta Grad berhenti nimbrung: "grad diem dulu".
@@ -67,6 +68,7 @@ Hentikan tugas yang sedang jalan: "stop"/"batal". Minta Grad berhenti nimbrung: 
 | `ai/stickers/` | koleksi stiker: pengumpulan, kurasi, pemakaian, command |
 | `ai/memory/notebook.js`, `ai/memory-store.js` | fakta, catatan, memori compact |
 | `ai/sandbox/` | Python sandbox + HTTP aman |
+| `ai/skills/` | skill bawaan (`builtin/*.md`); skill tambahan owner di `data/skills/` |
 | `ai/media/media-edit.js` | editor FFmpeg |
 | `ai/features*.js`, `ai/runtime-settings.js` | fitur per grup, pengaturan runtime |
 | `ai/dashboard/` | dashboard owner lokal |
@@ -79,4 +81,4 @@ Hentikan tugas yang sedang jalan: "stop"/"batal". Minta Grad berhenti nimbrung: 
 npm test
 ```
 
-Tes tidak pernah memakai API key asli. Validasi dengan API nyata (tanpa WhatsApp): `npm run simulate:agent`, `npm run probe:tools`, `npm run probe:audio -- <file>`. Dokumen overhaul v1 (arsip) ada di [`docs/overhaul/`](./docs/overhaul/).
+Tes tidak pernah memakai API key asli. Validasi dengan API nyata (tanpa WhatsApp): `npm run simulate:agent`, `npm run simulate:skills`, `npm run probe:tools`, `npm run probe:audio -- <file>`. Dokumen overhaul v1 (arsip) ada di [`docs/overhaul/`](./docs/overhaul/).

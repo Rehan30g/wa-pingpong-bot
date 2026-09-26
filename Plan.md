@@ -265,7 +265,7 @@ Setiap milestone baru dianggap **selesai** kalau:
 > **Status 26 Sep 2026: kode selesai + tes, tinggal demo WA (lokal).** Termasuk tambahan: tool `save_sticker` (simpan stiker atas permintaan lalu langsung pakai).
 
 - Setiap kemampuan Grad bisa dinyalakan/dimatikan per grup. Ditegakkan di kode: tools fitur yang mati tidak dikirim ke GLM, dan proses non-tool (transkripsi audio, pengumpulan stiker, stiker pengganti reaction) ikut berhenti.
-- Fitur dan default: `web` on, `audio` on, `stiker` on, `media` on, `reminder` on (M3), `sosial` off (M5), `workspace` off, `python` off, `skill` off (M4b).
+- Fitur dan default: `web` on, `audio` on, `stiker` on, `media` on, `reminder` on (M3), `sosial` off (M5), `workspace` off, `python` on, `skill` on (M4b; diperbarui 27 Sep 2026).
 - Dua level: **owner** mengunci/membuka fitur secara global; **admin WA grup** + owner mengatur per grup, hanya dalam batas yang dibuka owner. Status admin dicek langsung ke metadata grup setiap command.
 - Pengaturan lewat **DM** supaya tidak meramaikan grup: `/grup` (daftar grup yang dia admin-i), `/fitur <no>` (status), `/fitur <no> <fitur> on|off`. Owner juga bisa `/fitur global <fitur> kunci|buka`.
 - Perubahan **senyap** (tidak diumumkan). Di grup, siapa pun bisa kirim `/fitur` untuk melihat status (read-only). Semua perubahan dicatat (siapa, kapan, sebelum/sesudah).
@@ -295,7 +295,7 @@ Setiap milestone baru dianggap **selesai** kalau:
 
 ### M4b · Workspace, Python sandbox & skill
 
-> **Status 27 Sep 2026: Python sandbox selesai tanpa Docker (Pyodide + permission model Node), divalidasi API nyata: QR, cicilan anuitas, grafik kurs USD/IDR dari API frankfurter. Uji pembobolan (.env, run_js, spawn, fetch langsung, mount, SSRF, loop) semua tertahan.** Belum: tools `ws_*` terpisah dan skill.
+> **Status 27 Sep 2026: Python sandbox selesai tanpa Docker (Pyodide + permission model Node), divalidasi API nyata: QR, cicilan anuitas, grafik kurs USD/IDR dari API frankfurter. Uji pembobolan (.env, run_js, spawn, fetch langsung, mount, SSRF, loop) semua tertahan.** **Update malam 27 Sep: `python` kini aktif default (keluhan "Grad nggak punya tool QR"), dan 11 skill bawaan jalan (use_skill + indeks di prompt), divalidasi API nyata: QR teks/WiFi, kurs, cuaca, jadwal sholat, patungan, cicilan flat.** Belum: tools `ws_*` terpisah dan `write_skill` (skill buatan Grad + persetujuan owner).
 - `workspace/<chat>/files/` per grup/DM, tools `ws_list`/`ws_read`/`ws_write` (path dikunci ke folder chat). Catatan grup M4 menjadi file di sini.
 - `run_python(code)` di container Docker sekali pakai: hanya mount workspace chat itu, tanpa `.env`/`auth/`/folder project, batas CPU/RAM/waktu, internet keluar tanpa IP privat. Butuh Docker (Desktop/WSL2 di laptop). Fitur `python` terkunci global secara default.
 - Skill ala Hermes: `workspace/skills/<nama>/SKILL.md` (frontmatter name, description, scope, pembuat). Indeks (name + description) masuk prompt; `read_skill` memuat isi saat dibutuhkan; `write_skill` membuat/memperbarui setelah tugas berhasil. Skill baru lokal ke chat pembuatnya; menjadi global hanya lewat persetujuan owner (dashboard atau `/skill setujui`).

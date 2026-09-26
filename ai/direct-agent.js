@@ -169,7 +169,7 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
   const cfg = dmConfig();
   const { person, dm } = personContext(phone);
   const conversation = historySnapshot
-    .map((item) => `#${item.entry_id} ${item.sender} [${item.sender_id}]: ${item.text}${item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : ""}${item.audio ? " [audio tersimpan]" : ""}`)
+    .map((item) => `#${item.entry_id} ${groupAgent.historyStamp(item.at)}${item.sender} [${item.sender_id}]: ${item.text}${item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : ""}${item.audio ? " [audio tersimpan]" : ""}`)
     .join("\n");
   const hasAudio = historySnapshot.some((item) => item.audio);
   const hasStickers = Boolean(stickerIndex) && !toolsDisabled;
@@ -245,6 +245,7 @@ async function generateDirectReply({ handle = null, sendProgress = null, sock = 
   const key = dmKey(args.phone);
   const toolsDisabled = usageTracker.dailyBudgetLeft() <= 0;
   const features = featureSettings.enabledSet(phoneJid(args.phone));
+  if (!require("./sandbox/python-runner").isReady()) features.delete("python");
   const stickers = toolsDisabled || !features.has("stiker") ? null : await groupAgent.stickerContext(phoneJid(args.phone));
   const notes = features.has("memori") ? require("./memory/notebook").forChat({
     chatId: phoneJid(args.phone),
@@ -276,7 +277,8 @@ async function generateDirectReply({ handle = null, sendProgress = null, sock = 
       loadMedia: groupAgent.getMediaLoader(),
       stickers,
       features,
-      python: features.has("python") && require("./sandbox/python-runner").isReady() ? { run: ({ code }) => require("./sandbox/python-runner").runPython({ chatId: phoneJid(args.phone), code }) } : null,
+      python: features.has("python") ? { run: ({ code }) => require("./sandbox/python-runner").runPython({ chatId: phoneJid(args.phone), code }) } : null,
+      skills: features.has("skill") ? require("./skills").forFeatures(features) : null,
       outbox: { media: [] },
       background: features.has("latar") && sock ? groupAgent.makeBackgroundControl({ chatId: phoneJid(args.phone), historyKey: key, isDm: true, latestMessage: args.latestMessage, requestRef, sock }) : null,
       mediaEditor: features.has("edit_media") ? groupAgent.makeMediaEditor({ chatId: phoneJid(args.phone), historyKey: key }) : null,

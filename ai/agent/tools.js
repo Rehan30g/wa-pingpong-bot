@@ -327,6 +327,24 @@ TOOLS.get_chat_media = {
   },
 };
 
+TOOLS.use_skill = {
+  description: "Muat langkah kerja lengkap sebuah skill dari daftar 'Skill' di instruksi. Panggil SEKALI di awal tugas yang cocok, lalu ikuti langkahnya dengan tools lain.",
+  parameters: {
+    type: "object",
+    properties: { name: { type: "string", description: "nama skill persis dari daftar" } },
+    required: ["name"],
+    additionalProperties: false,
+  },
+  timeoutMs: 2_000,
+  // Isi skill ditulis owner/pengembang (bukan pengguna chat), jadi boleh diikuti.
+  trusted: true,
+  async handler({ name }, ctx) {
+    const skill = ctx.skills?.get(name);
+    if (!skill) return { error: `skill '${name}' tidak ada atau fiturnya mati di chat ini`, available: ctx.skills?.names() || [] };
+    return { skill: skill.name, title: skill.title, instructions: skill.body };
+  },
+};
+
 for (const tool of Object.values(TOOLS)) tool.validate = ajv.compile(tool.parameters);
 
 // Fitur M2b yang menaungi tiap tool. ctx.features (Set) kosong/absen = semua boleh.
@@ -336,6 +354,7 @@ const TOOL_FEATURE = { web_fetch: "web", listen_audio: "audio", send_sticker: "s
   send_to_my_dm: null,
   start_background_task: "latar",
   background_tasks: "latar",
+  use_skill: "skill",
   remember: "memori", recall: "memori", forget: "memori", note_write: "memori", note_read: "memori", note_list: "memori", summarize_history: "memori" };
 
 function featureOn(ctx, feature) {
@@ -357,6 +376,7 @@ function toolNamesFor(ctx = {}) {
     if (name === "send_to_my_dm") return Boolean(ctx.dmRelay);
     if (name === "start_background_task" || name === "background_tasks") return Boolean(ctx.background);
     if (name === "summarize_history") return Boolean(ctx.notebook && ctx.getHistory);
+    if (name === "use_skill") return Boolean(ctx.skills?.names().length);
     return true;
   });
 }
@@ -399,7 +419,9 @@ async function executeTool(call, ctx = {}) {
       payload = { error: String(error.message || "tool_gagal").slice(0, 200) };
     }
   }
-  const content = JSON.stringify({ untrusted_data: true, tool: call.name, result: payload });
+  const content = JSON.stringify(tool?.trusted && !payload?.error
+    ? { tool: call.name, trusted_instructions: true, result: payload }
+    : { untrusted_data: true, tool: call.name, result: payload });
   return {
     ok: !payload?.error,
     content: content.length > RESULT_MAX_CHARS ? `${content.slice(0, RESULT_MAX_CHARS)}…(dipotong)` : content,

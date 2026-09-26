@@ -18,8 +18,9 @@ const FEATURES = {
   edit_media: { label: "Edit video/audio/GIF & stiker animasi", default: true, available: true },
   sosial: { label: "Nimbrung tanpa dipanggil", default: true, available: true },
   workspace: { label: "File workspace grup", default: false, available: false, lockedByDefault: true },
-  python: { label: "Python sandbox (hitung, grafik, QR, API)", default: true, available: true, lockedByDefault: true },
-  skill: { label: "Membuat & memakai skill", default: false, available: false, lockedByDefault: true },
+  // Python aktif default: sandbox sudah terisolasi (tanpa file bot, env, atau jaringan langsung).
+  python: { label: "Python sandbox (hitung, grafik, QR, API)", default: true, available: true },
+  skill: { label: "Skill bawaan (resep tugas: QR, kurs, cuaca, patungan, …)", default: true, available: true },
 };
 const LOG_LIMIT = 300;
 

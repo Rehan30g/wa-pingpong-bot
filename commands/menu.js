@@ -1,17 +1,18 @@
 const features = require("../ai/features");
 
 // Contoh kemampuan Grad per fitur (hanya yang aktif di chat ini yang ditampilkan).
+// Skill bawaan ditampilkan di baris fitur yang menaunginya (bukan daftar terpisah).
 const ABILITIES = {
-  web: "🔎 cari info terbaru & rangkum link — _\"@Grad harga iPhone 17 sekarang?\"_",
-  audio: "🎙️ dengar voice note — cukup kirim VN yang manggil Grad",
-  media: "🖼️ lihat gambar/video — kirim/reply lalu tanya",
-  stiker: "🗂️ koleksi stiker — _\"@Grad simpan stiker ini\"_, _\"kirim stiker dong\"_",
-  reminder: "⏰ pengingat & jadwal — _\"ingetin grup besok jam 8 rapat\"_, _\"tiap Senin jam 7 cariin jadwal bola\"_",
-  memori: "🧠 ingat & catat — _\"inget ya aku alergi udang\"_, _\"catat keputusan rapat tadi\"_",
-  edit_media: "🎬 edit video/GIF/audio — _\"jadiin stiker video ini\"_, _\"ambil audionya jadi mp3\"_",
-  python: "🧮 hitung, grafik, QR, data API — _\"bikin grafik kurs USD 7 hari terakhir\"_",
-  latar: "🕒 tugas panjang di latar — _\"riset mendalam bandingin 3 laptop gaming\"_",
-  sosial: "💬 kadang ikut nimbrung (bilang _\"grad diem dulu\"_ kalau lagi nggak mau)",
+  web: "🔎 *Web* — cari info terbaru, ringkas link, cek hoaks, bandingin produk — _\"@Grad harga iPhone 17 sekarang?\"_",
+  audio: "🎙️ *Voice note* — cukup kirim VN yang manggil Grad",
+  media: "🖼️ *Gambar/video* — kirim/reply lalu tanya",
+  stiker: "🗂️ *Stiker* — koleksi & kirim stiker — _\"@Grad simpan stiker ini\"_, _\"kirim stiker dong\"_",
+  edit_media: "🎬 *Edit media* — stiker dari video/foto + teks, potong, kompres, ambil mp3 — _\"jadiin stiker 3 detik pertama, tulis GAS\"_",
+  python: "🧮 *Python* — hitung, grafik, QR (link/WiFi/WA/kontak), kurs, cuaca, jadwal sholat, patungan, cicilan/KPR — _\"patungan dong: …\"_, _\"250 dolar berapa rupiah?\"_",
+  reminder: "⏰ *Jadwal* — _\"ingetin grup besok jam 8 rapat\"_, _\"tiap Senin jam 7 cariin jadwal bola\"_",
+  memori: "🧠 *Memori & catatan* — ingat fakta, catatan, notulen rapat — _\"inget ya aku alergi udang\"_, _\"bikin notulen rapat tadi\"_",
+  latar: "🕒 *Tugas latar* — _\"riset mendalam bandingin 3 laptop gaming\"_",
+  sosial: "💬 *Nimbrung* — kadang ikut ngobrol (bilang _\"grad diem dulu\"_ kalau lagi nggak mau)",
 };
 
 module.exports = {
@@ -52,6 +53,7 @@ module.exports = {
         "/agent social on|off — nimbrung sosial di grup ini",
         "/stiker · /stiker lihat|buang <id> · /stiker kurasi|review — koleksi stiker",
         "/fitur global [<fitur> kunci|buka] — kunci fitur di semua grup (mis. python)",
+        "Skill tambahan: taruh file .md di data/skills/ (format sama dengan ai/skills/builtin)",
         "/allow · /deny — aktifkan/nonaktifkan bot di grup",
         "/veto (reply/nomor) · /unveto · /veto list — akses pengelola",
         "/owner · /verify · /reboot",

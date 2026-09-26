@@ -36,8 +36,8 @@ function freshFeatures() {
 test("default, kunci global owner, setelan per grup, DM ikut global, dan log perubahan", () => {
   freshFeatures();
   assert.equal(features.isEnabled(GROUP, "web"), true);
-  assert.equal(features.isEnabled(GROUP, "python"), false, "python terkunci default");
-  assert.deepEqual(features.availableFeatures(), ["web", "audio", "stiker", "media", "reminder", "memori", "latar", "edit_media", "sosial", "python"]);
+  assert.equal(features.isEnabled(GROUP, "python"), true, "python aktif default");
+  assert.deepEqual(features.availableFeatures(), ["web", "audio", "stiker", "media", "reminder", "memori", "latar", "edit_media", "sosial", "python", "skill"]);
 
   assert.equal(features.setGroupFeature(GROUP, "stiker", false, { phone: ADMIN, role: "admin" }).ok, true);
   assert.equal(features.isEnabled(GROUP, "stiker"), false);
@@ -69,15 +69,17 @@ test("/menu mengikuti fitur aktif grup dan menyembunyikan bagian owner dari non-
   };
   const member = await render(false);
   assert.match(member, /cari info terbaru/);
-  assert.doesNotMatch(member, /hitung, grafik, QR/, "python terkunci → tidak ditawarkan");
+  assert.match(member, /hitung, grafik, QR/, "python aktif default");
+  assert.match(member, /Python\* — hitung, grafik, QR .*kurs, cuaca, jadwal sholat, patungan/, "skill tampil di baris fiturnya");
+  assert.doesNotMatch(member, /skill siap pakai/);
   assert.doesNotMatch(member, /\/agent social/);
   features.setGroupFeature(GROUP, "web", false, { role: "admin" });
-  features.setGlobalLock("python", false, { role: "owner" });
+  features.setGlobalLock("python", true, { role: "owner" });
   const owner = await render(true);
   assert.doesNotMatch(owner, /cari info terbaru/);
-  assert.match(owner, /hitung, grafik, QR/);
+  assert.doesNotMatch(owner, /hitung, grafik, QR/, "python dikunci owner → tidak ditawarkan");
   assert.match(owner, /\/agent social on\|off/);
-  features.setGlobalLock("python", true, { role: "owner" });
+  features.setGlobalLock("python", false, { role: "owner" });
 });
 
 test("tools fitur yang mati tidak pernah dikirim ke GLM", () => {
@@ -194,7 +196,7 @@ test("/grup dan /fitur lewat DM: admin mengatur grupnya, non-admin tidak, orang 
   const dm = (from, text) => bot.dispatchInboundMessage(msg({ chat: `${from}@s.whatsapp.net`, from, text }), { sock });
 
   await dm(ADMIN, "/grup");
-  assert.match(sock.sent.at(-1).text, /1\. Grup Tester \(9\/10 fitur aktif\)/);
+  assert.match(sock.sent.at(-1).text, /1\. Grup Tester \(11\/11 fitur aktif\)/);
   await dm(ADMIN, "/fitur 1");
   assert.match(sock.sent.at(-1).text, /✅ \*stiker\*/);
   await dm(ADMIN, "/fitur 1 stiker off");

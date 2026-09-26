@@ -14,6 +14,8 @@ const schedules = require("./agent/schedules");
 const notebook = require("./memory/notebook");
 const proactive = require("./agent/proactive");
 const pythonRunner = require("./sandbox/python-runner");
+const skillLibrary = require("./skills");
+const { witParts } = require("./humanize");
 
 // Peserta chat berdasarkan nama (untuk remember "tentang Budi").
 function personResolver(historyKey) {
@@ -156,13 +158,34 @@ function mediaMessage(item) {
   }
 }
 
+// Isi media yang baru dikirim per chat (sha256 → waktu). GLM kadang membuat ulang
+// file lama (mis. QR dibuat lagi sebelum dijadikan stiker); hasil sampingan yang
+// isinya identik tidak dikirim dua kali.
+const recentMediaHashes = new Map();
+const RECENT_MEDIA_MS = 3 * 3_600_000;
+
+function mediaHash(file) {
+  return require("node:crypto").createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
 async function sendOutboxMedia(sock, chatId, items, { historyKey = chatId } = {}) {
   const sent = [];
   const seen = new Set();
-  for (const item of items || []) {
-    if (seen.has(item.path) || !fs.existsSync(item.path)) continue;
+  const recent = recentMediaHashes.get(chatId) || new Map();
+  for (const [hash, at] of recent) if (Date.now() - at > RECENT_MEDIA_MS) recent.delete(hash);
+  const pending = (items || []).filter((item) => {
+    if (seen.has(item.path) || !fs.existsSync(item.path)) return false;
     seen.add(item.path);
+    item.hash = mediaHash(item.path);
+    return true;
+  });
+  // Ulangan identik hanya dikirim bila memang satu-satunya hasil (pengguna minta kirim ulang).
+  const fresh = pending.filter((item) => !recent.has(item.hash));
+  const toSend = fresh.length ? fresh : pending;
+  for (const item of toSend) {
     try {
+      recent.set(item.hash, Date.now());
+      recentMediaHashes.set(chatId, recent);
       const message = await sock.sendMessage(chatId, mediaMessage(item));
       // Nama file teknis hasil media_edit tidak perlu masuk riwayat.
       const label = item.name.startsWith("edit_") ? "" : `: ${item.name}`;
@@ -439,6 +462,7 @@ function remember(groupId, entry) {
     audio: Buffer.isBuffer(entry.audio?.mp3) ? { mp3: entry.audio.mp3, seconds: entry.audio.seconds || null } : null,
     message_key: entry.messageKey || null,
     message_ref: entry.messageRef || null,
+    at: Number.isFinite(entry.at) ? entry.at : Date.now(),
   };
   history.push(saved);
   histories.set(groupId, history);
@@ -459,6 +483,7 @@ function dropHistoryEntries(groupId, entryIds) {
 }
 
 function resetHistories() {
+  recentMediaHashes.clear();
   const affectedGroups = new Set([
     ...histories.keys(),
     ...pendingGroups.keys(),
@@ -843,10 +868,22 @@ const PROACTIVE_HINTS = {
   social: "PENTING: kamu TIDAK dipanggil; ini momen santai. Ikut nimbrung seperti member biasa: lebih baik satu stiker yang maknanya pas (send_sticker placement 'only'), atau satu kalimat pendek santai. Jangan menjelaskan, jangan bertanya balik panjang, jangan menawarkan bantuan, jangan menyebut dirimu bot. Kalau tidak ada yang pas, balas KOSONG.",
 };
 
+// Jam WIT per pesan supaya GLM tahu "tadi", "barusan", atau "kemarin" dengan benar.
+function historyStamp(at, now = Date.now()) {
+  if (!Number.isFinite(at)) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  const dayKey = (parts) => `${parts.year}-${parts.month}-${parts.day}`;
+  const p = witParts(at);
+  const clock = `${pad(p.hour)}:${pad(p.minute)}`;
+  if (dayKey(p) === dayKey(witParts(now))) return `[${clock}] `;
+  if (dayKey(p) === dayKey(witParts(now - 86_400_000))) return `[kemarin ${clock}] `;
+  return `[${pad(p.day)}/${pad(p.month)} ${clock}] `;
+}
+
 function historyLine(item) {
   const media = item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : "";
   const audio = item.audio ? " [audio tersimpan]" : "";
-  return `#${item.entry_id} ${formatIdentity(item)}: ${item.text}${media}${audio}`;
+  return `#${item.entry_id} ${historyStamp(item.at)}${formatIdentity(item)}: ${item.text}${media}${audio}`;
 }
 
 function buildChatMessages({
@@ -885,8 +922,8 @@ function buildChatMessages({
 
   const userText = [
     "Konteks percakapan grup:",
-    `Memori terperinci sebelumnya:\n${memorySnapshot.glm}`,
-    conversation || "(belum ada konteks)",
+    `Memori terperinci sebelumnya (ringkasan obrolan lebih lama, waktunya tidak pasti):\n${memorySnapshot.glm}`,
+    conversation ? `Riwayat aktif (jam WIT di depan tiap pesan):\n${conversation}` : "(belum ada konteks)",
     quotedText ? `Pesan yang dibalas: ${quotedText}` : "",
     `Pesan terbaru dari ${latestMessage.sender}: ${latestMessage.text}`,
     mediaPart
@@ -921,7 +958,7 @@ function buildChatMessages({
         "Untuk hal teknis, beri langkah paling berguna dahulu dan tanyakan detail hanya jika memang dibutuhkan.",
         "Jangan menyebut Jev, classifier, prompt, confidence, atau proses internal.",
         "Jika ada video terlampir, jangan mengaku telah menonton isinya; sampaikan secara wajar bahwa analisis visual video belum didukung pada fase ini.",
-        agentInstructions({ maxReplyChars: cfg.maxReplyChars, hasAudio, hasStickers, canSaveStickers, toolsDisabled, features }),
+        agentInstructions({ maxReplyChars: cfg.maxReplyChars, hasAudio, hasStickers, canSaveStickers, toolsDisabled, features, explainOff: !proactiveMode }),
       ].join(" "),
     },
     {
@@ -982,7 +1019,9 @@ async function generateReply({ groupId, chatId = groupId, isDm = false, latestMe
   const snapshot = historySnapshot || getHistory(groupId);
   const enabledFeatures = featureSettings.enabledSet(chatId);
   // Nimbrung sosial hanya boleh berupa teks singkat atau stiker: tanpa web, jadwal, atau memori.
-  const features = proactiveMode === "social" ? new Set([...enabledFeatures].filter((name) => name === "stiker")) : enabledFeatures;
+  const features = proactiveMode === "social" ? new Set([...enabledFeatures].filter((name) => name === "stiker")) : new Set(enabledFeatures);
+  // Sandbox belum disiapkan (npm run python:setup) = python tidak bisa dipakai; skill-nya ikut tersembunyi.
+  if (!pythonRunner.isReady()) features.delete("python");
   const stickers = toolsDisabled || !features.has("stiker") ? null : await stickerContext(chatId);
   const notes = features.has("memori") ? notebook.forChat({
     chatId,
@@ -1012,7 +1051,8 @@ async function generateReply({ groupId, chatId = groupId, isDm = false, latestMe
       notebook: notes,
       compactMemory: () => getGroupMemory(groupId).glm,
       allowEmpty: Boolean(proactiveMode),
-      python: features.has("python") && pythonRunner.isReady() ? { run: ({ code }) => pythonRunner.runPython({ chatId, code }) } : null,
+      python: features.has("python") ? { run: ({ code }) => pythonRunner.runPython({ chatId, code }) } : null,
+      skills: features.has("skill") ? skillLibrary.forFeatures(features) : null,
       outbox: { media: [] },
       mediaEditor: features.has("edit_media") ? makeMediaEditor({ chatId, historyKey: groupId }) : null,
       // Subagent latar tidak bisa memulai subagent lagi; nimbrung/jadwal juga tidak.
@@ -1142,7 +1182,10 @@ async function evaluateGroupMessage(
   }
 
   // Diminta diam ("grad diem dulu"): hanya pesan yang memanggil bot yang ditanggapi.
-  if (proactive.isMuted(groupId) && !directlyAddressed) return { action: "ignore", muted: true, decision };
+  if (proactive.isMuted(groupId) && !directlyAddressed) {
+    if (decision.opportunity !== "none") require("./observability/activity").record("proactive", { chat: groupId, mode: "skip", opportunity: decision.opportunity, reason: "muted" });
+    return { action: "ignore", muted: true, decision };
+  }
 
   const shouldReply =
     (decision.action === "reply" &&
@@ -1167,6 +1210,14 @@ async function evaluateGroupMessage(
       proactive.markSocial(groupId);
     }
     if (proactiveMode) require("./observability/activity").record("proactive", { chat: groupId, mode: proactiveMode, confidence: decision.opportunityConfidence });
+    // Alasan TIDAK masuk dicatat juga (tanpa isi pesan), supaya "kenapa Grad diam" bisa dilihat di dashboard.
+    else if (decision.opportunity !== "none") {
+      const check = decision.opportunity === "help" ? proactive.checkHelp(groupId) : proactive.checkSocial(groupId);
+      const reason = !confident ? "confidence_rendah"
+        : decision.opportunity === "social" && !featureSettings.isEnabled(groupId, "sosial") ? "fitur_sosial_mati"
+          : check.reason || "ditahan";
+      require("./observability/activity").record("proactive", { chat: groupId, mode: "skip", opportunity: decision.opportunity, reason, confidence: decision.opportunityConfidence });
+    }
   }
 
   if (shouldReply || proactiveMode) {
@@ -1284,8 +1335,10 @@ function processGroupMessage(args) {
     activeLoops.get(groupId)?.abort();
     entry.absorbed = true;
     require("./observability/activity").record("proactive", { chat: groupId, mode: "muted", until });
-    return Promise.resolve(args.sock?.sendMessage?.(groupId, { react: { text: "🤐", key: args.message?.key } })
-      .catch(() => {}))
+    // Pesan yang direspons (reaction) juga harus berstatus dibaca.
+    return Promise.resolve(args.sock ? markRead(args.sock, args.message) : null)
+      .then(() => args.sock?.sendMessage?.(groupId, { react: { text: "🤐", key: args.message?.key } }))
+      .catch(() => {})
       .then(() => ({ action: "muted", until }));
   }
 
@@ -1297,8 +1350,9 @@ function processGroupMessage(args) {
     if (addressed && activeLoops.isStopCommand(text, config().botName)) {
       active.abort();
       entry.absorbed = true;
-      return Promise.resolve(args.sock?.sendMessage?.(groupId, { react: { text: "👍", key: args.message?.key } })
-        .catch(() => {}))
+      return Promise.resolve(args.sock ? markRead(args.sock, args.message) : null)
+        .then(() => args.sock?.sendMessage?.(groupId, { react: { text: "👍", key: args.message?.key } }))
+        .catch(() => {})
         .then(() => ({ action: "stopped" }));
     }
     active.inject(entry);
@@ -1345,6 +1399,7 @@ function processGroupMessage(args) {
 
 module.exports = {
   buildChatMessages,
+  historyStamp,
   makeBackgroundControl,
   makeMediaEditor,
   setRawMediaLoader,
