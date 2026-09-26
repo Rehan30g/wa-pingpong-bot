@@ -37,7 +37,7 @@ test("default, kunci global owner, setelan per grup, DM ikut global, dan log per
   freshFeatures();
   assert.equal(features.isEnabled(GROUP, "web"), true);
   assert.equal(features.isEnabled(GROUP, "python"), true, "python aktif default");
-  assert.deepEqual(features.availableFeatures(), ["web", "audio", "stiker", "media", "reminder", "memori", "latar", "edit_media", "sosial", "python", "skill"]);
+  assert.deepEqual(features.availableFeatures(), ["web", "audio", "stiker", "media", "reminder", "memori", "latar", "edit_media", "sosial", "dokumen", "python", "skill"]);
 
   assert.equal(features.setGroupFeature(GROUP, "stiker", false, { phone: ADMIN, role: "admin" }).ok, true);
   assert.equal(features.isEnabled(GROUP, "stiker"), false);
@@ -196,7 +196,7 @@ test("/grup dan /fitur lewat DM: admin mengatur grupnya, non-admin tidak, orang 
   const dm = (from, text) => bot.dispatchInboundMessage(msg({ chat: `${from}@s.whatsapp.net`, from, text }), { sock });
 
   await dm(ADMIN, "/grup");
-  assert.match(sock.sent.at(-1).text, /1\. Grup Tester \(11\/11 fitur aktif\)/);
+  assert.match(sock.sent.at(-1).text, /1\. Grup Tester \(12\/12 fitur aktif\)/);
   await dm(ADMIN, "/fitur 1");
   assert.match(sock.sent.at(-1).text, /✅ \*stiker\*/);
   await dm(ADMIN, "/fitur 1 stiker off");

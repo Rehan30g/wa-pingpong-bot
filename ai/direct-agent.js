@@ -246,6 +246,7 @@ async function generateDirectReply({ handle = null, sendProgress = null, sock = 
   const toolsDisabled = usageTracker.dailyBudgetLeft() <= 0;
   const features = featureSettings.enabledSet(phoneJid(args.phone));
   if (!require("./sandbox/python-runner").isReady()) features.delete("python");
+  if (!require("./sandbox/python-runner").documentsReady()) features.delete("dokumen");
   const stickers = toolsDisabled || !features.has("stiker") ? null : await groupAgent.stickerContext(phoneJid(args.phone));
   const notes = features.has("memori") ? require("./memory/notebook").forChat({
     chatId: phoneJid(args.phone),
@@ -279,6 +280,7 @@ async function generateDirectReply({ handle = null, sendProgress = null, sock = 
       features,
       python: features.has("python") ? { run: ({ code }) => require("./sandbox/python-runner").runPython({ chatId: phoneJid(args.phone), code }) } : null,
       skills: features.has("skill") ? require("./skills").forFeatures(features) : null,
+      documents: features.has("dokumen") ? groupAgent.makeDocumentReader({ chatId: phoneJid(args.phone), historyKey: key }) : null,
       outbox: { media: [] },
       background: features.has("latar") && sock ? groupAgent.makeBackgroundControl({ chatId: phoneJid(args.phone), historyKey: key, isDm: true, latestMessage: args.latestMessage, requestRef, sock }) : null,
       mediaEditor: features.has("edit_media") ? groupAgent.makeMediaEditor({ chatId: phoneJid(args.phone), historyKey: key }) : null,
@@ -482,6 +484,7 @@ function processDirectMessage(args) {
     hasVideo: args.media?.type === "video",
     media: args.media,
     audio: args.audio,
+    document: args.document,
     messageKey: args.message?.key,
     messageRef: args.message,
   });

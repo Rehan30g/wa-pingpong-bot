@@ -32,6 +32,56 @@ function pythonConfig() {
 }
 
 const IMAGE_TYPES = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" };
+// Dokumen di out/ dikirim sebagai file dokumen WhatsApp.
+const DOCUMENT_TYPES = {
+  ".pdf": "application/pdf",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".csv": "text/csv",
+};
+
+// Paket PyPI murni-Python (diunduh npm run python:setup) dipasang hanya bila
+// kode memakainya; pyodide = paket bawaan Pyodide yang dibutuhkan.
+const WHEEL_GROUPS = {
+  qrcode: { match: /\bqrcode\b/, wheels: ["qrcode"], pyodide: ["pillow"] },
+  pypdf: { match: /\bpypdf\b/, wheels: ["pypdf", "typing_extensions"], pyodide: [] },
+  docx: { match: /\b(?:import|from)\s+docx\b/, wheels: ["python-docx", "typing_extensions"], pyodide: ["lxml"] },
+  pptx: { match: /\b(?:import|from)\s+pptx\b/, wheels: ["python-pptx", "XlsxWriter", "typing_extensions"], pyodide: ["lxml", "pillow"] },
+  openpyxl: { match: /\bopenpyxl\b|\.(?:to|read)_excel\b/, wheels: ["openpyxl", "et_xmlfile"], pyodide: [] },
+  xlsxwriter: { match: /\bxlsxwriter\b/, wheels: ["XlsxWriter"], pyodide: [] },
+  fpdf: { match: /\b(?:import|from)\s+fpdf\b/, wheels: ["fpdf2", "defusedxml"], pyodide: ["pillow", "fonttools"] },
+};
+
+function readWheelIndex(cfg) {
+  const raw = JSON.parse(fs.readFileSync(path.join(cfg.cacheDir, "extra-wheels.json"), "utf8"));
+  // Format lama (sebelum dukungan dokumen): daftar file, hanya qrcode.
+  return Array.isArray(raw) ? { qrcode: raw.find((file) => file.startsWith("qrcode")) } : raw.wheels || {};
+}
+
+// File wheel + paket Pyodide yang perlu dipasang untuk kode ini.
+function installPlan(code, cfg) {
+  const index = readWheelIndex(cfg);
+  const wheels = new Set();
+  const pyodide = new Set();
+  for (const group of Object.values(WHEEL_GROUPS)) {
+    if (!group.match.test(code)) continue;
+    for (const name of group.wheels) if (index[name]) wheels.add(index[name]);
+    for (const name of group.pyodide) pyodide.add(name);
+  }
+  return { wheels: [...wheels], pyodide: [...pyodide] };
+}
+
+// Dukungan dokumen butuh wheel format baru; setup lama → npm run python:setup lagi.
+function documentsReady(cfg = pythonConfig()) {
+  if (!isReady(cfg)) return false;
+  try {
+    const index = readWheelIndex(cfg);
+    return ["pypdf", "python-docx", "python-pptx", "openpyxl", "fpdf2"].every((name) => index[name]);
+  } catch {
+    return false;
+  }
+}
 
 function pyodideDir() {
   return path.dirname(require.resolve("pyodide/package.json"));
@@ -107,7 +157,7 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
   });
   let stderrTail = "";
   child.stderr.on("data", (chunk) => { stderrTail = (stderrTail + chunk).slice(-2_000); });
-  const extraWheels = JSON.parse(fs.readFileSync(path.join(cfg.cacheDir, "extra-wheels.json"), "utf8"));
+  const install = installPlan(source, cfg);
   let requests = 0;
   const started = Date.now();
 
@@ -140,16 +190,22 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
     });
     child.on("exit", (codeValue) => finish({ ok: false, error: `sandbox berhenti (kode ${codeValue})${stderrTail ? `: ${stderrTail.split("\n").filter(Boolean).slice(-2).join(" ")}` : ""}` }));
     child.on("error", (error) => finish({ ok: false, error: error.message }));
-    child.send({ type: "run", job: { code: source, pyodideDir: pyDir, cacheDir: cfg.cacheDir, workdir, extraWheels, maxOutput: cfg.maxOutput } });
+    child.send({ type: "run", job: { code: source, pyodideDir: pyDir, cacheDir: cfg.cacheDir, workdir, install, maxOutput: cfg.maxOutput } });
   });
 
-  const images = fs.readdirSync(outDir)
-    .filter((name) => IMAGE_TYPES[path.extname(name).toLowerCase()])
+  const changed = fs.readdirSync(outDir)
     .filter((name) => !before.has(name) || fs.statSync(path.join(outDir, name)).mtimeMs > before.get(name))
-    .map((name) => ({ name, path: path.join(outDir, name), mime: IMAGE_TYPES[path.extname(name).toLowerCase()], size: fs.statSync(path.join(outDir, name)).size }))
-    .filter((image) => image.size > 0 && image.size <= 5 * 1_048_576)
+    .map((name) => ({ name, path: path.join(outDir, name), ext: path.extname(name).toLowerCase(), size: fs.statSync(path.join(outDir, name)).size }))
+    .filter((file) => file.size > 0);
+  const images = changed
+    .filter((file) => IMAGE_TYPES[file.ext] && file.size <= 5 * 1_048_576)
+    .map(({ ext, ...file }) => ({ ...file, mime: IMAGE_TYPES[ext] }))
     .slice(0, cfg.maxImages);
-  return { ...result, images, files: listFiles(workdir), requests, durationMs: Date.now() - started };
+  const documents = changed
+    .filter((file) => DOCUMENT_TYPES[file.ext] && file.size <= 16 * 1_048_576)
+    .map(({ ext, ...file }) => ({ ...file, mime: DOCUMENT_TYPES[ext] }))
+    .slice(0, 3);
+  return { ...result, images, documents, files: listFiles(workdir), requests, durationMs: Date.now() - started };
 }
 
-module.exports = { isReady, pythonConfig, runPython, workspaceFor };
+module.exports = { DOCUMENT_TYPES, WHEEL_GROUPS, documentsReady, installPlan, isReady, pythonConfig, runPython, workspaceFor };

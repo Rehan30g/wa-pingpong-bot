@@ -224,7 +224,8 @@ async function startBot() {
 function unwrapMediaWrappers(message) {
   let current = message;
   while (current) {
-    const wrapper = current.viewOnceMessage || current.viewOnceMessageV2;
+    // Dokumen dengan caption dibungkus documentWithCaptionMessage.
+    const wrapper = current.viewOnceMessage || current.viewOnceMessageV2 || current.documentWithCaptionMessage;
     if (!wrapper?.message || wrapper.message === current) break;
     current = wrapper.message;
   }
@@ -238,6 +239,7 @@ function getText(m) {
     content.extendedTextMessage?.text ||
     content.imageMessage?.caption ||
     content.videoMessage?.caption ||
+    content.documentMessage?.caption ||
     ""
   ).trim();
 }
@@ -303,6 +305,8 @@ function getContextInfo(m) {
     m.message?.imageMessage?.contextInfo ||
     m.message?.videoMessage?.contextInfo ||
     m.message?.audioMessage?.contextInfo ||
+    m.message?.documentMessage?.contextInfo ||
+    m.message?.documentWithCaptionMessage?.message?.documentMessage?.contextInfo ||
     m.message?.stickerMessage?.contextInfo ||
     {}
   );
@@ -316,8 +320,46 @@ function getQuotedText(m) {
     quoted.extendedTextMessage?.text ||
     quoted.imageMessage?.caption ||
     quoted.videoMessage?.caption ||
+    quoted.documentMessage?.caption ||
+    (quoted.documentMessage ? documentLabel(documentMeta(quoted.documentMessage)) : "") ||
     ""
   ).trim();
+}
+
+// Dokumen (PDF/Word/PPT/Excel/teks) — bukan dokumen yang sebenarnya gambar/video/audio.
+function documentMeta(doc) {
+  if (!doc || /^(video|audio|image)\//.test(doc.mimetype || "")) return null;
+  return {
+    name: String(doc.fileName || doc.title || "dokumen").slice(0, 120),
+    mime: doc.mimetype || null,
+    size: mediaFileLength(doc),
+    pages: Number(doc.pageCount) || null,
+  };
+}
+
+function documentLabel(meta) {
+  if (!meta) return "";
+  const size = meta.size ? ` · ${meta.size >= 1_048_576 ? `${(meta.size / 1_048_576).toFixed(1)} MB` : `${Math.max(1, Math.round(meta.size / 1024))} KB`}` : "";
+  return `[dokumen: ${meta.name}${meta.pages ? ` · ${meta.pages} hlm` : ""}${size}]`;
+}
+
+// Dokumen di pesan ini atau di pesan yang di-reply (untuk read_document).
+function messageDocument(m) {
+  const direct = documentMeta(unwrapMediaWrappers(m?.message)?.documentMessage);
+  if (direct) return { ...direct, quoted: false };
+  const quoted = documentMeta(unwrapMediaWrappers(getContextInfo(m || {})?.quotedMessage)?.documentMessage);
+  return quoted ? { ...quoted, quoted: true } : null;
+}
+
+async function getRawDocument(m, { maxBytes = Math.max(1, Number(process.env.DOC_MAX_MB || 20)) * 1_048_576 } = {}) {
+  const direct = unwrapMediaWrappers(m?.message)?.documentMessage;
+  const quoted = unwrapMediaWrappers(getContextInfo(m || {})?.quotedMessage)?.documentMessage;
+  const doc = documentMeta(direct) ? direct : documentMeta(quoted) ? quoted : null;
+  if (!doc || !(doc.url || doc.directPath)) return null;
+  const declared = mediaFileLength(doc);
+  if (declared != null && declared > maxBytes) throw new Error("dokumen terlalu besar");
+  const buffer = await downloadMedia({ message: { documentMessage: doc } }, { maxBytes });
+  return buffer?.length ? { buffer, fileName: doc.fileName || "dokumen", mime: doc.mimetype || null } : null;
 }
 
 // WhatsApp menulis tag di teks sebagai nomor (mis. "@628xxx" atau "@<lid>").
@@ -547,6 +589,7 @@ async function getAiMedia(m) {
 // get_chat_media mengunduh ulang media pesan lama yang sudah dibuang dari riwayat.
 groupAgent.setMediaLoader(getAiMedia);
 groupAgent.setRawMediaLoader(getRawMedia);
+groupAgent.setDocumentLoader(getRawDocument);
 // save_sticker mengunduh stiker yang di-reply bila belum pernah terkumpul.
 groupAgent.setStickerDownloader((stickerMessage) => downloadMedia({ message: { stickerMessage } }, { maxBytes: 2 * 1_048_576 }));
 
@@ -825,15 +868,17 @@ async function runLegacyMessageFlow({
     const dmMediaOn = featureSettings.isEnabled(`${memoryStore.normalizePhone(senderJid)}@s.whatsapp.net`, "media");
     const dmMedia = dmMediaOn ? earlyMedia || (await getAiMedia(m)) : null;
     const dmVisual = !dmMediaOn && visualPlaceholder(m);
-    if (!text && !dmMedia && !dmVisual) return;
+    const dmDocument = messageDocument(m);
+    if (!text && !dmMedia && !dmVisual && !dmDocument) return;
     await directAgent.processDirectMessage({
       sock,
       message: m,
       phone: senderJid,
       senderName: m.pushName || senderTag,
-      text: text || dmVisual || (dmMedia?.kind === "sticker" ? await stickerHistoryText(m) : dmMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+      text: dmDocument && !dmDocument.quoted ? [text, documentLabel(dmDocument)].filter(Boolean).join(" ") : text || dmVisual || (dmMedia?.kind === "sticker" ? await stickerHistoryText(m) : dmMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
       quotedText,
       media: dmMedia,
+      document: dmDocument,
       audio,
       isOwner: fromOwner,
     });
@@ -984,7 +1029,8 @@ async function runLegacyMessageFlow({
   const mediaOn = featureSettings.isEnabled(jid, "media");
   const aiMedia = mediaOn ? earlyMedia || (await getAiMedia(m)) : null;
   const visual = !mediaOn && visualPlaceholder(m);
-  if (!text && !aiMedia && !visual) return;
+  const aiDocument = messageDocument(m);
+  if (!text && !aiMedia && !visual && !aiDocument) return;
   const contextInfo = getContextInfo(m);
   const mentioned = (contextInfo.mentionedJid || []).map(normalizeJid);
   const metadataMention = Boolean(botIdentities().some((id) => mentioned.includes(id)));
@@ -1008,10 +1054,11 @@ async function runLegacyMessageFlow({
     groupId: jid,
     senderId: senderPhoneVerified ? senderJid : "nomor-tidak-diketahui",
     senderName: m.pushName || senderTag,
-    text: decoratedText || visual || (aiMedia?.kind === "sticker" ? await stickerHistoryText(m) : aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+    text: aiDocument && !aiDocument.quoted ? [decoratedText, documentLabel(aiDocument)].filter(Boolean).join(" ") : decoratedText || visual || (aiMedia?.kind === "sticker" ? await stickerHistoryText(m) : aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
     explicitMention,
     replyToBot,
     media: aiMedia,
+    document: aiDocument,
     audio,
     quotedText: decoratedQuoted,
   });
@@ -1038,7 +1085,7 @@ async function dispatchInboundMessage(m, {
     // Stiker tetap dicatat koleksi walau unduhan untuk AI gagal; voice note
     // diproses "telinga" Grad di runLegacyMessageFlow.
     const content = unwrapMediaWrappers(m.message) || {};
-    if (!earlyMedia && !content.stickerMessage && !content.audioMessage) return null;
+    if (!earlyMedia && !content.stickerMessage && !content.audioMessage && !documentMeta(content.documentMessage)) return null;
   }
 
   // identitas pengirim

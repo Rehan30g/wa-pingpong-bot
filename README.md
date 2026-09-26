@@ -22,6 +22,7 @@ Voice note ─► Gemini Flash Lite (telinga) ─► transkrip ─► Jev/GLM
 | Python: hitung, grafik, QR, API | "bikin grafik kurs USD/IDR 7 hari terakhir", "bikinin QR buat link ini" | `python` |
 | Tugas latar panjang (subagent) | "riset mendalam bandingin 3 laptop gaming + grafik harga" | `latar` |
 | Ikut nimbrung / bantu tanpa dipanggil | Grad kadang menimpali candaan (sering pakai stiker) atau menjawab pertanyaan terbuka | `sosial` |
+| Baca & buat dokumen | kirim PDF/Word/PPT/Excel lalu "ringkas ini", "slide berapa bahas anggaran?"; "jadiin notulen tadi PDF", "bikin 5 slide dari riset tadi", "export ke excel" (PDF hasil scan dibaca OCR) | `dokumen` |
 | Skill siap pakai | "250 dolar berapa rupiah?", "cuaca jayapura besok", "maghrib jam berapa", "patungan dong: …", "qr wifi RumahKita pw …", "bikin notulen rapat tadi" | `skill` |
 | Hasil ke DM peminta | "kirim ke DM aku aja" | — |
 
@@ -32,7 +33,7 @@ Hentikan tugas yang sedang jalan: "stop"/"batal". Minta Grad berhenti nimbrung: 
 1. Node.js 20+ (dev memakai 26), `ffmpeg` + `ffprobe` di PATH.
 2. `npm install`
 3. Salin `.env.example` ke `.env`, isi `OPENROUTER_API_KEY`, `BOT_NAME`, `BOT_ROLE`. Kosongkan `OPENROUTER_PROXY_URL` bila mesin bisa akses OpenRouter langsung (VPS di AGENTS.md butuh proxy).
-4. Opsional, untuk Python: `npm run python:setup` (unduh paket Pyodide ±22 MB sekali).
+4. Untuk Python & dokumen: `npm run python:setup` (unduh paket Pyodide + library dokumen sekali; ulangi setelah update yang menambah paket).
 5. `npm start`, scan QR, kirim `/verify` dari WhatsApp, masukkan kode di terminal, lalu `/allow` di grup.
 6. Dashboard owner: buka link `http://127.0.0.1:7777/?t=…` yang dicetak di terminal (atau `npm run dashboard:link`). Di VPS lewat SSH tunnel: `ssh -N -L 7777:127.0.0.1:7777 <user>@<vps>`.
 
@@ -68,6 +69,7 @@ Hentikan tugas yang sedang jalan: "stop"/"batal". Minta Grad berhenti nimbrung: 
 | `ai/stickers/` | koleksi stiker: pengumpulan, kurasi, pemakaian, command |
 | `ai/memory/notebook.js`, `ai/memory-store.js` | fakta, catatan, memori compact |
 | `ai/sandbox/` | Python sandbox + HTTP aman |
+| `ai/documents/reader.js` | pembaca dokumen (sandbox) + OCR PDF scan |
 | `ai/skills/` | skill bawaan (`builtin/*.md`); skill tambahan owner di `data/skills/` |
 | `ai/media/media-edit.js` | editor FFmpeg |
 | `ai/features*.js`, `ai/runtime-settings.js` | fitur per grup, pengaturan runtime |
@@ -81,4 +83,4 @@ Hentikan tugas yang sedang jalan: "stop"/"batal". Minta Grad berhenti nimbrung: 
 npm test
 ```
 
-Tes tidak pernah memakai API key asli. Validasi dengan API nyata (tanpa WhatsApp): `npm run simulate:agent`, `npm run simulate:skills`, `npm run probe:tools`, `npm run probe:audio -- <file>`. Dokumen overhaul v1 (arsip) ada di [`docs/overhaul/`](./docs/overhaul/).
+Tes tidak pernah memakai API key asli. Validasi dengan API nyata (tanpa WhatsApp): `npm run simulate:agent`, `npm run simulate:skills`, `npm run simulate:documents -- <file>`, `npm run probe:tools`, `npm run probe:audio -- <file>`. Dokumen overhaul v1 (arsip) ada di [`docs/overhaul/`](./docs/overhaul/).

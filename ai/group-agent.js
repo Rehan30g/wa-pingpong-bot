@@ -146,7 +146,7 @@ require("./scheduler").setChatTaskRunner(runScheduledTask);
 
 // Hasil run_python / media_edit (folder out/) dikirim ke chat setelah teks,
 // sesuai jenisnya: gambar, video, GIF (mp4 gifPlayback), audio, atau stiker.
-const MEDIA_LABEL = { image: "gambar", video: "video", gif: "GIF", audio: "audio", sticker: "stiker" };
+const MEDIA_LABEL = { image: "gambar", video: "video", gif: "GIF", audio: "audio", sticker: "stiker", document: "dokumen" };
 function mediaMessage(item) {
   const buffer = fs.readFileSync(item.path);
   switch (item.kind) {
@@ -154,6 +154,7 @@ function mediaMessage(item) {
     case "gif": return { video: buffer, mimetype: "video/mp4", gifPlayback: true };
     case "audio": return { audio: buffer, mimetype: item.mime || "audio/mpeg" };
     case "sticker": return { sticker: buffer };
+    case "document": return { document: buffer, mimetype: item.mime || "application/octet-stream", fileName: item.name };
     default: return { image: buffer, mimetype: item.mime };
   }
 }
@@ -285,6 +286,28 @@ function makeBackgroundControl({ chatId, historyKey, isDm, latestMessage, reques
 let rawMediaLoader = null;
 function setRawMediaLoader(fn) {
   rawMediaLoader = typeof fn === "function" ? fn : null;
+}
+
+// Loader dokumen asli dari pesan WA (dipasang index.js) untuk read_document.
+let rawDocumentLoader = null;
+function setDocumentLoader(fn) {
+  rawDocumentLoader = typeof fn === "function" ? fn : null;
+}
+
+/** Pembaca dokumen terikat satu chat: sumber pesan riwayat (#) atau file workspace. */
+function makeDocumentReader({ chatId, historyKey = chatId }) {
+  return async ({ entry_id: entryId, file, pages, query }, ctx = {}) => {
+    const reader = require("./documents/reader");
+    const common = { chatId, pages, query, addCost: ctx.addCost, signal: ctx.signal };
+    if (file) return reader.readDocument({ ...common, file });
+    const entry = getHistory(historyKey).find((item) => item.entry_id === entryId);
+    if (!entry) return { error: `pesan #${entryId} tidak ada di riwayat aktif` };
+    if (!entry.document) return { error: `pesan #${entryId} tidak membawa dokumen` };
+    if (!rawDocumentLoader || !entry.message_ref) return { error: "dokumen tidak bisa diunduh ulang" };
+    const loaded = await rawDocumentLoader(entry.message_ref);
+    if (!loaded?.buffer?.length) return { error: "dokumen gagal diunduh (mungkin sudah kedaluwarsa di WhatsApp)" };
+    return reader.readDocument({ ...common, buffer: loaded.buffer, fileName: loaded.fileName || entry.document.name });
+  };
 }
 
 /** Editor media terikat satu chat: sumber dari riwayat (#) atau file workspace. */
@@ -463,6 +486,7 @@ function remember(groupId, entry) {
     message_key: entry.messageKey || null,
     message_ref: entry.messageRef || null,
     at: Number.isFinite(entry.at) ? entry.at : Date.now(),
+    document: entry.document ? { name: String(entry.document.name || "dokumen").slice(0, 120), mime: entry.document.mime || null, size: entry.document.size || null, pages: entry.document.pages || null } : null,
   };
   history.push(saved);
   histories.set(groupId, history);
@@ -1022,6 +1046,7 @@ async function generateReply({ groupId, chatId = groupId, isDm = false, latestMe
   const features = proactiveMode === "social" ? new Set([...enabledFeatures].filter((name) => name === "stiker")) : new Set(enabledFeatures);
   // Sandbox belum disiapkan (npm run python:setup) = python tidak bisa dipakai; skill-nya ikut tersembunyi.
   if (!pythonRunner.isReady()) features.delete("python");
+  if (!pythonRunner.documentsReady()) features.delete("dokumen");
   const stickers = toolsDisabled || !features.has("stiker") ? null : await stickerContext(chatId);
   const notes = features.has("memori") ? notebook.forChat({
     chatId,
@@ -1053,6 +1078,7 @@ async function generateReply({ groupId, chatId = groupId, isDm = false, latestMe
       allowEmpty: Boolean(proactiveMode),
       python: features.has("python") ? { run: ({ code }) => pythonRunner.runPython({ chatId, code }) } : null,
       skills: features.has("skill") ? skillLibrary.forFeatures(features) : null,
+      documents: features.has("dokumen") ? makeDocumentReader({ chatId, historyKey: groupId }) : null,
       outbox: { media: [] },
       mediaEditor: features.has("edit_media") ? makeMediaEditor({ chatId, historyKey: groupId }) : null,
       // Subagent latar tidak bisa memulai subagent lagi; nimbrung/jadwal juga tidak.
@@ -1324,6 +1350,7 @@ function processGroupMessage(args) {
     hasVideo: media?.type === "video",
     media,
     audio: args.audio,
+    document: args.document,
     messageKey: args.message?.key,
     messageRef: args.message,
   });
@@ -1403,6 +1430,8 @@ module.exports = {
   makeBackgroundControl,
   makeMediaEditor,
   setRawMediaLoader,
+  setDocumentLoader,
+  makeDocumentReader,
   sendOutboxMedia,
   runScheduledTask,
   historyHasStickers,
