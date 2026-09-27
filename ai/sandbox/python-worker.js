@@ -124,13 +124,13 @@ async function run(job) {
   pyodide.mountNodeFS("/work", job.workdir);
   await pyodide.loadPackage("micropip", { messageCallback: () => {} });
   await pyodide.loadPackagesFromImports(job.code, { messageCallback: () => {} });
-  if (/\bqrcode\b/.test(job.code)) {
-    await pyodide.loadPackage("pillow", { messageCallback: () => {} });
-    for (const wheel of job.extraWheels || []) {
-      const bytes = fs.readFileSync(path.join(job.cacheDir, wheel));
-      pyodide.FS.writeFile(`/tmp/${wheel}`, bytes);
-      await pyodide.runPythonAsync(`import micropip\nawait micropip.install("emfs:/tmp/${wheel}", deps=False)`);
-    }
+  // Wheel PyPI (qrcode, pypdf, python-docx, …) sudah dipilih runner sesuai import di kode.
+  const install = job.install || { wheels: [], pyodide: [] };
+  if (install.pyodide.length) await pyodide.loadPackage(install.pyodide, { messageCallback: () => {} });
+  for (const wheel of install.wheels) {
+    const bytes = fs.readFileSync(path.join(job.cacheDir, wheel));
+    pyodide.FS.writeFile(`/tmp/${wheel}`, bytes);
+    await pyodide.runPythonAsync(`import micropip\nawait micropip.install("emfs:/tmp/${wheel}", deps=False)`);
   }
   await pyodide.runPythonAsync(PRELUDE);
   pyodide.runPython('import os; os.makedirs("/work/out", exist_ok=True); os.chdir("/work")');

@@ -74,7 +74,7 @@ test("agent loop grup: indeks skill masuk prompt, use_skill memuat resep, lalu t
     const sock = { sendMessage: async (jid, content) => { sent.push({ jid, ...content }); return { key: { id: `b${sent.length}` } }; }, readMessages: async () => {}, sendPresenceUpdate: async () => {} };
     const result = await groupAgent.processGroupMessage({ sock, message: { key: { id: "s1", remoteJid: CHAT } }, groupId: CHAT, senderId: "62811", senderName: "Rehan", text: "@Grad ringkasin https://example.com/berita", explicitMention: true, replyToBot: false, quotedText: "" });
     const system = mock.state.chat[0].messages[0].content;
-    assert.match(system, /Skill \(resep langkah kerja\) yang tersedia:\n- cuaca:/);
+    assert.match(system, /Skill \(resep langkah kerja\) yang tersedia:\n(?:- .*\n)*- cuaca:/);
     assert.ok(mock.state.chat[0].tools.some((t) => t.function?.name === "use_skill"));
     const toolMessage = mock.state.chat[1].messages.find((m) => m.role === "tool");
     assert.match(toolMessage.content, /trusted_instructions/);

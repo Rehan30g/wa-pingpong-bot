@@ -133,7 +133,7 @@ Kalau WARP disconnect: `warp-cli --accept-tos connect`
 
 ## Fitur per Grup (M2b)
 
-- `ai/features.js` (file `features.json`, `FEATURES_FILE`): fitur `web`, `audio`, `stiker`, `media` `reminder`, `memori`, `latar`, `edit_media`, `sosial`, `python`, `skill` (semua aktif default; `workspace` belum tersedia). Kunci global owner = mati di semua chat; admin WA grup + owner mengatur per grup dalam batas itu. DM hanya mengikuti default + kunci global.
+- `ai/features.js` (file `features.json`, `FEATURES_FILE`): fitur `web`, `audio`, `stiker`, `media` `reminder`, `memori`, `latar`, `edit_media`, `sosial`, `dokumen`, `python`, `skill` (semua aktif default; `workspace` belum tersedia). Kunci global owner = mati di semua chat; admin WA grup + owner mengatur per grup dalam batas itu. DM hanya mengikuti default + kunci global.
 - Penegakan di kode, bukan prompt: tools fitur mati tidak dikirim ke GLM (`TOOL_FEATURE` di `tools.js`), `agentInstructions` ikut menyesuaikan, voice note tidak dikirim ke model audio saat `audio` mati, stiker tidak dikumpulkan/dipakai saat `stiker` mati, gambar tidak dikirim ke GLM saat `media` mati.
 - Command (`ai/features-commands.js`): di DM `/grup`, `/fitur <no>`, `/fitur <no> <fitur> on|off`, owner `/fitur global <fitur> kunci|buka`. Status admin dibaca langsung dari metadata grup setiap command. Perubahan senyap; di grup `/fitur` hanya menampilkan status. Orang asing yang bukan admin grup aktif tetap tidak dibalas.
 
@@ -168,6 +168,15 @@ Kalau WARP disconnect: `warp-cli --accept-tos connect`
 - Bawaan: `qr_code`, `grafik_data`, `kurs_mata_uang` (open.er-api + frankfurter), `cuaca` (Open-Meteo), `jadwal_sholat` (myquran/Kemenag), `hitung_keuangan`, `patungan`, `riset_perbandingan`, `ringkas_link` (+ cek hoaks), `notulen_rapat`, `stiker_kustom`. Semua API gratis tanpa key, dipanggil lewat `net` di sandbox Python.
 - Validasi API nyata: `npm run simulate:skills [-- "pesan" …]`.
 - Fitur yang dimatikan disebut di prompt ("sedang dimatikan admin/owner") supaya Grad tidak menjawab "aku nggak punya tool"; tidak berlaku untuk mode nimbrung.
+
+## Dokumen (PDF, Word, PPT, Excel)
+
+- Fitur `dokumen` (default aktif; otomatis mati bila wheel dokumen belum disiapkan → `npm run python:setup`). Parsing & pembuatan memakai library komunitas di sandbox Pyodide: pypdf, python-docx, python-pptx, openpyxl, fpdf2 (+ XlsxWriter, et_xmlfile, defusedxml, typing_extensions). `python-runner.js` memasang wheel PyPI hanya bila kode mengimpornya (`WHEEL_GROUPS`); `extra-wheels.json` versi 2 = map nama → file.
+- Masuk: `index.js` mengenali `documentMessage`/`documentWithCaptionMessage` (langsung atau di-reply), riwayat berisi `[dokumen: nama · N hlm · ukuran]` + `entry.document`. File baru diunduh saat `read_document` dipanggil (`setDocumentLoader` → `getRawDocument`, batas `DOC_MAX_MB`).
+- `ai/documents/reader.js`: kode ekstraksi konstan (parameter lewat file job JSON, nama file dari pengguna tidak pernah masuk kode), file disimpan di `inbox/` folder kerja chat, hasil di-cache `docs/<sha>.json`. Tampilan per halaman/slide/sheet/bagian, `pages` ("2-5") atau `query` (kata kunci), maks ±8.000 karakter per panggilan. Penjaga: format lama (.doc/.ppt/.xls) ditolak, path di luar folder kerja ditolak, zip bomb (>200 MB terurai / >5000 entri) ditolak, PDF ber-password ditolak.
+- PDF hasil scan: halaman dengan teks < 25 karakter dipotong jadi PDF kecil lalu dikirim ke Gemini (`DOC_OCR_MODEL`, default model telinga) lewat plugin OpenRouter `file-parser` engine `native` (±$0,0002/halaman, ±2 dtk). Batas `DOC_OCR_MAX_PAGES` per permintaan dan `DOC_OCR_DAILY_PAGES` per hari; hasil OCR ikut di-cache.
+- Keluar: file .pdf/.docx/.pptx/.xlsx/.csv yang disimpan `run_python` ke `out/` dikirim sebagai dokumen WA (kind `document`, maks 16 MB, 3 per run). Skill: `baca_dokumen`, `buat_pdf` (font DejaVu dari matplotlib, fungsi `tulis()` wajib karena `multi_cell` fpdf2 tidak kembali ke margin kiri), `buat_word`, `buat_slide`, `buat_excel`.
+- Validasi API nyata: `npm run simulate:documents -- <file> ["pertanyaan" …]`.
 
 ## Dashboard Owner (M2c)
 

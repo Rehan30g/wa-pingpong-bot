@@ -202,7 +202,7 @@ TOOLS.summarize_history = {
 };
 
 TOOLS.run_python = {
-  description: "Jalankan Python 3 di sandbox (numpy, pandas, matplotlib, pillow, sympy, qrcode). Pakai untuk hitungan presisi, olah data, grafik/gambar, QR, atau memanggil API web: `import net; r = net.get(url, params={...}); r.json()` (juga net.post(url, json=...)). Simpan gambar ke folder out/ (mis. plt.savefig('out/grafik.png'), qrcode.make(teks).save('out/qr.png')) — semua gambar di out/ otomatis dikirim ke chat tepat DI BAWAH jawaban teksmu (jadi rujuk sebagai 'di bawah', dan jangan tulis ulang isinya). File lain di folder kerja tetap tersimpan untuk chat ini. print() hasil yang kamu butuhkan; ekspresi terakhir juga dikembalikan.",
+  description: "Jalankan Python 3 di sandbox (numpy, pandas, matplotlib, pillow, sympy, qrcode, fpdf2, python-docx, python-pptx, openpyxl, pypdf). Dokumen .pdf/.docx/.pptx/.xlsx/.csv yang disimpan ke out/ dikirim ke chat sebagai file dokumen. Pakai untuk hitungan presisi, olah data, grafik/gambar, QR, atau memanggil API web: `import net; r = net.get(url, params={...}); r.json()` (juga net.post(url, json=...)). Simpan gambar ke folder out/ (mis. plt.savefig('out/grafik.png'), qrcode.make(teks).save('out/qr.png')) — semua gambar di out/ otomatis dikirim ke chat tepat DI BAWAH jawaban teksmu (jadi rujuk sebagai 'di bawah', dan jangan tulis ulang isinya). File lain di folder kerja tetap tersimpan untuk chat ini. print() hasil yang kamu butuhkan; ekspresi terakhir juga dikembalikan.",
   parameters: {
     type: "object",
     properties: { code: { type: "string", description: "kode Python lengkap" } },
@@ -213,10 +213,11 @@ TOOLS.run_python = {
   async handler({ code }, ctx) {
     if (!ctx.python) return { error: "sandbox Python tidak tersedia di chat ini" };
     const run = await ctx.python.run({ code });
-    if (run.images?.length && ctx.outbox) {
+    const produced = [...(run.images || []).map((image) => ({ ...image, kind: "image" })), ...(run.documents || []).map((doc) => ({ ...doc, kind: "document" }))];
+    if (produced.length && ctx.outbox) {
       // File yang sama ditimpa run berikutnya: kirim sekali saja (versi terbaru).
-      const paths = new Set(run.images.map((image) => image.path));
-      ctx.outbox.media = ctx.outbox.media.filter((item) => !paths.has(item.path)).concat(run.images.map((image) => ({ ...image, kind: "image" })));
+      const paths = new Set(produced.map((item) => item.path));
+      ctx.outbox.media = ctx.outbox.media.filter((item) => !paths.has(item.path)).concat(produced);
     }
     return {
       ok: run.ok,
@@ -225,6 +226,7 @@ TOOLS.run_python = {
       stderr: String(run.stderr || "").slice(0, 1_000),
       error: run.error || null,
       images_to_send: (run.images || []).map((image) => image.name),
+      documents_to_send: (run.documents || []).map((doc) => doc.name),
       files: run.files || [],
     };
   },
@@ -327,6 +329,26 @@ TOOLS.get_chat_media = {
   },
 };
 
+TOOLS.read_document = {
+  description: "Baca dokumen (PDF, Word .docx, PowerPoint .pptx, Excel .xlsx, CSV, TXT) dari pesan di riwayat (entry_id: pesan dokumen atau pesan yang me-reply dokumen) atau file di folder kerja (file, mis. 'out/laporan.pdf'). Tanpa pages/query: awal dokumen sampai batas. pages: '3', '2-5', '1,4' (halaman/slide/sheet). query: kata kunci untuk mencari bagian yang relevan di dokumen panjang. Halaman PDF hasil scan otomatis dibaca OCR. Hasilnya tersimpan, jadi membaca bagian lain dari dokumen yang sama itu murah.",
+  parameters: {
+    type: "object",
+    properties: {
+      entry_id: { type: "integer" },
+      file: { type: "string" },
+      pages: { type: "string" },
+      query: { type: "string" },
+    },
+    additionalProperties: false,
+  },
+  timeoutMs: 240_000,
+  async handler(args, ctx) {
+    if (!ctx.documents) return { error: "baca dokumen tidak tersedia di chat ini" };
+    if (!Number.isInteger(args.entry_id) && !args.file) return { error: "isi entry_id atau file" };
+    return ctx.documents(args, ctx);
+  },
+};
+
 TOOLS.use_skill = {
   description: "Muat langkah kerja lengkap sebuah skill dari daftar 'Skill' di instruksi. Panggil SEKALI di awal tugas yang cocok, lalu ikuti langkahnya dengan tools lain.",
   parameters: {
@@ -355,6 +377,7 @@ const TOOL_FEATURE = { web_fetch: "web", listen_audio: "audio", send_sticker: "s
   start_background_task: "latar",
   background_tasks: "latar",
   use_skill: "skill",
+  read_document: "dokumen",
   remember: "memori", recall: "memori", forget: "memori", note_write: "memori", note_read: "memori", note_list: "memori", summarize_history: "memori" };
 
 function featureOn(ctx, feature) {
@@ -377,6 +400,7 @@ function toolNamesFor(ctx = {}) {
     if (name === "start_background_task" || name === "background_tasks") return Boolean(ctx.background);
     if (name === "summarize_history") return Boolean(ctx.notebook && ctx.getHistory);
     if (name === "use_skill") return Boolean(ctx.skills?.names().length);
+    if (name === "read_document") return Boolean(ctx.documents);
     return true;
   });
 }

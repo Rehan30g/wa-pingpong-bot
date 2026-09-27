@@ -20,7 +20,7 @@ Panduan teknis lengkap proyek ada di AGENTS.md (dimuat otomatis di bawah). File 
 
 ## Jebakan yang sudah pernah terjadi
 
-- Menyisipkan kode lewat heredoc + string JS sering menghilangkan backslash (`\d`, `\n`) — untuk regex dan template literal pakai Edit langsung, lalu `node --check`.
+- Menyisipkan kode lewat heredoc + string JS sering menghilangkan backslash (`\d`, `\n`) atau mengubah `\b` menjadi karakter backspace tak terlihat — untuk regex dan template literal pakai Edit/Write langsung, lalu `node --check` (cek juga `grep -c $'\x08' <file>`).
 - Parser env: `Number("")` = 0; pakai pola `envNumber` yang mengabaikan string kosong. Di tes, pulihkan env dengan `delete` bila nilai lama `undefined`.
 - GLM mengabaikan `response_format` saat tools aktif → jawaban akhir loop teks bebas + penanda `[[reply:#id]]`.
 - DNS lokal bisa mengembalikan IPv6 privat (`fd00::`) bersama IPv4 publik; `resolvePublic` memilih yang publik.

@@ -17,6 +17,7 @@ const FEATURES = {
   latar: { label: "Tugas latar panjang (subagent)", default: true, available: true },
   edit_media: { label: "Edit video/audio/GIF & stiker animasi", default: true, available: true },
   sosial: { label: "Nimbrung tanpa dipanggil", default: true, available: true },
+  dokumen: { label: "Baca & buat dokumen (PDF, Word, PPT, Excel)", default: true, available: true },
   workspace: { label: "File workspace grup", default: false, available: false, lockedByDefault: true },
   // Python aktif default: sandbox sudah terisolasi (tanpa file bot, env, atau jaringan langsung).
   python: { label: "Python sandbox (hitung, grafik, QR, API)", default: true, available: true },
