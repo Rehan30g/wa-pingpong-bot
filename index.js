@@ -22,6 +22,7 @@ const fs = require("fs");
 const groupAgent = require("./ai/group-agent");
 const directAgent = require("./ai/direct-agent");
 const memoryStore = require("./ai/memory-store");
+const identity = require("./ai/agent/identity");
 const scheduler = require("./ai/scheduler");
 const { extractVideoFrame } = require("./ai/media/video-frame");
 const { initGlobalLifecycle, getGlobalLifecycle } = require("./ai/runtime/lifecycle");
@@ -35,6 +36,7 @@ const featureSettings = require("./ai/features");
 const proactiveState = require("./ai/agent/proactive");
 const { handleFeatureCommand } = require("./ai/features-commands");
 const { formatDuration } = require("./ai/audio/ears");
+const motion = require("./ai/media/motion");
 
 const DATA_FILE = process.env.BOT_DATA_FILE || "./data.json";
 let data = { owner: null, allowedGroups: [], vetoAccess: {} };
@@ -144,6 +146,60 @@ async function shutdownRuntime() {
   }
 }
 
+// ---------- Kirim ulang untuk penerima yang gagal dekripsi (27 Sep) ----------
+// Tanpa getMessage, permintaan kirim ulang dari HP penerima tidak bisa dilayani dan
+// pesan bot tertahan "Menunggu pesan ini" (terlihat di DM teman owner).
+const SENT_STORE_MAX = 2_000;
+const SENT_STORE_TTL_MS = 24 * 3_600_000;
+const sentMessages = new Map(); // id → { message, at }
+
+function rememberSentMessage(sent) {
+  const id = sent?.key?.id;
+  if (!id || !sent.message) return;
+  sentMessages.set(id, { message: sent.message, at: Date.now() });
+  while (sentMessages.size > SENT_STORE_MAX) sentMessages.delete(sentMessages.keys().next().value);
+}
+
+async function getStoredMessage(key) {
+  const item = key?.id ? sentMessages.get(key.id) : null;
+  if (!item || Date.now() - item.at > SENT_STORE_TTL_MS) return undefined;
+  return item.message;
+}
+
+// ---------- Alamat DM: LID vs nomor HP (27 Sep) ----------
+// WhatsApp memindahkan chat ke LID. Kalau orang chat lewat LID tapi bot membalas ke
+// nomor@s.whatsapp.net, dua sesi enkripsi bentrok: log "Closing session" tiap balasan,
+// "Bad MAC", dan di HP penerima "Menunggu pesan ini" (kasus DM teman owner).
+function rememberDmRoute(phone, chatJid) {
+  const key = memoryStore.normalizePhone(phone);
+  const route = String(chatJid || "");
+  if (!/^\d{8,15}$/.test(key) || !/@(lid|s\.whatsapp\.net)$/.test(route)) return;
+  if (memoryStore.getDmMemory(key).chat_jid !== route) memoryStore.setDmMemory(key, { chat_jid: route });
+}
+
+function routeDmJid(jid) {
+  const value = String(jid || "");
+  const match = value.match(/^(\d{8,15})@s\.whatsapp\.net$/);
+  if (!match) return jid;
+  const person = memoryStore.getPerson(match[1]);
+  return person?.dm?.chat_jid || jid;
+}
+
+// CacheStore sederhana (get/set/del/flushAll) untuk penghitung retry Baileys.
+function simpleCacheStore(max = 5_000) {
+  const map = new Map();
+  return {
+    get: (key) => map.get(key),
+    set: (key, value) => {
+      map.set(key, value);
+      while (map.size > max) map.delete(map.keys().next().value);
+    },
+    del: (key) => map.delete(key),
+    flushAll: () => map.clear(),
+  };
+}
+const msgRetryCounterCache = simpleCacheStore();
+
 async function startBot() {
   await initRuntime({ sock });
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
@@ -158,7 +214,17 @@ async function startBot() {
     // Bot terlihat online supaya receipt "delivered" aktif:
     // pesan pengguna mendapat centang abu-abu begitu diterima bot.
     markOnlineOnConnect: true,
+    getMessage: getStoredMessage,
+    msgRetryCounterCache,
+    cachedGroupMetadata: async (jid) => groupMetadataCache.get(jid)?.value,
   });
+  // Simpan setiap pesan keluar supaya bisa dikirim ulang bila penerima gagal dekripsi.
+  const rawSendMessage = sock.sendMessage.bind(sock);
+  sock.sendMessage = async (jid, ...rest) => {
+    const sent = await rawSendMessage(routeDmJid(jid), ...rest);
+    rememberSentMessage(sent);
+    return sent;
+  };
 
   sock.ev.on("creds.update", saveCreds);
   sock.ev.on("groups.update", (updates) => {
@@ -570,11 +636,16 @@ async function getAiMedia(m) {
     const { kind, format } = classifyAiMedia(media);
     if (media.type === "video") {
       const frame = await extractVideoFrame(buffer);
-      return {
+      const result = {
         type: "video", kind, format,
         durationSeconds: Number(media.msg.seconds) || null,
         frameDataUrl: frame ? `data:image/jpeg;base64,${frame.toString("base64")}` : null,
       };
+      // GIF ditonton "mata gerak" setelah lolos gerbang izin (addMediaMotion), lalu buffernya dibuang.
+      if (format === "gif" && buffer.length <= motion.motionConfig().maxInputBytes) {
+        Object.defineProperty(result, "motionSource", { value: { buffer, key: stickerSha(media.msg.fileSha256) }, enumerable: false, configurable: true, writable: true });
+      }
+      return result;
     }
     const mime = media.type === "video"
       ? (String(media.msg.mimetype || "").startsWith("video/") ? media.msg.mimetype : "video/mp4")
@@ -586,11 +657,63 @@ async function getAiMedia(m) {
   }
 }
 
+/**
+ * "Mata gerak": stiker animasi/GIF ditonton Gemini sebagai video diperlambat,
+ * hasilnya (media.motion) menjadi teks riwayat untuk Jev & GLM. Panggil hanya
+ * untuk grup diizinkan / DM whitelist dengan fitur media aktif (ada biaya API).
+ */
+async function addMediaMotion(media, m) {
+  if (!media) return media;
+  const source = media.motionSource;
+  delete media.motionSource;
+  try {
+    if (media.kind === "sticker" && typeof media.dataUrl === "string") {
+      const direct = unwrapMediaWrappers(m?.message)?.stickerMessage;
+      const quoted = unwrapMediaWrappers(getContextInfo(m || {})?.quotedMessage)?.stickerMessage;
+      const buffer = Buffer.from(media.dataUrl.split(",")[1] || "", "base64");
+      const result = await motion.motionFor({ key: stickerSha((direct || quoted)?.fileSha256), buffer, kind: "sticker", store: getStickerCollector() });
+      if (result) media.motion = result;
+    } else if (source) {
+      const result = await motion.motionFor({ key: source.key, buffer: source.buffer, kind: "gif" });
+      if (result) media.motion = result;
+    }
+  } catch (error) {
+    console.warn("[MOTION] Dilewati:", error.message);
+  }
+  return media;
+}
+
+function dropMotionSource(media) {
+  if (media) delete media.motionSource;
+  return media;
+}
+
 // get_chat_media mengunduh ulang media pesan lama yang sudah dibuang dari riwayat.
-groupAgent.setMediaLoader(getAiMedia);
+groupAgent.setMediaLoader(async (ref) => addMediaMotion(await getAiMedia(ref), ref));
 groupAgent.setRawMediaLoader(getRawMedia);
 groupAgent.setDocumentLoader(getRawDocument);
 // save_sticker mengunduh stiker yang di-reply bila belum pernah terkumpul.
+// Membuang stiker lewat chat memengaruhi koleksi lintas grup: hanya owner,
+// admin WA grup itu, atau pemegang veto grup itu. Di DM hanya owner.
+groupAgent.setStickerManagerCheck(async ({ chatId, senderId, isDm }) => {
+  if (data.owner && identitiesMatch(senderId, data.owner)) return true;
+  if (isDm || !senderId || !data.allowedGroups.includes(chatId)) return false;
+  if (groupVetoUsers(chatId).some((allowed) => identitiesMatch(allowed, senderId))) return true;
+  const metadata = await getGroupMetadataSafe(chatId);
+  return Boolean(metadata && isAdminParticipant(metadata, senderId));
+});
+// DM ⇄ grup: daftar grup aktif beserta namanya (untuk konteks DM & titip pesan).
+groupAgent.setGroupDirectory(async () => Promise.all(data.allowedGroups.map(async (id) => ({
+  id,
+  subject: (await getGroupMetadataSafe(id))?.subject || id,
+}))));
+// Tag orang: nomor → JID anggota di grup itu (grup LID memakai id LID).
+require("./ai/agent/mentions").setMentionJidResolver(async (groupId, phone) => {
+  const metadata = await getGroupMetadataSafe(groupId);
+  const participant = participantForIdentity(metadata, `${phone}@s.whatsapp.net`);
+  if (metadata && !participant) return null;
+  return participant?.id || `${phone}@s.whatsapp.net`;
+});
 groupAgent.setStickerDownloader((stickerMessage) => downloadMedia({ message: { stickerMessage } }, { maxBytes: 2 * 1_048_576 }));
 
 // Voice note langsung dan yang di-reply → teks transkrip + mp3 untuk listen_audio.
@@ -675,17 +798,24 @@ function visualPlaceholder(m) {
   return "";
 }
 
-// Teks riwayat untuk stiker manusia; stiker yang ada di koleksi Grad diberi maknanya.
-async function stickerHistoryText(m) {
+// Teks riwayat untuk stiker manusia; stiker yang ada di koleksi Grad diberi maknanya,
+// stiker animasi diberi deskripsi gerakan dari "mata gerak".
+async function stickerHistoryText(m, media = null) {
   const sticker = unwrapMediaWrappers(m.message)?.stickerMessage;
   const sha = sticker ? stickerSha(sticker.fileSha256) : null;
-  if (!sha) return "[mengirim stiker]";
-  try {
-    const label = await getStickerLibrary().labelFor(sha);
-    return label ? `[mengirim stiker: ${label}]` : "[mengirim stiker]";
-  } catch {
-    return "[mengirim stiker]";
+  let label = null;
+  if (sha) {
+    try {
+      label = await getStickerLibrary().labelFor(sha);
+    } catch {}
   }
+  if (media?.motion) return motion.motionHistoryText({ kind: "sticker", label, motion: media.motion });
+  return label ? `[mengirim stiker: ${label}]` : "[mengirim stiker]";
+}
+
+function videoHistoryText(media) {
+  if (media?.format === "gif" && media.motion) return motion.motionHistoryText({ kind: "gif", motion: media.motion });
+  return media?.format === "gif" ? "[mengirim GIF]" : "[mengirim video]";
 }
 
 async function runLegacyMessageFlow({
@@ -862,20 +992,27 @@ async function runLegacyMessageFlow({
 
 // ===== CHAT PRIBADI (DM) =====
   if (!isGroup) {
+    // Ingat alamat chat yang dipakai orang ini (LID atau nomor); semua DM keluar
+    // diarahkan ke sana (lihat routeDmJid) supaya sesi enkripsinya tidak bentrok.
+    if (senderPhoneVerified) rememberDmRoute(senderJid, jid);
     // Perintah tidak dikenal di DM diabaikan; media tanpa caption tetap diproses.
     if (text.startsWith("/")) return;
     // Fitur "media" mati: gambar/video tidak diunduh untuk AI, cukup penanda teks.
     const dmMediaOn = featureSettings.isEnabled(`${memoryStore.normalizePhone(senderJid)}@s.whatsapp.net`, "media");
     const dmMedia = dmMediaOn ? earlyMedia || (await getAiMedia(m)) : null;
+    // Gerakan hanya dibaca untuk lawan chat yang boleh dibalas (hemat & aman).
+    if (voicePermitted) await addMediaMotion(dmMedia, m);
+    else dropMotionSource(dmMedia);
     const dmVisual = !dmMediaOn && visualPlaceholder(m);
     const dmDocument = messageDocument(m);
     if (!text && !dmMedia && !dmVisual && !dmDocument) return;
+    if (fromOwner) identity.noteOwner({ phone: senderJid, name: m.pushName || senderTag });
     await directAgent.processDirectMessage({
       sock,
       message: m,
       phone: senderJid,
       senderName: m.pushName || senderTag,
-      text: dmDocument && !dmDocument.quoted ? [text, documentLabel(dmDocument)].filter(Boolean).join(" ") : text || dmVisual || (dmMedia?.kind === "sticker" ? await stickerHistoryText(m) : dmMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+      text: dmDocument && !dmDocument.quoted ? [text, documentLabel(dmDocument)].filter(Boolean).join(" ") : text || dmVisual || (dmMedia?.kind === "sticker" ? await stickerHistoryText(m, dmMedia) : dmMedia?.type === "video" ? videoHistoryText(dmMedia) : "[mengirim gambar]"),
       quotedText,
       media: dmMedia,
       document: dmDocument,
@@ -1027,7 +1164,7 @@ async function runLegacyMessageFlow({
   // ----- AI GROUP AGENT -----
   // Jev memilih diam/react/jawab; GLM hanya dipanggil untuk menulis jawaban.
   const mediaOn = featureSettings.isEnabled(jid, "media");
-  const aiMedia = mediaOn ? earlyMedia || (await getAiMedia(m)) : null;
+  const aiMedia = mediaOn ? await addMediaMotion(earlyMedia || (await getAiMedia(m)), m) : (dropMotionSource(earlyMedia), null);
   const visual = !mediaOn && visualPlaceholder(m);
   const aiDocument = messageDocument(m);
   if (!text && !aiMedia && !visual && !aiDocument) return;
@@ -1044,6 +1181,8 @@ async function runLegacyMessageFlow({
   // membalas/ memulai DM hanya kepada mereka.
   if (senderPhoneVerified) {
     memoryStore.recordParticipant({ phone: senderJid, name: m.pushName || senderTag, groupId: jid, at: groupAgent.witTimestamp() });
+    // Grad perlu tahu nomor HP owner-nya (data.json sering menyimpan LID).
+    if (fromOwner) identity.noteOwner({ phone: senderJid, name: m.pushName || senderTag });
   } else {
     console.warn(`[AI] PN pengirim belum terverifikasi; LID tidak dimasukkan whitelist DM (${senderJid})`);
   }
@@ -1054,7 +1193,7 @@ async function runLegacyMessageFlow({
     groupId: jid,
     senderId: senderPhoneVerified ? senderJid : "nomor-tidak-diketahui",
     senderName: m.pushName || senderTag,
-    text: aiDocument && !aiDocument.quoted ? [decoratedText, documentLabel(aiDocument)].filter(Boolean).join(" ") : decoratedText || visual || (aiMedia?.kind === "sticker" ? await stickerHistoryText(m) : aiMedia?.type === "video" ? "[mengirim video]" : "[mengirim gambar]"),
+    text: aiDocument && !aiDocument.quoted ? [decoratedText, documentLabel(aiDocument)].filter(Boolean).join(" ") : decoratedText || visual || (aiMedia?.kind === "sticker" ? await stickerHistoryText(m, aiMedia) : aiMedia?.type === "video" ? videoHistoryText(aiMedia) : "[mengirim gambar]"),
     explicitMention,
     replyToBot,
     media: aiMedia,
@@ -1269,6 +1408,13 @@ module.exports = {
   classifyAiMedia,
   mediaFileLength,
   unwrapMediaWrappers,
+  addMediaMotion,
+  getStoredMessage,
+  rememberSentMessage,
+  rememberDmRoute,
+  routeDmJid,
+  stickerHistoryText,
+  videoHistoryText,
   resetData: () => { data = { owner: null, allowedGroups: [], vetoAccess: {} }; groupMetadataCache.clear(); saveData(); },
   setSock: (s) => { sock = s; groupMetadataCache.clear(); },
   games,

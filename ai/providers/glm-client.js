@@ -1,4 +1,5 @@
 const { createOpenRouterClient, OpenRouterError } = require("./openrouter-client");
+const providerPicker = require("./provider-picker");
 
 function sanitizeVideoParts(messages, supportsVideoDataUrl = false) {
   if (supportsVideoDataUrl || !Array.isArray(messages)) return messages;
@@ -23,11 +24,47 @@ function sanitizeVideoParts(messages, supportsVideoDataUrl = false) {
   });
 }
 
+// Pilihan provider OpenRouter per jenis langkah (2 Okt 2026). Tanpa preferensi,
+// OpenRouter condong ke provider termurah (OpenInference fp4, ±19 token/dtk) dan
+// obrolan singkat bisa 10 detik. Nilai env: kosong/"auto" = dipilih dari statistik
+// live OpenRouter (provider-picker.js, cadangan daftar di bawah selama statistik
+// belum termuat), "openrouter" = routing bawaan OpenRouter (termurah),
+// "latency"/"throughput"/"price" = urutan dinamis OpenRouter, atau daftar tag
+// provider dipisah koma (diurutkan, tetap boleh jatuh ke provider lain bila error/429).
+//  - fast: langkah pertama tanpa tool (obrolan, jawaban singkat)
+//  - balanced: langkah lanjutan tugas bertool (konteks panjang, harga input penting)
+// Cadangan dari `npm run bench:providers` 2 Okt (35 provider, prompt Grad asli, 3×):
+// Together p50 0,8 dtk (bawaan OpenRouter 5,7 dtk, plus typo & "lo/lu" dari fp4 murahan),
+// StreamLake fp8 termurah di antara yang cepat (±$0,00017/panggilan, 1,1–2,2 dtk).
+const DEFAULT_PROVIDER_TIERS = {
+  fast: "together,io-net/fp8,friendli,deepinfra/fp4",
+  balanced: "streamlake/fp8,together,deepinfra/fp4",
+};
+
+function providerPreference(tier, live = null) {
+  if (!tier) return null;
+  const key = `GLM_PROVIDER_${String(tier).toUpperCase()}`;
+  let raw = String(process.env[key] ?? "").trim() || "auto";
+  if (raw === "auto") {
+    const order = live ? providerPicker.rankedOrder(tier, live) : null;
+    if (order?.length) return { order, allow_fallbacks: true };
+    raw = String(DEFAULT_PROVIDER_TIERS[tier] ?? "").trim();
+  }
+  if (!raw || raw === "openrouter") return null;
+  if (["latency", "throughput", "price"].includes(raw)) return { sort: raw, allow_fallbacks: true };
+  const order = raw.split(",").map((item) => item.trim()).filter(Boolean);
+  return order.length ? { order, allow_fallbacks: true } : null;
+}
+
 function createGlmClient(options = {}) {
   const defaultModel = options.model || process.env.CHAT_MODEL || "z-ai/glm-5.3-flash";
   const defaultReasoningEffort = options.reasoningEffort || process.env.GLM_REASONING_EFFORT || "low";
   const defaultSupportsVideo = options.supportsVideoDataUrl ?? (process.env.AI_PROVIDER_SUPPORTS_VIDEO === "true");
   const openrouterClient = options.client || createOpenRouterClient(options);
+  const fetchProviderStats = async (model) => {
+    const response = await openrouterClient.httpClient.get(`/api/v1/models/${model}/endpoints`, { timeout: 10_000 });
+    return response.data?.data?.endpoints || [];
+  };
 
   async function chatCompletion({
     model = defaultModel,
@@ -39,6 +76,7 @@ function createGlmClient(options = {}) {
     temperature = 0.3,
     reasoningEffort = defaultReasoningEffort,
     supportsVideoDataUrl = defaultSupportsVideo,
+    tier = null,
     signal,
   }) {
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -71,8 +109,13 @@ function createGlmClient(options = {}) {
       payload.response_format = responseFormat;
     }
 
+    const provider = providerPreference(tier, { model, fetchEndpoints: fetchProviderStats });
+    if (provider) payload.provider = provider;
+
     const response = await openrouterClient.post("/api/v1/chat/completions", payload, signal ? { signal } : undefined);
     const latencyMs = Date.now() - start;
+    // Belajar dari kenyataan: provider di depan yang dilewati (429/error) diturunkan sementara.
+    if (provider?.order && response?.provider) providerPicker.noteServed(provider.order, response.provider, Date.now(), model);
 
     if (!response || typeof response !== "object") {
       throw new OpenRouterError("Respons GLM bukan objek JSON valid", {
@@ -164,6 +207,8 @@ function createGlmClient(options = {}) {
 }
 
 module.exports = {
+  DEFAULT_PROVIDER_TIERS,
   createGlmClient,
+  providerPreference,
   sanitizeVideoParts,
 };

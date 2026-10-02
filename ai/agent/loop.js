@@ -1,7 +1,7 @@
 // Agent loop (Plan v2 §3, M1): GLM dipanggil dengan tools; setiap hasil tool
 // dilihat GLM sebelum langkah berikutnya. Obrolan biasa = satu panggilan tanpa
 // tool. Kode yang menegakkan batas langkah, waktu, budget, dan pembatalan.
-const { executeTool, toolDefinitions } = require("./tools");
+const { executeTool, toolDefinitions, REACTION_EMOJIS } = require("./tools");
 const { parseFinalReply } = require("./format");
 const { formatWit } = require("./schedules");
 const skillLibrary = require("../skills");
@@ -34,8 +34,22 @@ function isEmojiOnly(text) {
   return Boolean(value) && !/[\p{L}\p{N}]/u.test(value);
 }
 
+// Model per jenis langkah (owner 2 Okt: "gabungkan sesuai kebutuhan kerja"). Simulasi
+// ghost-hunter: DeepSeek V4.1 Flash lebih paham dialek & lebih natural untuk obrolan
+// (p50 1,8 vs 2,6 dtk), GLM lebih tertib memakai tool dan hitungan bertahap. Tier fast
+// (Jev: quick, belum ada tool) → CHAT_MODEL_FAST; tier balanced (Jev: elaborate, atau
+// setelah tool dipakai) → model tugas (CHAT_MODEL). CHAT_MODEL_FAST=off = satu model saja.
+const DEFAULT_FAST_MODEL = "deepseek/deepseek-v4.1-flash";
+
+function chatModelFor(tier, taskModel) {
+  if (tier !== "fast") return taskModel;
+  const raw = String(process.env.CHAT_MODEL_FAST || "").trim();
+  if (raw === "off" || raw === "same") return taskModel;
+  return raw || DEFAULT_FAST_MODEL;
+}
+
 // Tool lokal yang selesai seketika; tidak memicu pesan progres.
-const INSTANT_TOOLS = new Set(["send_sticker", "save_sticker", "send_to_my_dm", "start_background_task", "background_tasks", "schedule", "list_schedules", "cancel_schedule", "remember", "recall", "forget", "note_write", "note_read", "note_list", "summarize_history", "use_skill"]);
+const INSTANT_TOOLS = new Set(["react", "stay_silent", "tell_group", "send_sticker", "save_sticker", "remove_sticker", "send_to_my_dm", "start_background_task", "background_tasks", "schedule", "list_schedules", "cancel_schedule", "remember", "recall", "forget", "note_write", "note_read", "note_list", "summarize_history", "use_skill"]);
 const PROGRESS_TEXTS = ["bentar ya", "sebentar, lagi kukerjain", "tunggu bentar ya", "oke, bentar ya"];
 const LONG_PROGRESS_TEXTS = ["masih aku kerjain ya, dikit lagi", "masih jalan nih, bentar lagi kelar"];
 const pick = (items) => items[Math.floor(Math.random() * items.length)];
@@ -44,16 +58,16 @@ const pick = (items) => items[Math.floor(Math.random() * items.length)];
 // informasi dengan beberapa data dipecah per baris supaya tidak jadi paragraf padat.
 const STYLE_GUIDE = [
   "Sesuaikan BENTUK jawaban dengan isinya (format WhatsApp: tebal pakai *satu bintang*, daftar pakai •; tanpa heading, tabel, atau link Markdown):",
-  "(1) Obrolan, candaan, konfirmasi: satu kalimat natural tanpa format.",
+  "(1) Obrolan, candaan, konfirmasi: super pendek gaya chat (beberapa kata sampai satu kalimat), tanpa format.",
   "(2) Satu fakta/jawaban tunggal: satu atau dua kalimat, angka atau jawaban kuncinya boleh *tebal*.",
-  "(3) Informasi dengan 2 data atau lebih (harga beberapa varian, perbandingan, langkah, jadwal, daftar, ringkasan): kalimat pembuka pendek yang langsung menjawab inti, lalu satu poin per baris diawali • dengan label *tebal* di depan, lalu bila perlu satu baris catatan singkat. Pisahkan pembuka, daftar, dan catatan dengan baris kosong. Tiap poin pendek (idealnya kurang dari 60 karakter). Jangan menjejalkan beberapa angka dalam satu kalimat panjang.",
-  "Langkah-langkah boleh bernomor (1. 2. 3.). Jangan membuka dengan basa-basi seperti 'Sini, aku bantu' atau mengulang pertanyaan.",
+  "(3) Informasi dengan 2 data atau lebih (harga beberapa varian, perbandingan, langkah, jadwal, daftar, ringkasan): kalimat pembuka pendek gaya chat yang langsung menjawab inti, lalu satu poin per baris diawali • dengan label *tebal* di depan (ejaan & kapital rapi), lalu kesimpulan/saran satu baris (celetukan hanya sesekali, kalau ada bahan nyata). Pisahkan bagian dengan baris kosong. Tiap poin pendek (idealnya kurang dari 60 karakter). Jangan menjejalkan beberapa angka dalam satu kalimat panjang.",
+  "Langkah-langkah boleh bernomor (1. 2. 3.). Jangan membuka dengan basa-basi atau mengulang pertanyaan.",
   "Kalau memakai sumber web, taruh maksimal 2 URL polos di baris terakhir.",
-  "Contoh bentuk (3):\nXiaomi 14T sekarang sekitar *Rp5,9–7 juta*, tergantung varian:\n\n• *12/256GB*: Rp5,9–6,5 juta\n• *12/512GB*: Rp6,5–7 juta\n\nHarga rilisnya dulu Rp8–9 jutaan, jadi sudah turun lumayan.\nhttps://contoh.com/artikel",
+  "Contoh bentuk (3), Budi tanya 'grad bandingin iphone 15 sama samsung s24 dong, mending mana buat foto':\nbuat foto dua-duanya oke sih, beda karakter aja:\n\n• *iPhone 15*: warna natural, video paling stabil\n• *Galaxy S24*: warna cerah, zoom 3x lebih jauh\n• *Harga*: S24 ±Rp1 juta lebih murah\n\nkalo sering foto konser/zoom ambil S24, kalo lebih sering bikin video iPhone 15",
 ].join("\n");
 
 // Instruksi tambahan untuk system prompt GLM di mode agen (grup dan DM).
-function agentInstructions({ maxReplyChars, maxTaskReplyChars = loopConfig().maxTaskReplyChars, hasAudio = false, hasStickers = false, canSaveStickers = false, toolsDisabled = false, features = null, explainOff = true } = {}) {
+function agentInstructions({ maxReplyChars, maxTaskReplyChars = loopConfig().maxTaskReplyChars, hasAudio = false, hasStickers = false, canSaveStickers = false, canReact = false, toolsDisabled = false, features = null, explainOff = true } = {}) {
   // Instruksi mengikuti fitur M2b yang aktif di chat ini (null = semua aktif).
   const on = (name) => !features || features.has(name);
   const skills = !toolsDisabled && on("skill") ? skillLibrary.forFeatures(features) : null;
@@ -67,16 +81,19 @@ function agentInstructions({ maxReplyChars, maxTaskReplyChars = loopConfig().max
       ? "Saat ini tools tidak tersedia; jawab dari pengetahuan dan konteks yang ada, dan jujur kalau butuh data terbaru."
       : [
         "Kamu punya tools. Untuk obrolan biasa JANGAN pakai tools, langsung jawab.",
+        "Kalau pesan yang kamu tanggapi tidak pantas dijawab sama sekali (didesak ngobrol mesum setelah kamu tegur, minta konten porno, pelecehan, pancingan menghina orang), panggil stay_silent; jangan pakai untuk pertanyaan biasa.",
+        canReact ? "Kamu sendiri yang memilih bentuk tanggapan: teks, stiker, atau cukup reaction lewat tool react (lalu jawaban akhir KOSONG) untuk pengakuan singkat tanpa permintaan seperti 'oke', 'sip', 'makasih', atau tawa. Pesan singkat yang berisi permintaan ('iyap, simpan dong', 'oke kirim', 'boleh, lanjut') WAJIB dikerjakan, bukan cuma diberi reaction. Kalau pengguna mengajak main/tebak-tebakan atau bilang akan mengirim sesuatu, jawab singkat bahwa kamu siap; jangan menebak atau mengirim stiker sebelum hal itu dikirim." : "",
         on("web")
           ? "Pakai web_search untuk fakta terbaru, harga, berita, jadwal, skor, atau hal yang kamu tidak yakin. Boleh mencari beberapa kali dan membandingkan. Pakai web_fetch untuk membaca link yang dikirim pengguna sebelum merangkumnya; jangan menebak isi link."
           : "Pencarian dan pembacaan web dimatikan admin di chat ini: jangan mengaku sudah mengecek internet, jujur kalau butuh data terbaru, dan jangan menebak isi link.",
         hasAudio && on("audio") ? `Voice note di riwayat sudah ditranskrip. Pakai listen_audio hanya kalau butuh detail yang tidak ada di transkrip (lagu, nada, suara latar). Judul lagu dari listen_audio hanyalah tebakan${on("web") ? ": verifikasi dengan web_search memakai potongan liriknya sebelum menyebut judul" : ""}.` : "",
-        hasStickers && on("stiker") ? "Kamu punya koleksi stiker sendiri (daftar 'Koleksi stiker') dan suka memakainya seperti member grup biasa. Saat obrolan santai, bercanda, menggoda, curhat ringan, bosan, senang, atau cukup dibalas ekspresi, UTAMAKAN membalas dengan stiker yang maknanya cocok lewat send_sticker: placement 'only' sebagai pengganti balasan (jawaban akhirmu harus kosong, tanpa teks maupun emoji), atau 'after_text' sebagai pelengkap teks yang memang berisi. Kira-kira satu dari tiga balasan santai pantas memakai stiker. Kalau pengguna hanya memintamu mengirim/memakai stiker, selalu pakai 'only'. Jangan pakai stiker untuk jawaban informatif atau topik serius (duka, konflik, kesehatan)." : "",
-        canSaveStickers && on("stiker") ? "Kalau ada yang memintamu menyimpan stiker (me-reply stiker atau menunjuk pesan #), pakai save_sticker: lihat stikernya dulu, nilai keamanannya jujur, beri label dan mood yang pas. Kalau diminta langsung memakainya, setelah tersimpan kirim dengan send_sticker. Jangan menyimpan stiker yang tidak diminta lewat tool ini." : "",
-        on("python") ? "Untuk hitungan yang perlu presisi, olah data, grafik, gambar, QR, atau memanggil API web, pakai run_python (gambar yang disimpan ke out/ otomatis terkirim tepat di bawah pesanmu; jangan kirim ulang lewat teks). Jelaskan hasilnya singkat." : "",
+        hasStickers && on("stiker") ? "Kamu punya koleksi stiker sendiri (daftar 'Koleksi stiker') dan suka memakainya seperti member grup biasa. Saat obrolan santai, bercanda, menggoda, curhat ringan, bosan, senang, atau cukup dibalas ekspresi, UTAMAKAN membalas dengan stiker yang maknanya cocok lewat send_sticker: placement 'only' sebagai pengganti balasan (jawaban akhirmu harus kosong, tanpa teks maupun emoji), atau 'after_text' sebagai pelengkap teks yang memang berisi. Kira-kira satu dari tiga balasan santai pantas memakai stiker. Kalau pengguna hanya memintamu mengirim/memakai stiker, selalu pakai 'only'. Jangan pakai stiker untuk jawaban informatif atau topik serius (duka, konflik, kesehatan). Kalau diminta menghapus/membuang stiker dari koleksimu, pakai remove_sticker (all=true untuk semua); jangan bilang kamu tidak bisa." : "",
+        canSaveStickers && on("stiker") ? "Kalau ada yang memintamu menyimpan stiker (me-reply stiker atau menunjuk pesan #), pakai save_sticker: lihat stikernya dulu, nilai keamanannya jujur, beri label dan mood yang pas. Kalau diminta menyimpan beberapa stiker, lihat SETIAP stiker (yang tidak terlampir ambil dengan get_chat_media) dan beri label dari gambarnya masing-masing; jangan menyalin label stiker lain. Untuk stiker animasi/GIF, gambar yang kamu lihat hanya satu frame: tentukan makna dan mood dari deskripsi gerakannya (tertulis 'gerakan: …' di riwayat atau hasil get_chat_media). Kalau diminta langsung memakainya, setelah tersimpan kirim dengan send_sticker. Jangan menyimpan stiker yang tidak diminta lewat tool ini." : "",
+        // Kasus Ghost hunter emas & validasi 2 Okt: dihitung di kepala, untung 97rb jadi "rugi 97rb".
+        on("python") ? "Hitungan UANG (untung/rugi, modal, margin, patungan, cicilan, total belanja) WAJIB dihitung dengan run_python, jangan di kepala; tulis rumusnya (pemasukan − modal) dan tanda untung/rugi dari hasil kode. Pertahankan satuan pengguna: kalau dia menulis '245' maksudnya 245rb, jawab '97rb' atau '4,94 jt', jangan 'Rp97' atau 'Rp4.940'. Untuk hitungan lain yang perlu presisi, olah data, grafik, gambar, QR, atau memanggil API web, pakai run_python (gambar yang disimpan ke out/ otomatis terkirim tepat di bawah pesanmu; jangan kirim ulang lewat teks). Jelaskan hasilnya singkat." : "",
         on("edit_media") ? "Untuk mengolah video/GIF/audio/stiker kiriman (jadiin stiker, potong, kompres, ambil lagu/frame, tambah teks, percepat, gabung) pakai media_edit dengan entry_id pesan medianya; hasil terkirim di bawah pesanmu, jadi cukup satu kalimat pengantar. Pilih sumber dengan teliti: pesan yang di-reply; kalau tidak ada, media terbaru dari peminta yang JENISNYA cocok ('video ini', 'audionya', 'ambil lagunya' = video/GIF terakhir, bukan voice note, kecuali voice note disebut jelas). Untuk mengolah hasil yang sudah kamu kirim (mis. 'QR tadi jadiin stiker'), pakai sources {file: 'out/<nama>'} dari folder kerja; JANGAN membuat ulang file itu dengan run_python." : "",
         on("dokumen") ? "Pesan bertanda [dokumen: …] adalah file PDF/Word/PPT/Excel: kalau diminta meringkas, menjawab, atau mencari isinya, baca dulu dengan read_document (entry_id pesan dokumennya), jangan menebak dari nama file. Untuk dokumen panjang pakai query atau pages. Untuk MEMBUAT dokumen (PDF, Word, slide, Excel) pakai run_python dan simpan ke out/; file terkirim di bawah pesanmu." : "",
-        "Kalau peminta minta hasilnya dikirim ke DM/japri-nya, pakai send_to_my_dm (hanya ke DM dia sendiri, tidak bisa ke orang atau grup lain).",
+        "Kalau peminta minta hasilnya dikirim ke DM/japri-nya, pakai send_to_my_dm (hanya ke DM dia sendiri, tidak bisa ke orang atau grup lain). Kalau hanya sebagian hasil yang ke DM (mis. 'yang kuning kirim ke DM'), buat semua file dulu dengan nama yang jelas, lalu isi files dengan file untuk DM saja; sisanya otomatis ke grup. Sebut pembagiannya sesuai dm_files/group_files dari hasil tool. Permintaan beberapa varian ('jadi ungu dan kuning', 'versi A dan B') artinya file terpisah per varian dengan nama jelas, apalagi kalau salah satunya diminta ke DM.",
         on("latar") ? "Kalau permintaan kemungkinan butuh lebih dari ~1 menit (riset mendalam banyak sumber, perbandingan besar, data + grafik), pakai start_background_task lalu jawab singkat bahwa kamu sedang mengerjakannya dan akan mengabari; hasilnya nanti dikirim otomatis. Untuk pertanyaan cepat, kerjakan langsung." : "",
         on("media") ? "Pakai get_chat_media kalau perlu melihat gambar/stiker dari pesan lama di riwayat yang tidak lagi terlampir." : "Melihat gambar/video dimatikan admin di chat ini: jangan mengaku melihat isi media.",
         skills ? `Skill (resep langkah kerja) yang tersedia:
@@ -109,15 +126,18 @@ async function runAgentLoop({
   toolContext = {},
   sendProgress = null,
   maxReplyChars = 220,
+  // Tier provider langkah pertama; Jev menilai berat pekerjaannya (ai/agent/effort.js).
+  firstStepTier = "fast",
   config = loopConfig(),
   now = () => Date.now(),
 }) {
   const started = now();
   const messages = [...initialMessages];
   const signal = handle?.signal;
-  const tools = toolDefinitions(toolContext);
+  let tools = toolDefinitions(toolContext);
   const toolCounts = {};
   const usage = { tokens: 0, cost: 0 };
+  const modelsUsed = new Set();
   let searches = 0;
   let toolCallsMade = 0;
   let slowToolCalls = 0;
@@ -155,13 +175,36 @@ async function runAgentLoop({
     // Paragraf tanpa tool boleh sampai 2× batas obrolan (jawaban informatif singkat);
     // panduan gaya di prompt yang menjaga obrolan tetap pendek.
     const parsed = parseFinalReply(text, { maxChars: usedTools || structured ? config.maxTaskReplyChars : maxReplyChars * 2 });
-    const stickers = status === "aborted" ? [] : [...(ctx.stickers?.queue || [])];
-    const media = status === "aborted" ? [] : [...(ctx.outbox?.media || [])];
+    // GLM kadang mengarang penanda "[[react:👍]]" di teks (meniru [[reply:#id]]):
+    // jadikan reaction sungguhan bila tersedia, dan jangan pernah terkirim sebagai teks.
+    parsed.text = String(parsed.text || "").replace(/\[\[\s*react\s*:\s*([^\]]{1,8})\]\]/giu, (_, emoji) => {
+      if (ctx.reaction && !ctx.reaction.emoji && REACTION_EMOJIS.includes(emoji.trim())) ctx.reaction.emoji = emoji.trim();
+      return "";
+    }).replace(/\[\[(?!\s*lanjut\s*\]\])[^\]]{0,40}\]\]/gi, "").trim();
+    // [[lanjut]] = obrolan santai dipecah jadi beberapa bubble (maks 3). Jawaban
+    // tugas/daftar tetap satu bubble. `text` selalu versi gabungan untuk jalur lain.
+    const pieces = String(parsed.text || "").split(/\s*\[\[lanjut\]\]\s*/i).map((piece) => piece.trim()).filter(Boolean);
+    parsed.text = pieces.join("\n");
+    const bubbles = pieces.length > 1 && !usedTools && !structured ? pieces.slice(0, 3) : null;
+    if (bubbles && pieces.length > 3) bubbles[2] = pieces.slice(2).join(" ");
+    // Validasi 2 Okt (provider Together): GLM kadang MENULIS "stay_silent" sebagai teks
+    // alih-alih memanggil tool, dan teks itu nyaris terkirim ke grup. Anggap diam.
+    if (!ctx.silence && /^\W*stay_silent\b/i.test(String(text || "").trim())) ctx.silence = { reason: "lainnya" };
+    // stay_silent (lapisan kedua setelah Jev): tidak ada keluaran apa pun ke chat.
+    const silenced = ctx.silence?.reason || null;
+    if (silenced) parsed.text = "";
+    const dropOutput = status === "aborted" || Boolean(silenced);
+    const stickers = dropOutput ? [] : [...(ctx.stickers?.queue || [])];
+    const media = dropOutput ? [] : [...(ctx.outbox?.media || [])];
     // Stiker pengganti balasan berarti tanpa teks, dan teks yang cuma emoji di
     // samping stiker itu redundan (GLM sering menambahkan "👍😄" walau diminta stiker saja).
     if (stickers.some((item) => item.placement === "only") || (stickers.length && isEmojiOnly(parsed.text))) parsed.text = "";
-    // Tugas yang sudah memakai tools tidak boleh berakhir diam (kecuali balasannya stiker).
-    if (!parsed.text && usedTools && !stickers.length && !media.length && !ctx.allowEmpty && status !== "aborted") parsed.text = "Maaf, aku belum nemu jawaban yang pas buat itu.";
+    const reaction = dropOutput ? null : ctx.reaction?.emoji || null;
+    // Reaction saja = pengakuan; teks yang cuma emoji di sampingnya redundan.
+    if (reaction && isEmojiOnly(parsed.text)) parsed.text = "";
+    // Tugas yang sudah memakai tools tidak boleh berakhir diam (kecuali balasannya stiker/reaction).
+    const onlyReacted = reaction && Object.keys(toolCounts).every((name) => name === "react");
+    if (!parsed.text && usedTools && !stickers.length && !media.length && !onlyReacted && !ctx.allowEmpty && !dropOutput) parsed.text = "Maaf, aku belum nemu jawaban yang pas buat itu.";
     return {
       status,
       ...parsed,
@@ -171,8 +214,13 @@ async function runAgentLoop({
       usedTools,
       stickers,
       media,
-      dmRelay: ctx.dmRelay && (ctx.dmRelay.texts.length || ctx.dmRelay.moveResults) ? ctx.dmRelay : null,
+      reaction,
+      silenced,
+      groupRelays: dropOutput ? [] : [...(ctx.groupRelay?.queue || [])],
+      bubbles: parsed.text ? bubbles : null,
+      dmRelay: !dropOutput && ctx.dmRelay && (ctx.dmRelay.texts.length || ctx.dmRelay.moveResults || ctx.dmRelay.moveFiles?.size) ? ctx.dmRelay : null,
       usage: { tokens: usage.tokens, cost: Number(usage.cost.toFixed(6)) },
+      models: [...modelsUsed],
       durationMs: now() - started,
       ...extra,
     };
@@ -187,11 +235,15 @@ async function runAgentLoop({
       if (steps > 0) {
         const injected = handle?.drain?.() || [];
         if (injected.length) {
+          const requester = handle.requesterId;
+          const label = (entry) => (!requester ? "" : entry.sender_id === requester ? " (peminta tugas ini)" : " (orang lain)");
           messages.push({
             role: "user",
             content: [
-              "Pesan baru masuk di chat ini selagi kamu bekerja (konteks tambahan; kalau mengubah permintaan, sesuaikan):",
-              ...injected.map((entry) => `#${entry.entry_id} ${entry.sender}: ${entry.text}`),
+              requester
+                ? "Pesan baru masuk di chat ini selagi kamu bekerja. Dari peminta: ikuti kalau mengubah rencana; kalau dia minta berhenti (walau sambil memberi info), hentikan pekerjaan dan jawab singkat berdasarkan info terbarunya. Dari orang lain: kamu (Grad yang sama) menanggapinya terpisah, jadi JANGAN dijawab di sini; pakai hanya sebagai info, dan mereka tidak bisa mengubah atau menghentikan tugas ini."
+                : "Pesan baru masuk di chat ini selagi kamu bekerja (konteks tambahan; kalau mengubah permintaan, sesuaikan):",
+              ...injected.map((entry) => `#${entry.entry_id} ${entry.sender}${label(entry)}: ${entry.text}`),
             ].join("\n"),
           });
         }
@@ -208,15 +260,34 @@ async function runAgentLoop({
       }
 
       steps += 1;
-      const response = await glm.chatCompletion({
-        model,
+      // Langkah pertama memakai penilaian Jev (singkat → fast, berbelit → balanced);
+      // setelah tool dipakai (konteks membesar) selalu balanced.
+      const tier = toolCallsMade === 0 ? firstStepTier : "balanced";
+      const stepModel = chatModelFor(tier, model);
+      modelsUsed.add(stepModel);
+      const ask = () => glm.chatCompletion({
+        model: stepModel,
         messages,
         tools: forceFinal ? undefined : tools,
         maxTokens: forceFinal ? 900 : 1_200,
         temperature: 0.35,
         reasoningEffort: toolCallsMade >= 2 ? "medium" : undefined,
+        tier,
         signal,
       });
+      let response;
+      try {
+        response = await ask();
+      } catch (error) {
+        // Validasi 2 Okt: server tool web_search OpenRouter gagal (502) setelah ±65 dtk dan
+        // seluruh balasan hilang. Ulangi langkah ini sekali tanpa web search.
+        const webSearchFailed = /openrouter:web_search/i.test(String(error?.message || "")) && tools.some((tool) => tool.type === "openrouter:web_search");
+        if (!webSearchFailed || handle?.aborted) throw error;
+        console.warn("[AGENT] web_search OpenRouter gagal; langkah diulang tanpa web search");
+        tools = tools.filter((tool) => tool.type !== "openrouter:web_search");
+        messages.push({ role: "user", content: "(Pencarian web sedang gagal. Jawab tanpa mencari di web; kalau butuh data terbaru, bilang jujur belum bisa ngecek sekarang.)" });
+        response = await ask();
+      }
       usage.tokens += response.usage?.totalTokens || 0;
       usage.cost += Number(response.cost) || 0;
       if ((response.annotations || []).some((item) => item?.type === "url_citation")) searches += 1;
@@ -239,9 +310,18 @@ async function runAgentLoop({
         messages.push({ role: "tool", tool_call_id: call.id, content: result.content });
         if (handle?.aborted) break;
       }
+      // Sudah memilih diam: tidak perlu langkah GLM berikutnya.
+      if (ctx.silence) return finish("");
+      // Langkah yang isinya hanya reaction (ack "sip", "makasih") langsung selesai: dulu
+      // loop memanggil GLM sekali lagi hanya untuk jawaban akhir kosong, dan dengan
+      // provider lambat totalnya >20 dtk sehingga "sebentar, lagi kukerjain" terkirim
+      // sebelum sekadar 👍 (laporan owner 2 Okt). Teks yang ikut di pesan yang sama tetap dipakai.
+      if (calls.every((call) => call.name === "react") && !handle?.aborted) return finish(response.text || "");
       // Hasil tool hanya teks; gambar dari get_chat_media dilampirkan sebagai pesan user.
       if (ctx.attachments?.length) {
         messages.push({ role: "user", content: [{ type: "text", text: "Media yang kamu minta lewat get_chat_media:" }, ...ctx.attachments.flatMap((item) => [{ type: "text", text: item.label }, item.part])] });
+        // Baru dianggap "sudah dilihat" setelah gambarnya benar-benar masuk ke GLM.
+        for (const item of ctx.attachments) if (Number.isInteger(item.entryId)) ctx.seenMedia?.add(item.entryId);
         ctx.attachments = [];
       }
       // Tugas nyata (tool lambat) yang sudah berjalan lama: kabari grup. Tugas
@@ -258,4 +338,4 @@ async function runAgentLoop({
   }
 }
 
-module.exports = { agentInstructions, loopConfig, runAgentLoop };
+module.exports = { DEFAULT_FAST_MODEL, agentInstructions, chatModelFor, loopConfig, runAgentLoop };

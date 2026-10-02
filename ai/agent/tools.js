@@ -1,6 +1,7 @@
 // Katalog tools agent loop (Plan v2 §4, M1). Kontrak: schema JSON untuk model,
 // handler, timeout, dan hasil ringkas. Tujuan pengiriman tidak pernah datang
 // dari argumen model: tools di sini hanya membaca, bukan mengirim.
+const path = require("node:path");
 const Ajv = require("ajv");
 const { safeWebFetch } = require("../runtime/safe-web-fetch");
 const { redactString } = require("../observability/redact");
@@ -74,6 +75,32 @@ const TOOLS = {
   },
 };
 
+TOOLS.watch_video = {
+  description: "Tonton video di riwayat chat (gambar + suara) lewat model video, lalu dapat jawaban teks: transkrip ucapan/lirik, apa yang terjadi, tulisan di layar, dsb. entry_id = nomor # pesan video, atau pesan yang me-reply video. question = pertanyaan spesifikmu (mis. 'transkrip semua ucapan dan lirik', 'apa yang terjadi di video ini'). Gambar video yang kamu lihat hanya satu frame, jadi untuk isi video selalu pakai ini.",
+  parameters: {
+    type: "object",
+    properties: {
+      entry_id: { type: "integer" },
+      question: { type: "string" },
+      context: { type: "string", description: "konteks singkat yang membantu (opsional)" },
+    },
+    required: ["entry_id", "question"],
+    additionalProperties: false,
+  },
+  timeoutMs: 180_000,
+  async handler(args, ctx) {
+    if (!ctx.watchVideo) return { error: "menonton video tidak tersedia di chat ini" };
+    try {
+      const seen = await ctx.watchVideo(args);
+      if (seen.error) return seen;
+      ctx.addCost?.(seen.cost || 0);
+      return { entry_id: args.entry_id, answer: seen.answer, truncated: seen.truncated || false, note: "Laporan model video. Sampaikan dengan gayamu; transkrip panjang boleh diringkas kecuali diminta lengkap." };
+    } catch (error) {
+      return { error: `video tidak bisa ditonton: ${String(error.message).slice(0, 160)}` };
+    }
+  },
+};
+
 TOOLS.send_sticker = {
   description: "Kirim satu stiker dari koleksimu (lihat daftar 'Koleksi stiker') ke chat ini. placement 'only' = stiker menggantikan balasan (jawaban akhirmu harus kosong: tanpa teks, tanpa emoji); pakai ini kalau pengguna cuma minta dikirimi/dipakaikan stiker; 'after_text' = stiker dikirim setelah balasan teksmu. Pakai kalau memang cocok dan terasa natural, jangan setiap balasan.",
   parameters: {
@@ -97,6 +124,44 @@ TOOLS.send_sticker = {
   },
 };
 
+// Reaction ke pesan yang sedang dibalas. Sejak 27 Sep GLM (bukan Jev) yang memilih
+// reaction vs teks vs stiker untuk pesan yang ditujukan ke bot.
+const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "👏"];
+TOOLS.react = {
+  description: "Beri reaction emoji ke pesan terbaru (yang sedang kamu tanggapi). Pakai kalau pesannya cukup diakui tanpa balasan (oke, sip, makasih, candaan singkat): lalu jawaban akhirmu KOSONG. Kalau mau ditambah balasan teks, tulis teksnya di pesan yang SAMA dengan panggilan react (setelah react tidak ada langkah lagi). Jangan pakai reaction untuk pesan yang berisi permintaan/pertanyaan tanpa mengerjakannya.",
+  parameters: {
+    type: "object",
+    properties: { emoji: { type: "string", enum: REACTION_EMOJIS } },
+    required: ["emoji"],
+    additionalProperties: false,
+  },
+  timeoutMs: 1_000,
+  async handler({ emoji }, ctx) {
+    if (!ctx.reaction) return { error: "reaction tidak tersedia di sini" };
+    ctx.reaction.emoji = emoji;
+    return { ok: true, emoji, note: "reaction dikirim ke pesan terbaru; kalau tidak ada yang perlu dikatakan, jawaban akhirmu kosong" };
+  },
+};
+
+// Lapisan kedua setelah Jev (owner 2 Okt): Jev sudah memutuskan menanggapi, tapi
+// GLM yang membaca isinya boleh menolak menjawab. Loop langsung berhenti dan
+// tidak ada apa pun yang terkirim (teks, stiker, reaction, maupun file).
+const SILENCE_REASONS = ["tidak_senonoh", "pelecehan", "provokasi", "bukan_untukku", "lainnya"];
+TOOLS.stay_silent = {
+  description: "Pilih diam: tidak mengirim apa pun ke chat (teks, stiker, maupun reaction). Pakai HANYA kalau pesan yang kamu tanggapi memang tidak pantas dijawab: ajakan/obrolan seksual yang terus didesak setelah kamu tegur, minta konten porno, pelecehan, pancingan supaya kamu ikut mesum atau menghina orang, atau kalau ternyata pesannya bukan untukmu dan menjawab justru mengganggu. JANGAN dipakai untuk pertanyaan atau permintaan biasa.",
+  parameters: {
+    type: "object",
+    properties: { reason: { type: "string", enum: SILENCE_REASONS } },
+    required: ["reason"],
+    additionalProperties: false,
+  },
+  timeoutMs: 1_000,
+  async handler({ reason }, ctx) {
+    ctx.silence = { reason };
+    return { ok: true, note: "kamu memilih diam; tidak ada yang dikirim" };
+  },
+};
+
 TOOLS.save_sticker = {
   description: "Simpan stiker yang diminta pengguna ke koleksimu (misalnya 'grad simpan stiker ini' sambil me-reply stiker). entry_id = nomor # pesan stiker itu, atau pesan yang me-reply stiker. Lihat dulu stikernya (terlampir, atau lewat get_chat_media) dan nilai keamanannya dengan jujur. Setelah tersimpan, stiker langsung bisa kamu kirim dengan send_sticker.",
   parameters: {
@@ -117,7 +182,30 @@ TOOLS.save_sticker = {
   timeoutMs: 20_000,
   async handler(args, ctx) {
     if (!ctx.saveSticker) return { error: "menyimpan stiker tidak tersedia di chat ini" };
+    // Label wajib berasal dari gambar yang benar-benar dilihat, bukan tebakan.
+    if (ctx.seenMedia && !ctx.seenMedia.has(args.entry_id)) {
+      return { error: `kamu belum melihat stiker #${args.entry_id}. Panggil get_chat_media(${args.entry_id}) dulu, tunggu gambarnya, baru simpan dengan label sesuai yang terlihat` };
+    }
     return ctx.saveSticker(args);
+  },
+};
+
+TOOLS.remove_sticker = {
+  description: "Buang stiker dari koleksimu atas permintaan pengguna ('hapus stiker itu', 'buang semua koleksimu'). sticker_ids = id dari daftar 'Koleksi stiker' (atau yang baru disimpan); all=true untuk semua koleksi yang terlihat di chat ini, termasuk yang sedang tidak ada di daftar karena baru dipakai. Hanya owner, admin grup, atau anggota dengan akses veto yang boleh; kalau ditolak, sampaikan apa adanya.",
+  parameters: {
+    type: "object",
+    properties: {
+      sticker_ids: { type: "array", items: { type: "string" }, maxItems: 200 },
+      all: { type: "boolean" },
+      reason: { type: "string", description: "alasan singkat dari peminta, boleh kosong" },
+    },
+    additionalProperties: false,
+  },
+  timeoutMs: 20_000,
+  async handler(args, ctx) {
+    if (!ctx.removeStickers) return { error: "membuang stiker tidak tersedia di chat ini" };
+    if (!args.all && !args.sticker_ids?.length) return { error: "isi sticker_ids atau all=true" };
+    return ctx.removeStickers(args);
   },
 };
 
@@ -202,7 +290,7 @@ TOOLS.summarize_history = {
 };
 
 TOOLS.run_python = {
-  description: "Jalankan Python 3 di sandbox (numpy, pandas, matplotlib, pillow, sympy, qrcode, fpdf2, python-docx, python-pptx, openpyxl, pypdf). Dokumen .pdf/.docx/.pptx/.xlsx/.csv yang disimpan ke out/ dikirim ke chat sebagai file dokumen. Pakai untuk hitungan presisi, olah data, grafik/gambar, QR, atau memanggil API web: `import net; r = net.get(url, params={...}); r.json()` (juga net.post(url, json=...)). Simpan gambar ke folder out/ (mis. plt.savefig('out/grafik.png'), qrcode.make(teks).save('out/qr.png')) — semua gambar di out/ otomatis dikirim ke chat tepat DI BAWAH jawaban teksmu (jadi rujuk sebagai 'di bawah', dan jangan tulis ulang isinya). File lain di folder kerja tetap tersimpan untuk chat ini. print() hasil yang kamu butuhkan; ekspresi terakhir juga dikembalikan.",
+  description: "Jalankan Python 3 di sandbox (numpy, pandas, matplotlib, pillow, sympy, qrcode, fpdf2, python-docx, python-pptx, openpyxl, pypdf). Dokumen .pdf/.docx/.pptx/.xlsx/.csv/.txt/.md/.json/.zip yang disimpan ke out/ dikirim ke chat sebagai file dokumen (maks 3 per run); format lain TIDAK dikirim. Zip berpassword: `import gradzip; gradzip.make_zip('out/x.zip', [file…], password='…')` (zipfile bawaan tidak bisa). Pakai untuk hitungan presisi, olah data, grafik/gambar, QR, atau memanggil API web: `import net; r = net.get(url, params={...}); r.json()` (juga net.post(url, json=...)). Simpan gambar ke folder out/ (mis. plt.savefig('out/grafik.png'), qrcode.make(teks).save('out/qr.png')) — semua gambar di out/ otomatis dikirim ke chat tepat DI BAWAH jawaban teksmu (jadi rujuk sebagai 'di bawah', dan jangan tulis ulang isinya). File lain di folder kerja tetap tersimpan untuk chat ini. print() hasil yang kamu butuhkan; ekspresi terakhir juga dikembalikan.",
   parameters: {
     type: "object",
     properties: { code: { type: "string", description: "kode Python lengkap" } },
@@ -227,6 +315,7 @@ TOOLS.run_python = {
       error: run.error || null,
       images_to_send: (run.images || []).map((image) => image.name),
       documents_to_send: (run.documents || []).map((doc) => doc.name),
+      ...(run.notSent?.length ? { not_sent: run.notSent, not_sent_note: "file ini TIDAK terkirim; jangan bilang sudah dikirim. Simpan ulang dengan format yang didukung, atau tulis isinya langsung di jawaban kalau pendek." } : {}),
       files: run.files || [],
     };
   },
@@ -262,20 +351,56 @@ TOOLS.media_edit = {
 };
 
 TOOLS.send_to_my_dm = {
-  description: "Kirim ke chat pribadi (DM) si peminta sendiri, hanya kalau dia memintanya (mis. 'kirim ke DM aku aja', 'japri aku hasilnya'). text = isi pesan DM (boleh kosong bila hanya memindahkan hasil); include_results = true untuk memindahkan gambar/video/audio hasil tugas ini ke DM, bukan ke grup. Tidak bisa ke orang lain atau grup lain.",
+  description: "Kirim ke chat pribadi (DM) si peminta sendiri, hanya kalau dia memintanya (mis. 'kirim ke DM aku aja', 'japri aku hasilnya', 'yang kuning kirim ke DM gw'). text = isi pesan DM (boleh kosong). files = nama file hasil tugas ini (mis. 'qr_kuning.png') yang dipindah ke DM; file lain tetap dikirim ke grup. Buat filenya dulu (run_python/media_edit) sebelum memanggil ini. include_results = true memindahkan SEMUA hasil ke DM. Tidak bisa ke orang lain atau grup lain.",
   parameters: {
     type: "object",
-    properties: { text: { type: "string" }, include_results: { type: "boolean" } },
+    properties: {
+      text: { type: "string" },
+      files: { type: "array", items: { type: "string" }, maxItems: 10 },
+      include_results: { type: "boolean" },
+    },
     additionalProperties: false,
   },
   timeoutMs: 2_000,
-  async handler({ text = "", include_results: includeResults = false }, ctx) {
+  async handler({ text = "", files = [], include_results: includeResults = false }, ctx) {
     if (!ctx.dmRelay) return { error: "DM ke peminta tidak tersedia di sini" };
     const body = String(text || "").trim().slice(0, 3_000);
-    if (!body && !includeResults) return { error: "tidak ada yang dikirim" };
+    if (!body && !includeResults && !files.length) return { error: "tidak ada yang dikirim" };
+    // Kasus nyata 27 Sep: "ungu di grup, kuning ke DM" → semua hasil pindah ke DM
+    // dan Grad mengklaim yang kuning terkirim. Pembagian kini per file dan dilaporkan balik.
+    const produced = (ctx.outbox?.media || []).map((item) => item.name);
+    const wanted = files.map((file) => path.basename(String(file)));
+    const missing = wanted.filter((name) => !produced.includes(name));
+    if (missing.length) return { error: `file belum ada di hasil tugas ini: ${missing.join(", ")}. Hasil yang ada: ${produced.join(", ") || "(belum ada)"}. Buat dulu filenya lalu panggil lagi.` };
     if (body) ctx.dmRelay.texts.push(body);
+    for (const name of wanted) ctx.dmRelay.moveFiles.add(name);
     if (includeResults) ctx.dmRelay.moveResults = true;
-    return { ok: true, note: "akan dikirim ke DM peminta setelah balasanmu; di grup cukup bilang singkat bahwa sudah dikirim ke DM" };
+    const toDm = produced.filter((name) => ctx.dmRelay.moveResults || ctx.dmRelay.moveFiles.has(name));
+    return {
+      ok: true,
+      dm_files: ctx.dmRelay.moveResults ? "semua hasil (termasuk yang dibuat sesudah ini)" : toDm,
+      group_files: ctx.dmRelay.moveResults ? [] : produced.filter((name) => !toDm.includes(name)),
+      note: "Dikirim setelah balasanmu. Di grup sebut pembagiannya persis sesuai dm_files/group_files; jangan mengaku mengirim file yang tidak ada di daftar itu.",
+    };
+  },
+};
+
+TOOLS.tell_group = {
+  description: "(Hanya di chat pribadi) Titip pesan dari lawan chatmu ke grup yang dia ikuti, kalau dia memintanya ('bilang ke grup aku telat', 'tolong ingetin @Ani di grup bayar kas'). Pesan dikirim terang-terangan atas nama dia ('<nama> titip pesan: …'), jadi tulis isi pesannya saja dari sudut pandang titipan; jangan menyamar atau berpura-pura itu idemu. Tag orang dengan @Nama hanya kalau dia memang minta orang itu dipanggil/diingatkan; jangan menambah tag sendiri (tidak boleh @semua). Pesan yang men-tag, menagih, atau menegur orang akan jadi draf dulu: tunjukkan preview-nya, lalu setelah dia setuju panggil lagi dengan confirm: true (tanpa text). Tolak titipan yang menghina, menuduh, atau mempermalukan orang.",
+  parameters: {
+    type: "object",
+    properties: {
+      group: { type: "string", description: "nama grup (boleh sebagian); kosong kalau dia hanya ikut satu grup" },
+      text: { type: "string" },
+      confirm: { type: "boolean", description: "true = kirim draf yang sedang menunggu karena dia sudah setuju ('oke kirim')" },
+      confirm_draft: { type: "string", description: "opsional: draft_id yang disetujui" },
+    },
+    additionalProperties: false,
+  },
+  timeoutMs: 2_000,
+  async handler(args, ctx) {
+    if (!ctx.groupRelay) return { error: "titip pesan ke grup hanya bisa dari chat pribadi" };
+    return require("./group-relay").request(ctx.groupRelay, args);
   },
 };
 
@@ -324,8 +449,9 @@ TOOLS.get_chat_media = {
     if (!media && entry.message_ref && (entry.has_image || entry.has_video || entry.media_kind) && ctx.loadMedia) media = await ctx.loadMedia(entry.message_ref);
     const part = media && ctx.mediaPart?.(media);
     if (!part) return { error: `pesan #${entryId} tidak membawa gambar yang bisa diambil` };
-    ctx.attachments = [...(ctx.attachments || []), { label: `Media dari pesan #${entryId} (${entry.sender}: ${String(entry.text).slice(0, 80)})`, part }];
-    return { ok: true, entry_id: entryId, kind: media.kind || media.type, note: "media terlampir di pesan berikutnya" };
+    const motion = media.motion?.summary || null;
+    ctx.attachments = [...(ctx.attachments || []), { entryId, label: `Media dari pesan #${entryId} (${entry.sender}: ${String(entry.text).slice(0, 80)})${motion ? ` · gerakan animasinya: ${motion}` : ""}`, part }];
+    return { ok: true, entry_id: entryId, kind: media.kind || media.type, ...(motion ? { motion, motion_note: "gambar hanya satu frame; deskripsi gerakan berasal dari menonton animasinya dan lebih bisa dipercaya untuk makna stiker/GIF" } : {}), note: "media terlampir di pesan berikutnya" };
   },
 };
 
@@ -370,10 +496,11 @@ TOOLS.use_skill = {
 for (const tool of Object.values(TOOLS)) tool.validate = ajv.compile(tool.parameters);
 
 // Fitur M2b yang menaungi tiap tool. ctx.features (Set) kosong/absen = semua boleh.
-const TOOL_FEATURE = { web_fetch: "web", listen_audio: "audio", send_sticker: "stiker", save_sticker: "stiker", get_chat_media: "media", schedule: "reminder", list_schedules: "reminder", cancel_schedule: "reminder",
+const TOOL_FEATURE = { web_fetch: "web", listen_audio: "audio", watch_video: "media", send_sticker: "stiker", save_sticker: "stiker", remove_sticker: "stiker", get_chat_media: "media", schedule: "reminder", list_schedules: "reminder", cancel_schedule: "reminder",
   run_python: "python",
   media_edit: "edit_media",
   send_to_my_dm: null,
+  tell_group: null,
   start_background_task: "latar",
   background_tasks: "latar",
   use_skill: "skill",
@@ -388,15 +515,21 @@ function toolNamesFor(ctx = {}) {
   return Object.keys(TOOLS).filter((name) => {
     if (TOOL_FEATURE[name] && !featureOn(ctx, TOOL_FEATURE[name])) return false;
     if (name === "listen_audio") return Boolean(ctx.hasAudio);
+    if (name === "react") return Boolean(ctx.reaction);
+    // Tugas latar & jadwal harus selalu mengirim hasil; diam hanya untuk tanggapan langsung.
+    if (name === "stay_silent") return ctx.canSilence !== false;
+    if (name === "watch_video") return Boolean(ctx.watchVideo && ctx.hasVideo);
     // send_sticker juga ditawarkan bila ada stiker yang bisa disimpan lalu langsung dipakai.
     if (name === "send_sticker") return Boolean(ctx.stickers && (ctx.stickers.usable?.size || ctx.hasStickerMessages));
     if (name === "save_sticker") return Boolean(ctx.saveSticker && ctx.hasStickerMessages);
+    if (name === "remove_sticker") return Boolean(ctx.removeStickers && (ctx.stickers?.visible || ctx.stickers?.usable)?.size);
     if (name === "get_chat_media") return Boolean(ctx.hasMedia && ctx.mediaPart);
     if (["schedule", "list_schedules", "cancel_schedule"].includes(name)) return Boolean(ctx.schedules);
     if (["remember", "recall", "forget", "note_write", "note_read", "note_list"].includes(name)) return Boolean(ctx.notebook);
     if (name === "run_python") return Boolean(ctx.python);
     if (name === "media_edit") return Boolean(ctx.mediaEditor);
     if (name === "send_to_my_dm") return Boolean(ctx.dmRelay);
+    if (name === "tell_group") return Boolean(ctx.groupRelay?.groups?.length);
     if (name === "start_background_task" || name === "background_tasks") return Boolean(ctx.background);
     if (name === "summarize_history") return Boolean(ctx.notebook && ctx.getHistory);
     if (name === "use_skill") return Boolean(ctx.skills?.names().length);
@@ -452,4 +585,4 @@ async function executeTool(call, ctx = {}) {
   };
 }
 
-module.exports = { TOOLS, executeTool, setWebFetcher, toolDefinitions, toolNamesFor, webSearchServerTool };
+module.exports = { REACTION_EMOJIS, SILENCE_REASONS, TOOLS, executeTool, setWebFetcher, toolDefinitions, toolNamesFor, webSearchServerTool };

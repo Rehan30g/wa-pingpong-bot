@@ -118,3 +118,29 @@ test("agent loop: python aktif default, bisa dikunci owner; gambar hasil run_pyt
     features.setGlobalLock("python", false, { role: "owner" });
   }
 });
+
+// Kasus nyata 27 Sep: "file isi hati" disimpan .txt, tidak terkirim, tapi Grad bilang "udah dikirim di bawah".
+test("file .txt di out/ ikut terkirim sebagai dokumen; format lain dilaporkan tidak terkirim", opts, async () => {
+  const run = await runner.runPython({ chatId: CHAT, code: "open('out/isi_hati.txt','w').write('jujur semua')\nopen('out/rahasia.bin','wb').write(b'x')" });
+  assert.deepEqual(run.documents.map((doc) => [doc.name, doc.mime]), [["isi_hati.txt", "text/plain"]]);
+  assert.deepEqual(run.notSent, [{ name: "rahasia.bin", reason: "format .bin tidak dikirim" }]);
+  const { executeTool } = require("../ai/agent/tools");
+  const ctx = { python: { run: async () => run }, outbox: { media: [] } };
+  const result = JSON.parse((await executeTool({ name: "run_python", ok: true, arguments: { code: "x" } }, ctx)).content).result;
+  assert.deepEqual(result.documents_to_send, ["isi_hati.txt"]);
+  assert.equal(result.not_sent[0].name, "rahasia.bin");
+  assert.match(result.not_sent_note, /jangan bilang sudah dikirim/);
+  assert.deepEqual(ctx.outbox.media.map((item) => item.kind), ["document"]);
+});
+
+test("gradzip: zip berpassword AES-256 & ZipCrypto dari sandbox, ikut terkirim sebagai dokumen", opts, async () => {
+  const run = await runner.runPython({ chatId: CHAT, code: "import gradzip, zipfile\nopen('isi.txt','w').write('jujur')\nprint(gradzip.make_zip('out/a.zip', ['isi.txt'], password='pw1'))\nprint(gradzip.make_zip('out/w.zip', {'x.txt': 'halo'}, password='pw1', method='zipcrypto'))\nz = zipfile.ZipFile('out/w.zip')\nprint(z.read('x.txt', pwd=b'pw1'))\ninfo = zipfile.ZipFile('out/a.zip').infolist()[0]\nprint(info.compress_type, info.flag_bits & 1)" });
+  assert.equal(run.ok, true, run.error || run.stderr);
+  assert.match(run.stdout, /'method': 'aes'/);
+  assert.match(run.stdout, /b'halo'/, "ZipCrypto terbaca zipfile dengan password");
+  assert.match(run.stdout, /99 1/, "AES = metode 99, terenkripsi");
+  assert.deepEqual(run.documents.map((doc) => doc.mime), ["application/zip", "application/zip"]);
+  const failed = await runner.runPython({ chatId: CHAT, code: "import gradzip\ngradzip.make_zip('out/rusak.zip', ['tidak_ada.txt'], password='x')" });
+  assert.equal(failed.ok, false);
+  assert.ok(!failed.documents.length, "zip gagal tidak meninggalkan file untuk dikirim");
+});

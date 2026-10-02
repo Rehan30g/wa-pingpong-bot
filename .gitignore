@@ -32,3 +32,6 @@ data/runtime-settings.json
 data/notebook.json
 data/pyodide-cache/
 data/workspace/
+data/bench/
+data/logs/
+auth.backup-*/

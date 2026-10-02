@@ -188,7 +188,8 @@ Ditegakkan di kode, bukan di prompt:
 5. `web_fetch` dan `fetch_image_url` menolak IP privat/lokal (SSRF guard dipakai ulang).
 6. Memori DM tidak dibocorkan ke grup (scope per chat).
 7. Batas per tugas: 25 langkah, ~3 menit, budget token per tugas dan per hari (`budget.js` dipakai ulang, disederhanakan).
-8. Kill switch: `/agent off` (owner) mematikan loop agen, dan emergency pause tetap ada. **Reminder yang diminta pengguna tetap jalan** walau agent off.
+8. Obrolan tidak senonoh (2 Okt 2026): Grad tidak ikut; reaction/stiker/nimbrung ditahan dan diganti teguran halus ber-cooldown (`ai/agent/decency.js`), dan GLM selalu punya `stay_silent` sebagai lapisan kedua setelah Jev.
+9. Kill switch: `/agent off` (owner) mematikan loop agen, dan emergency pause tetap ada. **Reminder yang diminta pengguna tetap jalan** walau agent off.
 
 ## 7. Nasib kode v1
 
@@ -262,7 +263,7 @@ Setiap milestone baru dianggap **selesai** kalau:
 
 ### M2b · Fitur per grup (keputusan 26 Sep 2026)
 
-> **Status 26 Sep 2026: kode selesai + tes, tinggal demo WA (lokal).** Termasuk tambahan: tool `save_sticker` (simpan stiker atas permintaan lalu langsung pakai).
+> **Status 26 Sep 2026: kode selesai + tes, tinggal demo WA (lokal).** Termasuk tambahan: tool `save_sticker` (simpan stiker atas permintaan lalu langsung pakai). **Perbaikan 27 Sep (dari demo WA):** save_sticker wajib melihat stikernya dulu (label tidak lagi dikarang), tool `remove_sticker` untuk owner/admin/veto, statistik `/stiker` dibetulkan. **Mata gerak (27 Sep):** stiker animasi & GIF ditonton Gemini Flash Lite sebagai video diperlambat 4× (probe: Gemini 6/6 vs GLM 2/6 untuk gerakan singkat), deskripsinya dipakai riwayat, kurasi, dan save_sticker; divalidasi API nyata (kucing hijau → "katak mukul kesel", kuda → "kuda nabrak tembok gokil").
 
 - Setiap kemampuan Grad bisa dinyalakan/dimatikan per grup. Ditegakkan di kode: tools fitur yang mati tidak dikirim ke GLM, dan proses non-tool (transkripsi audio, pengumpulan stiker, stiker pengganti reaction) ikut berhenti.
 - Fitur dan default: `web` on, `audio` on, `stiker` on, `media` on, `reminder` on (M3), `sosial` off (M5), `workspace` off, `python` on, `skill` on (M4b; diperbarui 27 Sep 2026).
@@ -321,6 +322,8 @@ Setiap milestone baru dianggap **selesai** kalau:
 ### M5 · Proaktif grup dinamis
 
 > **Status 26 Sep 2026 (malam): kode selesai + disimulasikan dengan gaya obrolan grup Yy & Tes Bot <3.** Sinyal Jev `opportunity`, jalur bantuan & sosial dengan rem, "grad diem dulu" menahan semua respons ke pesan yang tidak memanggil bot, `/agent social on|off`. Simulasi: "Aku bosaaaan" → stiker bosen; "HAHAHA malu banget" → stiker ngakak; sebagian momen dilewati (tidak spam). Sosial mati di jam tenang (22–07 WIT).
+
+> **Update 27 Sep (dari demo WA):** Jev tepat saat memilih diam, tapi sering salah memilih reaction vs balasan untuk pesan yang ditujukan ke bot. Kini pilihan reaction Jev pada pesan yang ditujukan ke bot diteruskan ke GLM, yang memilih teks/stiker/reaction sendiri (tool `react`). Divalidasi API nyata dengan ulangan percakapan demo: ajakan tebak stiker → "Siap, kirim aja"; "Iyap, simpan dong" → save_sticker; "sip makasih" → 👍.
 
 - Sinyal `opportunity` di Jev, cooldown dua jalur, rem otomatis, `/agent social on|off`.
 - **Demo:** ada yang bertanya fakta tanpa mention → bot menjawab. Ada candaan → bot sesekali ikut. Ada yang bilang "grad diem dulu" → bot diam.

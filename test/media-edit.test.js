@@ -53,6 +53,22 @@ test("stiker animasi, GIF bertulisan, mp3 dipercepat, frame, kompres, gabung", o
   assert.ok(!fs.readdirSync(WORK).some((name) => /_(concat|font|text)\b/.test(name)), "berkas bantu dibersihkan");
 });
 
+// Build ffmpeg tanpa drawtext (mis. statis 7.0.2 tanpa harfbuzz) harus memberi
+// error yang bisa dijelaskan Grad, bukan "Filter not found".
+test("operasi text ditolak jelas bila ffmpeg tidak punya drawtext", { skip: process.platform === "win32" ? "butuh skrip shell" : opts.skip }, async () => {
+  makeVideo("in.mp4", 2);
+  const fake = path.join(testDir, "ffmpeg-tanpa-drawtext.sh");
+  fs.writeFileSync(fake, "#!/bin/sh\necho ' T.. null              V->V       Pass the source unchanged.'\n", { mode: 0o755 });
+  const old = process.env.FFMPEG_PATH;
+  process.env.FFMPEG_PATH = fake;
+  try {
+    await assert.rejects(editMedia({ workdir: WORK, inputs: ["in.mp4"], steps: [{ op: "text", text: "halo" }], output: "gif" }), /tidak mendukung tulisan/);
+  } finally {
+    if (old === undefined) delete process.env.FFMPEG_PATH;
+    else process.env.FFMPEG_PATH = old;
+  }
+});
+
 test("penjaga: file di luar folder kerja, operasi/format tak dikenal, audio→stiker ditolak", opts, async () => {
   makeVideo("in.mp4", 2);
   await assert.rejects(editMedia({ workdir: WORK, inputs: ["../../.env"], output: "mp4" }), /di luar folder kerja/);

@@ -6,7 +6,8 @@ const path = require("node:path");
 const { pythonConfig, WHEEL_GROUPS } = require("../ai/sandbox/python-runner");
 
 // lxml/fonttools dipakai python-docx, python-pptx, dan fpdf2.
-const PACKAGES = ["micropip", "numpy", "pandas", "matplotlib", "pillow", "sympy", "requests", "lxml", "fonttools"];
+// pycryptodome dipakai helper gradzip (zip berpassword AES).
+const PACKAGES = ["micropip", "numpy", "pandas", "matplotlib", "pillow", "sympy", "requests", "lxml", "fonttools", "pycryptodome"];
 
 async function pypiWheel(name, dir) {
   const response = await fetch(`https://pypi.org/pypi/${name}/json`);
@@ -29,7 +30,7 @@ async function pypiWheel(name, dir) {
     for (let attempt = 1; ; attempt += 1) {
       let failed = null;
       await pyodide.loadPackage(name, { messageCallback: () => {}, errorCallback: (message) => { failed = message; } });
-      const importName = { pillow: "PIL", fonttools: "fontTools" }[name] || name;
+      const importName = { pillow: "PIL", fonttools: "fontTools", pycryptodome: "Crypto" }[name] || name;
       try {
         pyodide.runPython(`import ${importName}`);
         if (!failed) break;

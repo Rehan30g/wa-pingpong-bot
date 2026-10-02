@@ -71,6 +71,16 @@ const SCHEMA = [
   )`,
   "CREATE INDEX IF NOT EXISTS idx_sticker_decisions_at ON sticker_decisions(at)",
   "CREATE TABLE IF NOT EXISTS sticker_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+  // Deskripsi gerakan stiker animasi dari "mata gerak" (ai/media/motion.js), sekali per stiker.
+  `CREATE TABLE IF NOT EXISTS sticker_motion (
+    sha TEXT PRIMARY KEY,
+    summary TEXT NOT NULL,
+    motion TEXT NOT NULL DEFAULT '',
+    emotion TEXT NOT NULL DEFAULT '',
+    text_in_media TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    at INTEGER NOT NULL
+  )`,
 ];
 
 // Kolom yang ditambahkan setelah M0 (DB lama dimigrasi di tempat).
@@ -235,13 +245,15 @@ function createStickerCollector({ dbPath, dir = stickerDir(), now = () => Date.n
     const conn = await db();
     const one = async (sql, args = []) => (await conn.execute({ sql, args })).rows[0];
     const totals = await one(`SELECT COUNT(*) AS candidates,
-      SUM(CASE WHEN file IS NOT NULL THEN 1 ELSE 0 END) AS stored,
-      COALESCE(SUM(use_count), 0) AS uses
+      SUM(CASE WHEN file IS NOT NULL THEN 1 ELSE 0 END) AS stored
       FROM sticker_candidates WHERE status = 'candidate'`);
+    // Pemakaian manusia dihitung dari semua stiker, termasuk yang sudah masuk koleksi.
+    const allUses = await one("SELECT COALESCE(SUM(use_count), 0) AS uses FROM sticker_candidates");
     const today = await one("SELECT COUNT(*) AS n, COUNT(DISTINCT sha) AS stickers FROM sticker_usage WHERE by_bot = 0 AND at >= ?", [at - 86_400_000]);
     const perSticker = `SELECT c.sha, c.use_count, c.last_seen, c.animated,
         COUNT(DISTINCT u.chat_id) AS chats, COUNT(DISTINCT u.sender) AS senders
       FROM sticker_candidates c LEFT JOIN sticker_usage u ON u.sha = c.sha AND u.by_bot = 0
+      WHERE c.status = 'candidate'
       GROUP BY c.sha`;
     const top = (await conn.execute({ sql: `${perSticker} ORDER BY c.use_count DESC, c.last_seen DESC LIMIT ?`, args: [limit] })).rows;
     const newest = (await conn.execute({ sql: "SELECT sha, first_seen FROM sticker_candidates ORDER BY first_seen DESC LIMIT ?", args: [limit] })).rows;
@@ -250,7 +262,7 @@ function createStickerCollector({ dbPath, dir = stickerDir(), now = () => Date.n
     return {
       candidates: Number(totals.candidates || 0),
       stored: Number(totals.stored || 0),
-      uses: Number(totals.uses || 0),
+      uses: Number(allUses.uses || 0),
       usesLast24h: Number(today.n || 0),
       stickersLast24h: Number(today.stickers || 0),
       collection: Number(collection.n || 0),
@@ -282,7 +294,21 @@ function createStickerCollector({ dbPath, dir = stickerDir(), now = () => Date.n
 
   const flush = () => queue.catch(() => {});
 
-  return { observe, flush, stats, contexts, close, db, now, dir: baseDir, dbPath: resolvedDbPath };
+  async function getMotion(sha) {
+    const row = (await (await db()).execute({ sql: "SELECT * FROM sticker_motion WHERE sha = ?", args: [sha] })).rows[0];
+    return row ? { summary: row.summary, motion: row.motion, emotion: row.emotion, text: row.text_in_media, model: row.model } : null;
+  }
+
+  async function saveMotion(sha, result, at = now()) {
+    await (await db()).execute({
+      sql: `INSERT INTO sticker_motion (sha, summary, motion, emotion, text_in_media, model, at) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sha) DO UPDATE SET summary = excluded.summary, motion = excluded.motion, emotion = excluded.emotion,
+              text_in_media = excluded.text_in_media, model = excluded.model, at = excluded.at`,
+      args: [sha, result.summary, result.motion || "", result.emotion || "", result.text || "", result.model || "", at],
+    });
+  }
+
+  return { observe, flush, stats, contexts, close, db, now, getMotion, saveMotion, dir: baseDir, dbPath: resolvedDbPath };
 }
 
 let shared = null;

@@ -392,8 +392,11 @@ test("get_chat_media: media lama diunduh ulang dan dilampirkan ke langkah beriku
 
 // ---------- save_sticker: simpan atas permintaan, langsung pakai ----------
 
+const STICKER_MEDIA = { type: "image", kind: "sticker", format: "webp", dataUrl: "data:image/webp;base64,UklGRg==" };
+
 function replyToSticker(sock, groupId, text, n, extra = {}) {
-  const args = groupArgs(sock, groupId, text, extra);
+  // Seperti index.js: stiker yang di-reply ikut terlampir sebagai media pesan itu.
+  const args = groupArgs(sock, groupId, text, { media: STICKER_MEDIA, ...extra });
   args.message.message = { extendedTextMessage: { text, contextInfo: { stanzaId: "orig", quotedMessage: { stickerMessage: { fileSha256: sha(n) } } } } };
   return args;
 }
@@ -503,4 +506,97 @@ test("/stiker lihat, buang, kurasi lewat handleMessage (owner)", async () => {
     assert.match(overview, /Koleksi: 2/);
     assert.match(overview, /buang "kucing ketawa" \(owner, barusan\): kebanyakan dipakai/);
   });
+});
+
+// Kasus nyata 27 Sep: "simpan semua stiker ini" untuk 8 stiker, tapi hanya 4 yang
+// terlampir; GLM menyalin label ke 4 lainnya. Penjaga: stiker harus dilihat dulu.
+function stickerArgs(sock, groupId, n) {
+  const args = groupArgs(sock, groupId, "[mengirim stiker]", { explicitMention: false, media: STICKER_MEDIA });
+  args.message.message = { stickerMessage: { fileSha256: sha(n) } };
+  return args;
+}
+
+test("save_sticker menolak stiker yang belum dilihat; lolos setelah get_chat_media", async () => {
+  const { library } = await freshStore();
+  groupAgent.setStickerDownloader(async () => webp({ r: 9, g: 9, b: 9, alpha: 1 }));
+  groupAgent.setMediaLoader(async () => STICKER_MEDIA);
+  try {
+    await withEnv({ AI_HISTORY_MEDIA_LIMIT: "1" }, () => withMock({ decision: { choice: "ignore", confidence: 0.99 }, chat: [] }, async (mock) => {
+      const sock = makeSock();
+      await groupAgent.processGroupMessage(stickerArgs(sock, GROUP_A, 21));
+      await groupAgent.processGroupMessage(stickerArgs(sock, GROUP_A, 22));
+      const [older, newer] = groupAgent.getHistory(GROUP_A).map((item) => item.entry_id);
+      const save = (entryId, label, callId) => toolCall("save_sticker", { entry_id: entryId, label, moods: ["laugh"], when_to_use: "-", planned_frequency: "kadang", scope: "global", safety: "ok" }, callId);
+      mock.script.decision = { choice: "reply", confidence: 0.95 };
+      mock.script.chat = [
+        { content: null, tool_calls: [save(newer, "baru", "c1"), save(older, "tebakan", "c2"), toolCall("get_chat_media", { entry_id: older }, "c3")] },
+        { content: null, tool_calls: [save(older, "lama", "c4")] },
+        "Dua-duanya udah kusimpan.",
+      ];
+      await groupAgent.processGroupMessage(groupArgs(sock, GROUP_A, "@Grad simpan semua stiker ini"));
+
+      const prompt = JSON.stringify(mock.state.chat[0].messages);
+      assert.match(prompt, new RegExp(`Media lama dari #${newer} `), "media lama berlabel #id");
+      const results = mock.state.chat[1].messages.filter((m) => m.role === "tool").map((m) => JSON.parse(m.content).result);
+      assert.equal(results[0].ok, true, "stiker yang terlampir boleh langsung disimpan");
+      assert.match(results[1].error, /belum melihat stiker/);
+      const later = JSON.parse(mock.state.chat[2].messages.at(-1).content).result;
+      assert.equal(later.ok, true, "setelah gambarnya masuk, boleh disimpan");
+      assert.deepEqual((await library.listCollection()).map((s) => s.label).sort(), ["baru", "lama"]);
+    }));
+  } finally {
+    groupAgent.setStickerDownloader(null);
+    groupAgent.setMediaLoader(null);
+  }
+});
+
+test("remove_sticker: hanya pengelola, 'hapus semua' membuang yang terlihat di chat ini saja", async () => {
+  const library = await seedCollection(); // #1 lokal GROUP_A, #2 global
+  const checks = [];
+  let allowed = false;
+  groupAgent.setStickerManagerCheck(async (who) => { checks.push(who); return allowed; });
+  try {
+    await withMock({ chat: [{ content: null, tool_calls: [toolCall("remove_sticker", { all: true })] }, "Maaf, cuma admin yang bisa."] }, async (mock) => {
+      const sock = makeSock();
+      await groupAgent.processGroupMessage(groupArgs(sock, GROUP_B, "@Grad hapus semua koleksimu"));
+      assert.ok(mock.state.chat[0].tools.some((t) => t.function?.name === "remove_sticker"));
+      assert.match(JSON.stringify(mock.state.chat[0].messages[0]), /remove_sticker/);
+      assert.match(JSON.parse(mock.state.chat[1].messages.at(-1).content).result.error, /hanya owner, admin grup/);
+      assert.deepEqual(checks.at(-1), { chatId: GROUP_B, senderId: "628222222222", isDm: false });
+      assert.equal((await library.listCollection()).length, 2, "ditolak = tidak ada yang dibuang");
+    });
+
+    allowed = true;
+    // Baru dipakai = kena rem jeda dan hilang dari daftar pakai, tapi tetap harus bisa dibuang.
+    await library.recordBotUse(hex(2), GROUP_B);
+    assert.deepEqual((await library.usableForChat(GROUP_B)).map((s) => s.id), []);
+    await withMock({ chat: [{ content: null, tool_calls: [toolCall("remove_sticker", { all: true, reason: "bosen" })] }, "Udah kubuang."] }, async (mock) => {
+      await groupAgent.processGroupMessage(groupArgs(makeSock(), GROUP_B, "@Grad hapus semua koleksimu"));
+      const result = JSON.parse(mock.state.chat[1].messages.at(-1).content).result;
+      assert.deepEqual(result.removed.map((r) => r.sticker_id), [id(2)], "stiker lokal grup lain tidak ikut terbuang");
+      assert.deepEqual((await library.listCollection()).map((s) => s.id), [id(1)]);
+      const last = await library.lastDecision(hex(2));
+      assert.equal(last.source, "request");
+      assert.match(last.reason, /dibuang atas permintaan Budi: bosen/);
+    });
+
+    await withMock({ chat: [{ content: null, tool_calls: [toolCall("remove_sticker", { sticker_ids: [id(1), "ffffffff"] })] }, "Oke."] }, async (mock) => {
+      await groupAgent.processGroupMessage(groupArgs(makeSock(), GROUP_A, "@Grad buang stiker muka Budi"));
+      const result = JSON.parse(mock.state.chat[1].messages.at(-1).content).result;
+      assert.deepEqual([result.removed.map((r) => r.sticker_id), result.not_found], [[id(1)], ["ffffffff"]]);
+      assert.equal((await library.listCollection()).length, 0);
+    });
+  } finally {
+    groupAgent.setStickerManagerCheck(null);
+  }
+});
+
+test("statistik /stiker menghitung pemakaian stiker yang sudah masuk koleksi", async () => {
+  const { collector, library } = await freshStore();
+  await seed(collector, 1, { uses: 2 });
+  await seed(collector, 2, { uses: 1 });
+  await curator.runCuration({ glm: fakeGlm([{ decisions: [decision(1), decision(2, { decision: "skip" })], removals: [] }]), library });
+  const stats = await collector.stats();
+  assert.equal(stats.uses, 3);
+  assert.deepEqual(stats.top.map((t) => t.sha), [], "yang sudah diputuskan tidak tampil sebagai kandidat");
 });

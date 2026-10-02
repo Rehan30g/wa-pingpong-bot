@@ -5,7 +5,7 @@ const { getStickerLibrary } = require("./library");
 const curator = require("./curator");
 
 const KIND_LABEL = { keep: "simpan", skip: "skip", remove: "buang", revise: "revisi" };
-const SOURCE_LABEL = { curation: "kurasi", review: "review", owner: "owner", rule: "aturan" };
+const SOURCE_LABEL = { curation: "kurasi", review: "review", owner: "owner", rule: "aturan", request: "permintaan" };
 
 function agoText(at, now = Date.now()) {
   const minutes = Math.max(0, Math.round((now - at) / 60_000));

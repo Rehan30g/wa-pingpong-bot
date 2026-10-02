@@ -6,7 +6,7 @@ const ABILITIES = {
   web: "🔎 *Web* — cari info terbaru, ringkas link, cek hoaks, bandingin produk — _\"@Grad harga iPhone 17 sekarang?\"_",
   audio: "🎙️ *Voice note* — cukup kirim VN yang manggil Grad",
   media: "🖼️ *Gambar/video* — kirim/reply lalu tanya",
-  stiker: "🗂️ *Stiker* — koleksi & kirim stiker — _\"@Grad simpan stiker ini\"_, _\"kirim stiker dong\"_",
+  stiker: "🗂️ *Stiker* — koleksi & kirim stiker — _\"@Grad simpan stiker ini\"_, _\"kirim stiker dong\"_, _\"hapus stiker itu\"_ (admin)",
   edit_media: "🎬 *Edit media* — stiker dari video/foto + teks, potong, kompres, ambil mp3 — _\"jadiin stiker 3 detik pertama, tulis GAS\"_",
   python: "🧮 *Python* — hitung, grafik, QR (link/WiFi/WA/kontak), kurs, cuaca, jadwal sholat, patungan, cicilan/KPR — _\"patungan dong: …\"_, _\"250 dolar berapa rupiah?\"_",
   dokumen: "📄 *Dokumen* — baca/ringkas PDF (termasuk hasil scan), Word, PPT, Excel; bikin PDF, Word, slide, Excel — _\"ringkas PDF ini\"_, _\"jadiin notulen tadi PDF\"_",

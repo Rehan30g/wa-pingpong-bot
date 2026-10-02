@@ -12,11 +12,12 @@ function begin(chatId) {
     inject(entry) {
       if (!controller.signal.aborted) handle.injections.push(entry);
     },
-    // Dipanggil loop sebelum langkah berikutnya. Entri yang diambil ditandai
-    // absorbed agar evaluasi antreannya tidak membalas dua kali.
+    // Dipanggil loop sebelum langkah berikutnya. Pesan peminta ditandai absorbed
+    // (sudah ditangani loop ini). Pesan orang lain hanya jadi info: Grad
+    // menanggapinya di jalur samping (multitasking), jadi tidak ditandai.
     drain() {
       const taken = handle.injections.splice(0);
-      for (const entry of taken) entry.absorbed = true;
+      for (const entry of taken) if (!handle.requesterId || entry.sender_id === handle.requesterId) entry.absorbed = true;
       return taken;
     },
     abort() {

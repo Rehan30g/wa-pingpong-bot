@@ -470,3 +470,194 @@ test("voice note ditranskrip menjadi teks riwayat dan mp3 disimpan untuk listen_
   assert.equal(failed.text, "[voice note 0:07, belum bisa didengar]");
   assert.equal(failed.audio, null);
 });
+
+// ---------- multitasking (27 Sep): tugas jalan, obrolan grup tidak tertahan ----------
+const ANI = { senderId: "628333333333", senderName: "Ani" };
+
+test("multitasking: member lain dijawab selagi tugas jalan; tugas tetap selesai dan tahu pesan itu info saja", async () => {
+  await withMock({
+    chat: [
+      { content: null, tool_calls: [toolCall("web_fetch", { url: "https://a.example/harga" })], delayMs: 400 },
+      "jam 3 sore ni, masih siang wkwk",
+      "Harga X sekarang Rp10 ribu.",
+    ],
+  }, async (mock) => {
+    tools.setWebFetcher(async (url) => ({ url, text: "harga X Rp10 ribu" }));
+    const sock = makeSock();
+    const task = groupAgent.processGroupMessage(groupArgs(sock, "@Grad cariin harga X"));
+    await sleep(80);
+    const side = await groupAgent.processGroupMessage(groupArgs(sock, "@Grad sekarang jam berapa?", ANI));
+    assert.equal(side.action, "reply", "tidak tertahan menunggu tugas");
+    assert.deepEqual(sock.sent.filter((s) => s.text).map((s) => s.text), ["jam 3 sore ni, masih siang wkwk"], "jawaban Ani terkirim sebelum hasil tugas");
+    assert.match(JSON.stringify(mock.state.chat[1].messages), /sedang mengerjakan tugas lain di chat ini untuk Budi: «@Grad cariin harga X»/);
+
+    const result = await task;
+    assert.equal(result.action, "reply");
+    assert.equal(sock.sent.filter((s) => s.text).at(-1).text, "Harga X sekarang Rp10 ribu.");
+    const injected = JSON.stringify(mock.state.chat[2].messages);
+    assert.match(injected, /Ani \(orang lain\): @Grad sekarang jam berapa\?/);
+    assert.match(injected, /JANGAN dijawab di sini/);
+  });
+});
+
+test("multitasking: 'stop' dari member lain tidak membatalkan tugas Budi (kecuali owner/admin); dari Budi berhenti", async () => {
+  await withMock({
+    chat: [
+      { content: null, tool_calls: [toolCall("web_fetch", { url: "https://a.example/1" })], delayMs: 300 },
+      "itu tugasnya Budi, bukan aku yang mutusin wkwk",
+      "hasil tugas Budi",
+    ],
+  }, async () => {
+    tools.setWebFetcher(async (url) => ({ url, text: "isi" }));
+    groupAgent.setStickerManagerCheck(async () => false);
+    const sock = makeSock();
+    const task = groupAgent.processGroupMessage(groupArgs(sock, "@Grad rangkum promo"));
+    await sleep(60);
+    const other = await groupAgent.processGroupMessage(groupArgs(sock, "@Grad stop", ANI));
+    assert.equal(other.action, "reply", "bukan stop: ditanggapi di jalur samping");
+    const result = await task;
+    assert.equal(result.action, "reply");
+    assert.ok(sock.sent.some((s) => s.text === "hasil tugas Budi"));
+  });
+
+  await withMock({
+    chat: [{ content: null, tool_calls: [toolCall("web_fetch", { url: "https://a.example/2" })], delayMs: 300 }, "tidak boleh terkirim"],
+  }, async () => {
+    groupAgent.setStickerManagerCheck(async ({ senderId }) => senderId === ANI.senderId);
+    const sock = makeSock();
+    const task = groupAgent.processGroupMessage(groupArgs(sock, "@Grad rangkum promo"));
+    await sleep(60);
+    const admin = await groupAgent.processGroupMessage(groupArgs(sock, "@Grad stop", ANI));
+    assert.equal(admin.action, "stopped", "admin/owner boleh menghentikan");
+    assert.equal((await task).action, "stopped");
+  });
+  groupAgent.setStickerManagerCheck(null);
+});
+
+test("multitasking: 'grad diem dulu' dari member lain tidak ikut membatalkan tugas yang jalan", async () => {
+  await withMock({
+    chat: [{ content: null, tool_calls: [toolCall("web_fetch", { url: "https://a.example/3" })], delayMs: 250 }, "hasil tetap terkirim"],
+  }, async () => {
+    tools.setWebFetcher(async (url) => ({ url, text: "isi" }));
+    const sock = makeSock();
+    const task = groupAgent.processGroupMessage(groupArgs(sock, "@Grad cari info"));
+    await sleep(60);
+    const mute = await groupAgent.processGroupMessage(groupArgs(sock, "@Grad diem dulu", ANI));
+    assert.equal(mute.action, "muted");
+    assert.equal((await task).action, "reply");
+    assert.ok(sock.sent.some((s) => s.text === "hasil tetap terkirim"));
+  });
+  require("../ai/agent/proactive").reset();
+});
+
+test("provider per langkah: obrolan → tier fast, langkah setelah tool → tier balanced", async () => {
+  const { providerPreference } = require("../ai/providers/glm-client");
+  const old = { fast: process.env.GLM_PROVIDER_FAST, balanced: process.env.GLM_PROVIDER_BALANCED };
+  process.env.GLM_PROVIDER_FAST = "provA/fp8, provB";
+  process.env.GLM_PROVIDER_BALANCED = "throughput";
+  test.after(() => {
+    for (const [tier, value] of Object.entries(old)) {
+      const key = `GLM_PROVIDER_${tier.toUpperCase()}`;
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  assert.deepEqual(providerPreference("fast"), { order: ["provA/fp8", "provB"], allow_fallbacks: true });
+  assert.deepEqual(providerPreference("balanced"), { sort: "throughput", allow_fallbacks: true });
+  assert.equal(providerPreference(null), null, "kompaksi/kurasi tetap bawaan OpenRouter");
+  process.env.GLM_PROVIDER_BALANCED = "";
+  assert.equal(providerPreference("balanced").order[0], "streamlake/fp8", "env kosong = default di kode");
+  process.env.GLM_PROVIDER_BALANCED = "openrouter";
+  assert.equal(providerPreference("balanced"), null);
+  process.env.GLM_PROVIDER_BALANCED = "throughput";
+
+  groupAgent.resetHistories();
+  // recall = tool biasa (bukan react, yang kini langsung mengakhiri loop).
+  const mock = await createMockOpenRouter({ chat: [{ content: null, tool_calls: [toolCall("recall", { query: "jadwal" })] }, "sip"] }).start();
+  try {
+    const sock = { sendMessage: async () => ({ key: { id: "b" } }), readMessages: async () => {}, sendPresenceUpdate: async () => {} };
+    await groupAgent.processGroupMessage({ sock, message: { key: { id: "tier1", remoteJid: GROUP } }, groupId: GROUP, senderId: PHONE, senderName: "Rehan", text: "@Grad inget jadwal kita ga", explicitMention: true, replyToBot: false, quotedText: "" });
+    assert.deepEqual(mock.state.chat[0].provider, { order: ["provA/fp8", "provB"], allow_fallbacks: true });
+    assert.deepEqual(mock.state.chat[1].provider, { sort: "throughput", allow_fallbacks: true });
+  } finally {
+    await mock.stop();
+  }
+});
+
+test("pemilih provider live: fast = waktu total (TTFT + token/throughput), balanced = waktu+biaya, 429 diturunkan", () => {
+  const picker = require("../ai/providers/provider-picker");
+  picker.reset();
+  const ep = (tag, latency, tps, prompt, completion, uptime = 99.9) => ({ tag, latency_last_30m: { p50: latency }, throughput_last_30m: { p50: tps }, pricing: { prompt: prompt / 1e6, completion: completion / 1e6 }, uptime_last_30m: uptime, supported_parameters: ["tools"] });
+  const ranking = picker.rankEndpoints([
+    ep("ttft-cepat-tapi-lambat", 700, 28, 0.15, 0.5), // ala DigitalOcean: 0,7 dtk tapi 28 tok/dtk
+    ep("cepat", 650, 80, 0.15, 0.5),
+    ep("murah", 1300, 36, 0.035, 0.5),
+    ep("mahal", 400, 150, 0.3, 1.0),
+    ep("sering-down", 300, 200, 0.1, 0.3, 90),
+    { ...ep("tanpa-tools", 300, 200, 0.1, 0.3), supported_parameters: [] },
+  ], { minUptime: 98, maxPromptPrice: 0.15, maxCompletionPrice: 0.5, size: 4 });
+  assert.equal(ranking.fast[0], "cepat");
+  assert.ok(ranking.fast.indexOf("ttft-cepat-tapi-lambat") > ranking.fast.indexOf("cepat"));
+  for (const tag of ["mahal", "sering-down", "tanpa-tools"]) assert.ok(!ranking.fast.includes(tag), tag);
+  assert.equal(ranking.balanced[0], "murah");
+
+  picker.noteServed(["baseten/fp8", "together", "io-net/fp8"], "Together");
+  assert.deepEqual(picker.applyDemotions(["baseten/fp8", "together", "io-net/fp8"]), ["together", "io-net/fp8", "baseten/fp8"]);
+  picker.noteServed(["io-net/fp8", "together"], "Io Net");
+  assert.deepEqual(picker.applyDemotions(["io-net/fp8", "together"]), ["io-net/fp8", "together"], "yang melayani tidak diturunkan");
+  picker.reset();
+});
+
+test("Jev menilai berat pekerjaan (pertanyaan opsional di panggilan yang sama) → tier provider langkah pertama", async () => {
+  const old = { fast: process.env.GLM_PROVIDER_FAST, balanced: process.env.GLM_PROVIDER_BALANCED };
+  process.env.GLM_PROVIDER_FAST = "cepat";
+  process.env.GLM_PROVIDER_BALANCED = "hemat";
+  test.after(() => {
+    for (const [tier, value] of Object.entries(old)) {
+      const key = `GLM_PROVIDER_${tier.toUpperCase()}`;
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  const mock = await createMockOpenRouter({ chat: ["oke"] }).start();
+  try {
+    const sock = { sendMessage: async () => ({ key: { id: "b" } }), readMessages: async () => {}, sendPresenceUpdate: async () => {} };
+    const send = (text, id) => groupAgent.processGroupMessage({ sock, message: { key: { id, remoteJid: GROUP } }, groupId: GROUP, senderId: PHONE, senderName: "Rehan", text, explicitMention: true, replyToBot: false, quotedText: "" });
+    groupAgent.resetHistories();
+    mock.script.effort = { choice: "elaborate", confidence: 0.9 };
+    await send("@Grad bandingin hp A dan B lengkap", "e1");
+    assert.ok(mock.state.decisions[0].questions.effort, "effort ikut ditanyakan ke Jev");
+    assert.deepEqual(mock.state.chat[0].provider.order, ["hemat"]);
+    mock.script.effort = { choice: "elaborate", confidence: 0.4 };
+    await send("@Grad yang tadi gimana", "e2");
+    assert.deepEqual(mock.state.chat[1].provider.order, ["cepat"], "keyakinan rendah → fast");
+    mock.script.effort = null;
+    await send("@Grad pagi", "e3");
+    assert.deepEqual(mock.state.chat[2].provider.order, ["cepat"], "tanpa jawaban effort → fast");
+    process.env.AGENT_JEV_EFFORT = "false";
+    await send("@Grad pagi lagi", "e4");
+    assert.ok(!mock.state.decisions.at(-1).questions.effort, "bisa dimatikan");
+    delete process.env.AGENT_JEV_EFFORT;
+  } finally {
+    await mock.stop();
+  }
+});
+
+test("ack ke Grad: langkah yang hanya react langsung selesai (satu panggilan GLM) dan tanpa pesan progres", async () => {
+  groupAgent.resetHistories();
+  const mock = await createMockOpenRouter({ decision: { choice: "react_ack", confidence: 0.9 }, chat: [{ content: null, tool_calls: [toolCall("react", { emoji: "👍" })], delayMs: 60 }, "tidak boleh dipanggil"] }).start();
+  const old = process.env.AGENT_PROGRESS_AFTER_MS;
+  process.env.AGENT_PROGRESS_AFTER_MS = "10";
+  try {
+    const sent = [];
+    const sock = { sendMessage: async (jid, content) => { sent.push(content); return { key: { id: "b" } }; }, readMessages: async () => {}, sendPresenceUpdate: async () => {} };
+    const result = await groupAgent.processGroupMessage({ sock, message: { key: { id: "ack1", remoteJid: GROUP } }, groupId: GROUP, senderId: PHONE, senderName: "Rehan", text: "@Grad sip makasih", explicitMention: true, replyToBot: false, quotedText: "" });
+    assert.equal(result.action, "react");
+    assert.equal(mock.state.chat.length, 1, "tanpa panggilan GLM kedua");
+    assert.deepEqual(sent, [{ react: { text: "👍", key: { id: "ack1", remoteJid: GROUP } } }], "tanpa 'bentar ya'");
+  } finally {
+    if (old === undefined) delete process.env.AGENT_PROGRESS_AFTER_MS;
+    else process.env.AGENT_PROGRESS_AFTER_MS = old;
+    await mock.stop();
+  }
+});
