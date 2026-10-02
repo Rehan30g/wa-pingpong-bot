@@ -85,9 +85,10 @@ test("/menu mengikuti fitur aktif grup dan menyembunyikan bagian owner dari non-
 test("tools fitur yang mati tidak pernah dikirim ke GLM", () => {
   const ctx = { hasAudio: true, hasMedia: true, mediaPart: () => ({}), stickers: { usable: new Map([["x", {}]]), queue: [] } };
   const all = tools.toolDefinitions(ctx).map((t) => t.function?.name || t.type);
-  assert.deepEqual(all.sort(), ["get_chat_media", "listen_audio", "openrouter:web_search", "send_sticker", "web_fetch"].sort());
+  // stay_silent tidak terikat fitur: menolak menjawab selalu boleh.
+  assert.deepEqual(all.sort(), ["get_chat_media", "listen_audio", "openrouter:web_search", "send_sticker", "stay_silent", "web_fetch"].sort());
   const limited = tools.toolDefinitions({ ...ctx, features: new Set(["audio"]) }).map((t) => t.function?.name || t.type);
-  assert.deepEqual(limited, ["listen_audio"]);
+  assert.deepEqual(limited.sort(), ["listen_audio", "stay_silent"]);
 });
 
 // ---------- penegakan di alur pesan ----------

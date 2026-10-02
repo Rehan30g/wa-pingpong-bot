@@ -17,4 +17,5 @@ requires: python
    qr.make_image(fill_color="black", back_color="white").save("out/qr.png")
    ```
    Kalau diminta ada label di bawah QR, tambahkan dengan PIL (ImageDraw, font bawaan) sebelum disimpan.
+   Warna: modul (fill_color) yang diwarnai, latar tetap putih/terang supaya bisa discan. "Jadi ungu dan kuning" = DUA versi terpisah (`out/qr_ungu.png`, `out/qr_kuning.png`), bukan satu QR dua warna, kecuali diminta gabungan. Warna terang (kuning) di atas putih susah discan: pakai kuning tua (mis. `#E0B000`) atau latar gelap.
 3. Jawab satu kalimat: QR untuk apa, tanpa menulis ulang isinya (kecuali link pendek). Jangan tulis password WiFi di teks.

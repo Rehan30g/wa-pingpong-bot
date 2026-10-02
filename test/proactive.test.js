@@ -43,6 +43,13 @@ const args = (sock, text, extra = {}) => ({
   ...extra,
 });
 
+// Grup "ramai": syarat nimbrung sosial sejak 27 Sep (≥4 pesan manusia dari ≥2 orang, 10 menit).
+function liven(groupId = GROUP) {
+  for (const [name, id, text] of [["Kevin", "628777", "eh tadi seru banget"], ["Rehan", "628111", "iya wkwk"], ["Kevin", "628777", "besok lagi yuk"], ["Rehan", "628111", "gas"]]) {
+    groupAgent.remember(groupId, { sender: name, senderId: id, text });
+  }
+}
+
 function fresh() {
   proactive.reset();
   groupAgent.resetHistories();
@@ -55,8 +62,23 @@ test("panggilan nama toleran: Gradd/GRAAAD/grad2 terbaca, Grab/gratis/gradasi ti
   for (const text of ["pesan grab aja", "gratis ongkir", "gradasi warnanya", "upgrade dulu", "grade A"]) assert.equal(groupAgent.textMentionsBotName(text, "Grad"), false, text);
 });
 
+test("default nimbrung jarang: cooldown 60 menit, maks 1/jam, dan hanya saat grup ramai", () => {
+  fresh();
+  const cfg = proactive.proactiveConfig();
+  assert.deepEqual([cfg.socialCooldownMs / MIN, cfg.socialMaxPerHour], [60, 1]);
+  const t = Date.now();
+  const chat = (n, senders) => Array.from({ length: n }, (_, i) => ({ sender_id: `6281${i % senders}`, at: t - i * MIN, is_bot: false }));
+  assert.equal(proactive.checkSocial(GROUP, t, { history: chat(2, 2) }).reason, "grup_sepi", "baru 2 pesan");
+  assert.equal(proactive.checkSocial(GROUP, t, { history: chat(6, 1) }).reason, "grup_sepi", "cuma satu orang ngomong sendiri");
+  assert.equal(proactive.checkSocial(GROUP, t, { history: chat(4, 2).map((item) => ({ ...item, at: t - 30 * MIN })) }).reason, "grup_sepi", "ramainya sudah lewat");
+  assert.equal(proactive.checkSocial(GROUP, t, { history: chat(4, 2) }).ok, true);
+});
+
 test("rem proaktif: cooldown bantuan, cooldown & kuota sosial, jam tenang, dan 'diam'", () => {
   fresh();
+  process.env.AGENT_SOCIAL_COOLDOWN_MIN = "20";
+  process.env.AGENT_SOCIAL_MAX_PER_HOUR = "2";
+  test.after(() => { delete process.env.AGENT_SOCIAL_COOLDOWN_MIN; delete process.env.AGENT_SOCIAL_MAX_PER_HOUR; });
   const t = Date.now();
   assert.equal(proactive.checkHelp(GROUP, t).ok, true);
   proactive.markHelp(GROUP, t);
@@ -110,11 +132,12 @@ test("jalur sosial: hanya stiker/teks singkat tanpa web; jawaban kosong = diam; 
   const mock = await createMockOpenRouter({ decision: { choice: "ignore", confidence: 0.7 }, opportunity: { choice: "social", confidence: 0.8 }, chat: [""] }).start();
   try {
     const sock = makeSock();
+    liven();
     const result = await groupAgent.processGroupMessage(args(sock, "wkwk kemarin aku kepleset di depan kelas"));
     assert.equal(result.action, "proactive_skip");
     const request = mock.state.chat[0];
     assert.ok(!(request.tools || []).some((t) => t.type === "openrouter:web_search" || ["web_fetch", "schedule", "remember"].includes(t.function?.name)));
-    assert.match(JSON.stringify(request.messages), /momen santai/);
+    assert.match(JSON.stringify(request.messages), /grup lagi rame dan santai/);
     assert.equal(sock.sent.length, 0, "tidak ada yang pas → tidak mengirim apa-apa (tanpa 'Maaf…')");
 
     proactive.reset();
@@ -180,6 +203,7 @@ test("nimbrung sosial boleh memakai stiker koleksi", async () => {
   }).start();
   try {
     const sock = makeSock();
+    liven();
     const result = await groupAgent.processGroupMessage(args(sock, "wkwk si Rehan kepleset lagi"));
     assert.equal(result.action, "sticker");
     assert.equal(result.proactive, "social");

@@ -2,10 +2,10 @@ const http = require("node:http");
 
 // Mock OpenRouter untuk tes agent loop. `chat` adalah antrean respons
 // /chat/completions; tiap item: string (content), atau { content, tool_calls,
-// annotations, cost, delayMs }. Item terakhir dipakai ulang bila antrean habis.
+// annotations, cost, delayMs } atau { status, error } untuk respons error. Item terakhir dipakai ulang bila antrean habis.
 function createMockOpenRouter({ decision = { choice: "reply", confidence: 0.95 }, opportunity = { choice: "none", confidence: 0.9 }, chat = ["Oke."] } = {}) {
   const state = { decisions: [], chat: [], audio: [] };
-  const script = { decision, opportunity, chat: [...chat], audio: null };
+  const script = { decision, opportunity, effort: null, chat: [...chat], audio: null };
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => { body += chunk; });
@@ -14,7 +14,7 @@ function createMockOpenRouter({ decision = { choice: "reply", confidence: 0.95 }
       res.setHeader("Content-Type", "application/json");
       if (req.url === "/api/alpha/decisions") {
         state.decisions.push(payload);
-        res.end(JSON.stringify({ answers: { action: script.decision, gratitude_target: { choice: "not_gratitude", confidence: 0.99 }, intent: { choice: "question", confidence: 0.9 }, opportunity: script.opportunity } }));
+        res.end(JSON.stringify({ answers: { action: script.decision, gratitude_target: { choice: "not_gratitude", confidence: 0.99 }, intent: { choice: "question", confidence: 0.9 }, opportunity: script.opportunity, ...(script.effort ? { effort: script.effort } : {}) } }));
         return;
       }
       if (req.url === "/api/v1/chat/completions") {
@@ -28,6 +28,12 @@ function createMockOpenRouter({ decision = { choice: "reply", confidence: 0.95 }
         const item = script.chat.length > 1 ? script.chat.shift() : script.chat[0];
         const step = typeof item === "string" ? { content: item } : item;
         if (step.delayMs) await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+        // { status: 502, error: "..." } = respons error OpenRouter.
+        if (step.status) {
+          res.statusCode = step.status;
+          res.end(JSON.stringify({ error: { message: step.error || "error", code: step.status } }));
+          return;
+        }
         const message = { role: "assistant", content: step.content ?? null };
         if (step.tool_calls) message.tool_calls = step.tool_calls;
         if (step.annotations) message.annotations = step.annotations;

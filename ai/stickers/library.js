@@ -96,6 +96,14 @@ function createStickerLibrary(store = getStickerCollector()) {
    * Rem: jeda per stiker (planned_frequency), kuota per jam per chat, dan
    * stiker yang sama tidak dipakai dua kali berturut-turut di chat yang sama.
    */
+  // Semua stiker yang boleh terlihat di chat ini menurut scope, tanpa rem pemakaian.
+  async function visibleForChat(chatId) {
+    const collection = await listCollection();
+    if (!collection.length) return [];
+    const chats = await humanChats();
+    return collection.filter((sticker) => sticker.scope !== "local" || chats.get(sticker.sha)?.has(chatId));
+  }
+
   async function usableForChat(chatId, { at = now() } = {}) {
     const cfg = stickerConfig();
     const collection = await listCollection();
@@ -241,7 +249,7 @@ function createStickerLibrary(store = getStickerCollector()) {
 
   return {
     store, exec, now,
-    listCollection, findSticker, lastDecision, usableForChat, pickForMood, indexText, readFile,
+    listCollection, findSticker, lastDecision, visibleForChat, usableForChat, pickForMood, indexText, readFile,
     recordBotUse, logDecision, importCandidate, keep, skip, remove, revise, recentDecisions, favorites, getMeta, setMeta, labelFor,
   };
 }

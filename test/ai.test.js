@@ -235,7 +235,7 @@ test("prompt GLM meminta gaya singkat tanpa Markdown", () => {
   });
 
   assert.equal(messages[0].role, "system");
-  assert.match(messages[0].content, /Jangan gunakan heading, tabel, code fence, link Markdown/);
+  assert.match(messages[0].content, /Jangan gunakan heading, tabel, code fence, atau link Markdown/);
   assert.match(messages[1].content, /Budi \[nomor-tidak-diketahui\]: Server masih 502/);
   assert.match(messages[1].content, /Ani: Terus cek apa/);
 });
@@ -318,7 +318,7 @@ test("media dari percakapan aktif lama ikut dilampirkan ke GLM", () => {
   });
   assert.ok(Array.isArray(messages[1].content));
   assert.ok(messages[1].content.some((part) => part.type === "image_url" && part.image_url.url.includes("TEFNQQ==")));
-  assert.ok(messages[1].content.some((part) => part.type === "text" && /Media lama dari Ani/.test(part.text)));
+  assert.ok(messages[1].content.some((part) => part.type === "text" && /Media lama dari #\d+ Ani/.test(part.text)));
 });
 
 test("jumlah media aktif yang disimpan mengikuti AI_HISTORY_MEDIA_LIMIT", () => {
@@ -684,27 +684,70 @@ test("percakapan antarmanusia tetap diabaikan walau confidence rendah", async ()
   }, false);
 });
 
-test("konfirmasi singkat dalam dialog bot tetap dapat reaction ack", async () => {
-  await withMockAiServer(async (mock) => {
-    mock.setDecision({ choice: "react_ack", confidence: 0.8 });
-    mock.gratitude = { choice: "not_gratitude", confidence: 0.9 };
+// Sejak 27 Sep: untuk pesan yang ditujukan ke bot, Jev hanya memutuskan diam/tidak;
+// GLM yang memilih reaction vs teks vs stiker (Jev memberi 👍 untuk "iyap, simpan dong").
+async function withScriptedGlm(options, run) {
+  const { createMockOpenRouter } = require("./helpers/mock-openrouter");
+  const mock = await createMockOpenRouter(options).start();
+  agent.resetHistories();
+  try {
+    await run(mock);
+  } finally {
+    agent.resetHistories();
+    await mock.stop();
+  }
+}
+
+const dialogueArgs = (sock, groupId, text, id) => ({
+  sock, message: { key: { id, remoteJid: groupId } }, groupId, senderId: "+6281111", senderName: "Rehan",
+  text, explicitMention: false, replyToBot: false, quotedText: "",
+});
+
+test("konfirmasi singkat dalam dialog bot: GLM yang memilih reaction (tool react, tanpa teks)", async () => {
+  const { toolCall } = require("./helpers/mock-openrouter");
+  await withScriptedGlm({ decision: { choice: "react_ack", confidence: 0.8 }, chat: [{ content: null, tool_calls: [toolCall("react", { emoji: "👍" })] }, ""] }, async (mock) => {
     const sock = makeAiSock();
     agent.remember("ack@g.us", { sender: "Grad", senderId: "BOT", text: "Bagus tuh, karya mu sendiri?", isBot: true });
-
-    const result = await agent.processGroupMessage({
-      sock,
-      message: aiMessage("a1"),
-      groupId: "ack@g.us",
-      senderId: "+6281111",
-      senderName: "Rehan",
-      text: "iyap",
-      explicitMention: false,
-      replyToBot: false,
-      quotedText: "",
-    });
+    const result = await agent.processGroupMessage(dialogueArgs(sock, "ack@g.us", "iyap", "a1"));
     assert.equal(result.action, "react", "konfirmasi ke bot harus dapat reaction, bukan diabaikan");
     assert.equal(result.emoji, "👍");
-  }, false);
+    assert.equal(result.decision.jevAction, "react_ack");
+    assert.ok(mock.state.chat[0].tools.some((t) => t.function?.name === "react"));
+    assert.match(JSON.stringify(mock.state.chat[0].messages[0]), /cukup reaction lewat tool react/);
+    assert.deepEqual(sock.sent.map((item) => item.react?.text || item.text), ["👍"]);
+    assert.equal(sock.sent[0].react.key.id, "a1", "reaction ke pesan pemicu");
+  });
+});
+
+test("'iyap, simpan dong' dalam dialog bot: Jev bilang react_ack, tapi GLM mengerjakan permintaannya", async () => {
+  await withScriptedGlm({ decision: { choice: "react_ack", confidence: 0.9 }, chat: ["Oke, udah kusimpan."] }, async () => {
+    const sock = makeAiSock();
+    agent.remember("ack2@g.us", { sender: "Grad", senderId: "BOT", text: "Tebakanku: kamu lagi kesal. Bener nggak?", isBot: true });
+    const result = await agent.processGroupMessage(dialogueArgs(sock, "ack2@g.us", "Iyap, simpan dong", "a2"));
+    assert.equal(result.action, "reply");
+    assert.deepEqual(sock.sent.map((item) => item.text), ["Oke, udah kusimpan."]);
+    assert.ok(!sock.sent.some((item) => item.react), "tidak ada 👍 otomatis dari Jev");
+  });
+});
+
+test("ajakan main ke bot (Jev react_laugh) tidak lagi dibalas stiker acak; GLM menjawab", async () => {
+  await withScriptedGlm({ decision: { choice: "react_laugh", confidence: 0.9 }, chat: ["Siap, kirim aja stikernya!"] }, async () => {
+    const sock = makeAiSock();
+    const result = await agent.processGroupMessage({ ...dialogueArgs(sock, "game@g.us", "Grad, aku akan kirim stiker, dan kamu tebak apa maksud stiker ini", "g1"), explicitMention: true });
+    assert.equal(result.action, "reply");
+    assert.deepEqual(sock.sent.map((item) => item.text), ["Siap, kirim aja stikernya!"]);
+  });
+});
+
+test("reaction Jev untuk obrolan yang tidak ditujukan ke bot tetap instan (tanpa GLM)", async () => {
+  await withScriptedGlm({ decision: { choice: "react_laugh", confidence: 0.95 }, chat: ["tidak boleh dipanggil"] }, async (mock) => {
+    const sock = makeAiSock();
+    agent.remember("amb@g.us", { sender: "Ani", senderId: "+6282222", text: "eh kemarin aku kepleset di depan dosen", isBot: false });
+    const result = await agent.processGroupMessage(dialogueArgs(sock, "amb@g.us", "WKWKWK sumpah malu banget", "x1"));
+    assert.equal(result.action, "react");
+    assert.equal(result.emoji, "😂");
+    assert.equal(mock.state.chat.length, 0);
+  });
 });
 
 test("reaction heart untuk orang lain tidak dicuri bot", async () => {
@@ -819,5 +862,58 @@ test("evaluasi antrean yang basi (ada pesan lebih baru) dilewati", async () => {
       "pesan basi tidak ditandai terbaca karena Jev tidak meresponsnya",
     );
     assert.equal(mock.state.decisions.length, 2);
+  });
+});
+
+test("[[lanjut]] memecah obrolan jadi beberapa bubble; jawaban berdaftar tetap satu bubble", async () => {
+  await withScriptedGlm({ chat: ["wkwk dosennya lagi ngedongeng ya [[lanjut]] tahan ni, bentar lagi istirahat"] }, async () => {
+    const sock = makeAiSock();
+    const result = await agent.processGroupMessage({ ...dialogueArgs(sock, "bubble@g.us", "grad aku ngantuk bgt di kelas", "b1"), explicitMention: true });
+    assert.equal(result.action, "reply");
+    assert.deepEqual(sock.sent.map((item) => item.text), ["wkwk dosennya lagi ngedongeng ya", "tahan ni, bentar lagi istirahat"]);
+    assert.equal(result.text, "wkwk dosennya lagi ngedongeng ya\ntahan ni, bentar lagi istirahat");
+    assert.deepEqual(agent.getHistory("bubble@g.us").filter((item) => item.is_bot).map((item) => item.text), ["wkwk dosennya lagi ngedongeng ya", "tahan ni, bentar lagi istirahat"]);
+  });
+  await withScriptedGlm({ chat: ["harganya beda tipis:\n\n• *A*: Rp10 ribu\n• *B*: Rp12 ribu [[lanjut]] btw murah semua"] }, async () => {
+    const sock = makeAiSock();
+    await agent.processGroupMessage({ ...dialogueArgs(sock, "bubble2@g.us", "grad bandingin harga A sama B", "b2"), explicitMention: true });
+    assert.equal(sock.sent.length, 1, "daftar informatif tidak dipecah");
+    assert.ok(!sock.sent[0].text.includes("[[lanjut]]"));
+  });
+});
+
+test("rem humor: setelah beberapa balasan bercanda, prompt meminta jawaban lurus", async () => {
+  const { humorBrake, recentJokeCount } = require("../ai/agent/persona");
+  const bot = (text) => ({ is_bot: true, text });
+  const calm = [bot("oke, udah kucatat"), bot("Harga X Rp10 ribu."), bot("[mengirim stiker: ngakak]")];
+  assert.equal(humorBrake(calm), "");
+  const jokey = [bot("kok dramatis wkwk"), bot("kayak drama korea haha"), bot("siap 😂")];
+  assert.deepEqual(recentJokeCount(jokey), { jokes: 3, total: 3 });
+  assert.match(humorBrake(jokey), /3 dari 3 balasan terakhirmu sudah bercanda; kali ini kurangi 'wkwk', emoji tawa, dan roasting, tapi tetap hangat dan playful/);
+  assert.equal(humorBrake([bot("wkwk iya"), bot("siap")]), "", "sesekali bercanda itu wajar");
+  // Ekspresi yang sama berulang (mis. 😑 dari riwayat sendiri) dilarang dulu.
+  assert.match(humorBrake([bot("jir 😑 yaudah"), bot("oke"), bot("serius? 😑")]), /berulang kali memakai 😑; JANGAN pakai itu/);
+
+  await withScriptedGlm({ chat: ["kenapa? mau dibantu apa"] }, async (mock) => {
+    const sock = makeAiSock();
+    for (const text of ["kenapa emangnya, kok dramatis wkwk", "bantuan macem apa nih, kayak drama korea wkwk", "hah? wkwk"]) agent.remember("brake@g.us", { sender: "Grad", senderId: "BOT", text, isBot: true });
+    await agent.processGroupMessage({ ...dialogueArgs(sock, "brake@g.us", "B-bantu AKU", "k1"), explicitMention: true });
+    assert.match(JSON.stringify(mock.state.chat[0].messages), /tetap hangat dan playful/);
+    assert.match(JSON.stringify(mock.state.chat[0].messages[0]), /HARGA DIRI/);
+  });
+});
+
+test("penanda karangan [[react:👍]] di teks jadi reaction sungguhan dan tidak pernah terkirim sebagai teks", async () => {
+  await withScriptedGlm({ decision: { choice: "react_ack", confidence: 0.9 }, chat: ["[[react:👍]]"] }, async () => {
+    const sock = makeAiSock();
+    agent.remember("mk@g.us", { sender: "Grad", senderId: "BOT", text: "1 liter itu 4 gelas.", isBot: true });
+    const result = await agent.processGroupMessage(dialogueArgs(sock, "mk@g.us", "oke makasih", "r1"));
+    assert.equal(result.action, "react");
+    assert.deepEqual(sock.sent.map((item) => item.react?.text || item.text), ["👍"]);
+  });
+  await withScriptedGlm({ chat: ["siap [[lanjut]] nanti aku kabarin [[apa:ini]]"] }, async () => {
+    const sock = makeAiSock();
+    await agent.processGroupMessage({ ...dialogueArgs(sock, "mk2@g.us", "grad cek ya", "r2"), explicitMention: true });
+    assert.deepEqual(sock.sent.map((item) => item.text), ["siap", "nanti aku kabarin"]);
   });
 });

@@ -679,3 +679,27 @@ test("veto dari reply LID disimpan sebagai nomor PN peserta", async () => {
 
   assert.deepEqual(bot.getData().vetoAccess[GROUP], [PLAYER]);
 });
+
+// Kasus 27 Sep: DM bot tertahan "Menunggu pesan ini" di HP teman owner. Baileys
+// melayani permintaan kirim ulang lewat getMessage, jadi pesan keluar harus tersimpan.
+test("pesan keluar tersimpan untuk kirim ulang (getMessage) saat penerima gagal dekripsi", async () => {
+  bot.rememberSentMessage({ key: { id: "RETRY1" }, message: { conversation: "QR-nya nih" } });
+  assert.deepEqual(await bot.getStoredMessage({ id: "RETRY1", remoteJid: "628@s.whatsapp.net" }), { conversation: "QR-nya nih" });
+  assert.equal(await bot.getStoredMessage({ id: "tidak-ada" }), undefined);
+  bot.rememberSentMessage({ key: { id: "tanpa-isi" } });
+  assert.equal(await bot.getStoredMessage({ id: "tanpa-isi" }), undefined);
+});
+
+test("DM keluar ke nomor@s.whatsapp.net diarahkan ke alamat chat yang dipakai orang itu (LID)", () => {
+  const phone = "6281200001111";
+  bot.memoryStore.recordParticipant({ phone, name: "Teman", groupId: "120363000000001@g.us", at: "2026-09-27 18:00 WIT" });
+  assert.equal(bot.routeDmJid(`${phone}@s.whatsapp.net`), `${phone}@s.whatsapp.net`, "belum ada rute → apa adanya");
+  bot.rememberDmRoute(phone, "199003618717862@lid");
+  assert.equal(bot.routeDmJid(`${phone}@s.whatsapp.net`), "199003618717862@lid");
+  assert.equal(bot.routeDmJid("120363000000001@g.us"), "120363000000001@g.us", "grup tidak disentuh");
+  assert.equal(bot.routeDmJid("199003618717862@lid"), "199003618717862@lid");
+  bot.rememberDmRoute(phone, `${phone}@s.whatsapp.net`);
+  assert.equal(bot.routeDmJid(`${phone}@s.whatsapp.net`), `${phone}@s.whatsapp.net`, "kembali ke nomor bila dia chat lewat nomor");
+  bot.rememberDmRoute(phone, "bukan-jid");
+  assert.equal(bot.routeDmJid(`${phone}@s.whatsapp.net`), `${phone}@s.whatsapp.net`);
+});

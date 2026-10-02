@@ -72,7 +72,8 @@ function maskChat(chatId) {
 function logTask(chatId, result) {
   const tools = Object.entries(result.toolCounts || {}).map(([name, count]) => `${name}×${count}`).join(",") || "-";
   activity.record("task", { chat: chatId, status: result.status, steps: result.steps, tools: result.toolCounts || {}, tokens: result.usage?.tokens || 0, cost: result.usage?.cost || 0, durationMs: result.durationMs });
-  console.log(`[AGENT] chat=${maskChat(chatId)} status=${result.status} langkah=${result.steps} tools=${tools} token=${result.usage?.tokens || 0} biaya=$${(result.usage?.cost || 0).toFixed(4)} durasi=${result.durationMs}ms`);
+  const models = (result.models || []).map((model) => String(model).split("/").pop()).join("+") || "-";
+  console.log(`[AGENT] chat=${maskChat(chatId)} status=${result.status} model=${models} langkah=${result.steps} tools=${tools} token=${result.usage?.tokens || 0} biaya=$${(result.usage?.cost || 0).toFixed(4)} durasi=${result.durationMs}ms`);
 }
 
 module.exports = { budgetConfig, dailyBudgetLeft, logTask, maskChat, recordAudio, recordTask, today };

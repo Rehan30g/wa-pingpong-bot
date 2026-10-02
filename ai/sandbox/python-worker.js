@@ -132,6 +132,13 @@ async function run(job) {
     pyodide.FS.writeFile(`/tmp/${wheel}`, bytes);
     await pyodide.runPythonAsync(`import micropip\nawait micropip.install("emfs:/tmp/${wheel}", deps=False)`);
   }
+  // Modul bantu tepercaya (mis. gradzip) di FS virtual, di luar folder kerja pengguna.
+  const helpers = job.helpers || {};
+  if (Object.keys(helpers).length) {
+    pyodide.FS.mkdirTree("/grad_lib");
+    for (const [file, source] of Object.entries(helpers)) pyodide.FS.writeFile(`/grad_lib/${file}`, source);
+    pyodide.runPython('import sys; sys.path.insert(0, "/grad_lib")');
+  }
   await pyodide.runPythonAsync(PRELUDE);
   pyodide.runPython('import os; os.makedirs("/work/out", exist_ok=True); os.chdir("/work")');
   let result = null;

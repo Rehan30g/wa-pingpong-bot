@@ -8,7 +8,7 @@
 //  5. batas waktu, memori, jumlah request, dan ukuran output.
 const fs = require("node:fs");
 const path = require("node:path");
-const { fork } = require("node:child_process");
+const { fork, spawnSync } = require("node:child_process");
 const { safeHttpRequest } = require("./safe-http");
 
 function envNumber(name, fallback) {
@@ -16,6 +16,26 @@ function envNumber(name, fallback) {
   if (raw === undefined || String(raw).trim() === "") return fallback;
   const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
+}
+
+// net.get/post memakai run_sync Pyodide yang butuh JSPI (WebAssembly stack
+// switching). Node 22 belum mengaktifkannya default, dan nama flag-nya beda
+// per versi V8 (Node 20: --experimental-wasm-stack-switching, Node 22:
+// --experimental-wasm-jspi). Flag yang tidak dikenal membuat node gagal start,
+// jadi dicek sekali ke `node --v8-options` (proses bot, bukan sandbox) lalu
+// di-cache. Flag ini hanya fitur WebAssembly; permission model tidak berubah.
+let jspiFlagsCache = null;
+function jspiFlags() {
+  if (jspiFlagsCache) return jspiFlagsCache;
+  if (typeof WebAssembly.Suspending === "function") return (jspiFlagsCache = []);
+  let options = "";
+  try {
+    options = spawnSync(process.execPath, ["--v8-options"], { encoding: "utf8", timeout: 10_000, env: {} }).stdout || "";
+  } catch {}
+  if (/--experimental-wasm-jspi\b/.test(options)) jspiFlagsCache = ["--experimental-wasm-jspi"];
+  else if (/--experimental-wasm-stack-switching\b/.test(options)) jspiFlagsCache = ["--experimental-wasm-stack-switching"];
+  else jspiFlagsCache = [];
+  return jspiFlagsCache;
 }
 
 function pythonConfig() {
@@ -39,6 +59,11 @@ const DOCUMENT_TYPES = {
   ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".csv": "text/csv",
+  // Kasus 27 Sep: "file isi hati" disimpan .txt lalu diaku terkirim padahal tidak.
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".json": "application/json",
+  ".zip": "application/zip",
 };
 
 // Paket PyPI murni-Python (diunduh npm run python:setup) dipasang hanya bila
@@ -51,7 +76,22 @@ const WHEEL_GROUPS = {
   openpyxl: { match: /\bopenpyxl\b|\.(?:to|read)_excel\b/, wheels: ["openpyxl", "et_xmlfile"], pyodide: [] },
   xlsxwriter: { match: /\bxlsxwriter\b/, wheels: ["XlsxWriter"], pyodide: [] },
   fpdf: { match: /\b(?:import|from)\s+fpdf\b/, wheels: ["fpdf2", "defusedxml"], pyodide: ["pillow", "fonttools"] },
+  gradzip: { match: /\bgradzip\b/, wheels: [], pyodide: ["pycryptodome"] },
 };
+
+// Modul bantu buatan kita (ai/sandbox/pylib/*.py), dikirim ke worker hanya bila diimpor.
+const PYLIB_DIR = path.join(__dirname, "pylib");
+function helperModules(code) {
+  let names = [];
+  try {
+    names = fs.readdirSync(PYLIB_DIR).filter((file) => file.endsWith(".py"));
+  } catch {
+    return {};
+  }
+  return Object.fromEntries(names
+    .filter((file) => new RegExp(`\\b${file.slice(0, -3)}\\b`).test(code))
+    .map((file) => [file, fs.readFileSync(path.join(PYLIB_DIR, file), "utf8")]));
+}
 
 function readWheelIndex(cfg) {
   const raw = JSON.parse(fs.readFileSync(path.join(cfg.cacheDir, "extra-wheels.json"), "utf8"));
@@ -149,6 +189,7 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
       `--allow-fs-read=${workdir}`,
       `--allow-fs-write=${workdir}`,
       `--max-old-space-size=${cfg.memoryMb}`,
+      ...jspiFlags(),
     ],
     env: {},
     cwd: workdir,
@@ -190,7 +231,7 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
     });
     child.on("exit", (codeValue) => finish({ ok: false, error: `sandbox berhenti (kode ${codeValue})${stderrTail ? `: ${stderrTail.split("\n").filter(Boolean).slice(-2).join(" ")}` : ""}` }));
     child.on("error", (error) => finish({ ok: false, error: error.message }));
-    child.send({ type: "run", job: { code: source, pyodideDir: pyDir, cacheDir: cfg.cacheDir, workdir, install, maxOutput: cfg.maxOutput } });
+    child.send({ type: "run", job: { code: source, pyodideDir: pyDir, cacheDir: cfg.cacheDir, workdir, install, helpers: helperModules(source), maxOutput: cfg.maxOutput } });
   });
 
   const changed = fs.readdirSync(outDir)
@@ -205,7 +246,14 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
     .filter((file) => DOCUMENT_TYPES[file.ext] && file.size <= 16 * 1_048_576)
     .map(({ ext, ...file }) => ({ ...file, mime: DOCUMENT_TYPES[ext] }))
     .slice(0, 3);
-  return { ...result, images, documents, files: listFiles(workdir), requests, durationMs: Date.now() - started };
+  // File baru di out/ yang TIDAK ikut terkirim dilaporkan, supaya model tidak mengaku sudah mengirimnya.
+  const sent = new Set([...images, ...documents].map((file) => file.name));
+  const notSent = changed.filter((file) => !sent.has(file.name)).map((file) => ({
+    name: file.name,
+    reason: !IMAGE_TYPES[file.ext] && !DOCUMENT_TYPES[file.ext] ? `format ${file.ext || "tanpa ekstensi"} tidak dikirim`
+      : file.size > (IMAGE_TYPES[file.ext] ? 5 : 16) * 1_048_576 ? "terlalu besar" : "melebihi jumlah file per run",
+  }));
+  return { ...result, images, documents, notSent, files: listFiles(workdir), requests, durationMs: Date.now() - started };
 }
 
 module.exports = { DOCUMENT_TYPES, WHEEL_GROUPS, documentsReady, installPlan, isReady, pythonConfig, runPython, workspaceFor };

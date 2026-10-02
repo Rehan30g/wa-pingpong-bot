@@ -10,6 +10,7 @@ const memoryStore = require("../memory-store");
 const { createGlmClient } = require("../providers/glm-client");
 const { FREQUENCIES, MOODS, getStickerLibrary, shortId, stickerConfig } = require("./library");
 const activity = require("../observability/activity");
+const { motionFor } = require("../media/motion");
 
 const DAY = 86_400_000;
 
@@ -125,12 +126,13 @@ async function candidatesForCuration(library, { limit, recheckUses }) {
   return rows.filter((row) => fs.existsSync(path.join(library.store.dir, row.file)));
 }
 
-async function describeCandidate(library, row) {
+async function describeCandidate(library, row, movement = null) {
   const contexts = await library.store.contexts(row.sha);
   const groupContexts = contexts.filter((item) => !item.isDm);
   const dmCount = contexts.length - groupContexts.length;
   const lines = [
-    `Stiker ${shortId(row.sha)}${row.status !== "candidate" ? ` (dinilai ulang: sebelumnya ${row.status}, pemakaian naik)` : ""}: dipakai manusia ${row.use_count}× di ${row.chats} chat oleh ${row.senders} orang; pertama ${fmtDate(row.first_seen)}, terakhir ${fmtDate(row.last_seen)}; ${row.animated ? "animasi (3 frame)" : "statis"}.`,
+    `Stiker ${shortId(row.sha)}${row.status !== "candidate" ? ` (dinilai ulang: sebelumnya ${row.status}, pemakaian naik)` : ""}: dipakai manusia ${row.use_count}× di ${row.chats} chat oleh ${row.senders} orang; pertama ${fmtDate(row.first_seen)}, terakhir ${fmtDate(row.last_seen)}; ${movement || row.animated ? "animasi (gambar = 3 frame awal/tengah/akhir)" : "statis"}.`,
+    movement ? `Gerakan (hasil menonton animasinya sebagai video; lebih bisa dipercaya daripada 3 frame untuk makna): ${[movement.motion, movement.emotion && `emosi: ${movement.emotion}`].filter(Boolean).join("; ") || movement.summary}` : "",
     ...groupContexts.map((item) => `Konteks: ${item.before ? `sebelum «${item.before.replace(/\n/g, " | ")}»` : ""} ${item.after ? `sesudah «${item.after.replace(/\n/g, " | ")}»` : ""}`.trim()),
     dmCount ? `(${dmCount} pemakaian lain di chat pribadi; isinya tidak ditampilkan)` : "",
   ].filter(Boolean);
@@ -141,7 +143,7 @@ async function describeCandidate(library, row) {
  * Kurasi harian: kandidat baru (dan skip yang pemakaiannya naik) dinilai GLM
  * per batch. Mengembalikan ringkasan keputusan untuk log/command.
  */
-async function runCuration({ glm = defaultGlm(), library = getStickerLibrary(), at = Date.now(), botName = process.env.BOT_NAME || "Grad" } = {}) {
+async function runCuration({ glm = defaultGlm(), library = getStickerLibrary(), at = Date.now(), botName = process.env.BOT_NAME || "Grad", motion = motionFor } = {}) {
   const cfg = curationConfig();
   const { capacity } = stickerConfig();
   const summary = { considered: 0, kept: [], skipped: [], removed: [], errors: 0, cost: 0 };
@@ -154,8 +156,11 @@ async function runCuration({ glm = defaultGlm(), library = getStickerLibrary(), 
     const byId = new Map();
     for (const row of batch) {
       try {
-        const preview = await stickerPreview(fs.readFileSync(path.join(library.store.dir, row.file)));
-        parts.push({ type: "text", text: await describeCandidate(library, row) }, { type: "image_url", image_url: { url: preview.dataUrl } });
+        const buffer = fs.readFileSync(path.join(library.store.dir, row.file));
+        const preview = await stickerPreview(buffer);
+        // Stiker animasi: makna ada di gerakannya, bukan di 3 frame (probe 27 Sep).
+        const movement = preview.frames > 1 ? await motion({ key: row.sha, buffer, kind: "sticker", store: library.store }) : null;
+        parts.push({ type: "text", text: await describeCandidate(library, row, movement) }, { type: "image_url", image_url: { url: preview.dataUrl } });
         byId.set(shortId(row.sha), row);
       } catch (error) {
         // File rusak/tidak bisa dibaca: skip permanen supaya tidak dicoba terus.

@@ -23,12 +23,12 @@ const FONT_CANDIDATES = [
 const ffmpegBin = () => process.env.FFMPEG_PATH || "ffmpeg";
 const ffprobeBin = () => process.env.FFPROBE_PATH || "ffprobe";
 
-function run(bin, args, { cwd, timeoutMs = 120_000 } = {}) {
+function run(bin, args, { cwd, timeoutMs = 120_000, maxStdout = 20_000 } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, { cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    proc.stdout.on("data", (chunk) => { stdout = (stdout + chunk).slice(-20_000); });
+    proc.stdout.on("data", (chunk) => { stdout = (stdout + chunk).slice(-maxStdout); });
     proc.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4_000); });
     const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("ffmpeg_timeout")); }, timeoutMs);
     proc.on("error", (error) => { clearTimeout(timer); reject(error); });
@@ -71,6 +71,20 @@ function atempoChain(factor) {
   return chain.join(",");
 }
 
+// Tidak semua build ffmpeg punya drawtext: sejak FFmpeg 6.1 filter ini butuh
+// libfreetype + libharfbuzz, dan build statis johnvansickle 7.0.2 (dulu di VPS)
+// tidak membawa harfbuzz. Tanpa cek ini user hanya dapat "Filter not found" yang
+// membingungkan. Dicek sekali per binary lalu di-cache.
+const drawtextCache = new Map();
+function hasDrawtext(bin = ffmpegBin()) {
+  if (!drawtextCache.has(bin)) {
+    drawtextCache.set(bin, run(bin, ["-hide_banner", "-filters"], { timeoutMs: 15_000, maxStdout: 1_000_000 })
+      .then((out) => /^\s*\S+\s+drawtext\s/m.test(out))
+      .catch(() => false));
+  }
+  return drawtextCache.get(bin);
+}
+
 function pickFont() {
   return FONT_CANDIDATES.find((file) => fs.existsSync(file)) || null;
 }
@@ -90,6 +104,10 @@ async function editMedia({ workdir, inputs, steps = [], output = "mp4", frames =
     if (!file.startsWith(path.resolve(workdir) + path.sep)) throw new Error(`file ${name} di luar folder kerja`);
     if (!fs.existsSync(file)) throw new Error(`file ${name} tidak ada`);
     if (fs.statSync(file).size > MAX_INPUT_BYTES) throw new Error("media masukan terlalu besar (maks 64 MB)");
+  }
+  // Dicek sebelum kerja berat (gabung klip) supaya gagalnya cepat dan jelas.
+  if (steps.some((step) => step.op === "text") && !(await hasDrawtext())) {
+    throw new Error("text: ffmpeg di server ini tidak mendukung tulisan (filter drawtext tidak ada). Bilang jujur ke user bahwa menambah teks belum bisa; operasi lain tetap bisa");
   }
   const outDir = path.join(workdir, "out");
   fs.mkdirSync(outDir, { recursive: true });
@@ -256,4 +274,4 @@ async function editMedia({ workdir, inputs, steps = [], output = "mp4", frames =
   return { files, info: { duration: Number(duration.toFixed(2)), width: info.width, height: info.height } };
 }
 
-module.exports = { editMedia, probe, seconds };
+module.exports = { editMedia, probe, seconds, hasDrawtext };

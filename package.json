@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js test/foundation.test.js test/runtime-storage.test.js test/runtime-recovery.test.js test/runtime-lifecycle.test.js test/autonomous-task-loop.test.js test/media-web.test.js test/web-search.test.js test/headless-agent.test.js test/stickers.test.js test/agent-loop.test.js test/sticker-collection.test.js test/features.test.js test/dashboard.test.js test/schedules.test.js test/notebook.test.js test/proactive.test.js test/python-sandbox.test.js test/media-edit.test.js test/dm-relay.test.js test/background.test.js test/skills.test.js test/documents.test.js",
+    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js test/foundation.test.js test/runtime-storage.test.js test/runtime-recovery.test.js test/runtime-lifecycle.test.js test/autonomous-task-loop.test.js test/media-web.test.js test/web-search.test.js test/headless-agent.test.js test/stickers.test.js test/agent-loop.test.js test/sticker-collection.test.js test/features.test.js test/dashboard.test.js test/schedules.test.js test/notebook.test.js test/proactive.test.js test/python-sandbox.test.js test/media-edit.test.js test/dm-relay.test.js test/background.test.js test/skills.test.js test/documents.test.js test/motion.test.js test/dm-group.test.js test/video-watch.test.js test/decency.test.js test/identity-models.test.js",
     "simulate:ai": "node scripts/simulate-ai.js",
     "simulate:burst": "node scripts/simulate-burst.js",
     "simulate:memory": "node scripts/simulate-memory.js",
@@ -17,10 +17,14 @@
     "probe:tools": "node scripts/probe-openrouter-tools.js",
     "probe:audio": "node scripts/probe-audio.js",
     "simulate:skills": "node scripts/simulate-skills.js",
+    "simulate:decency": "node scripts/simulate-decency.js",
+    "bench:providers": "node scripts/benchmark-providers.js",
+    "simulate:ghost": "node scripts/simulate-ghost.js",
     "simulate:documents": "node scripts/simulate-documents.js",
     "simulate:agent": "node scripts/simulate-agent-loop.js",
     "dashboard:link": "node scripts/dashboard-link.js",
-    "python:setup": "node scripts/python-setup.js"
+    "python:setup": "node scripts/python-setup.js",
+    "bench:decision": "node scripts/benchmark-decision.js"
   },
   "dependencies": {
     "@libsql/client": "0.18.0",

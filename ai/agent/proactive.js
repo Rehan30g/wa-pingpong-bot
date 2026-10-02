@@ -15,8 +15,12 @@ function envNumber(name, fallback) {
 function proactiveConfig() {
   return {
     helpCooldownMs: Math.max(0, envNumber("AGENT_HELP_COOLDOWN_MIN", 2)) * 60_000,
-    socialCooldownMs: Math.max(0, envNumber("AGENT_SOCIAL_COOLDOWN_MIN", 20)) * 60_000,
-    socialMaxPerHour: Math.max(0, envNumber("AGENT_SOCIAL_MAX_PER_HOUR", 2)),
+    // Owner 27 Sep: nimbrung sosial jarang dan hanya saat grup memang ramai.
+    socialCooldownMs: Math.max(0, envNumber("AGENT_SOCIAL_COOLDOWN_MIN", 60)) * 60_000,
+    socialMaxPerHour: Math.max(0, envNumber("AGENT_SOCIAL_MAX_PER_HOUR", 1)),
+    socialMinMessages: Math.max(0, envNumber("AGENT_SOCIAL_MIN_MESSAGES", 4)),
+    socialMinSenders: Math.max(1, envNumber("AGENT_SOCIAL_MIN_SENDERS", 2)),
+    socialWindowMs: Math.max(1, envNumber("AGENT_SOCIAL_WINDOW_MIN", 10)) * 60_000,
     muteMs: Math.max(0, envNumber("AGENT_SOCIAL_MUTE_HOURS", 3)) * 3_600_000,
     confidence: Math.min(1, Math.max(0, envNumber("AGENT_PROACTIVE_CONFIDENCE", 0.6))),
   };
@@ -42,11 +46,20 @@ function checkHelp(groupId, at = Date.now()) {
   return { ok: true };
 }
 
-function checkSocial(groupId, at = Date.now()) {
+// Grup "ramai" = cukup banyak pesan manusia dari beberapa orang baru-baru ini.
+// Tanpa itu Grad tidak basa-basi sendirian di grup yang sepi.
+function groupIsLively(history = [], at = Date.now()) {
+  const cfg = proactiveConfig();
+  const recent = history.filter((item) => !item.is_bot && Number(item.at) && at - Number(item.at) <= cfg.socialWindowMs);
+  return recent.length >= cfg.socialMinMessages && new Set(recent.map((item) => item.sender_id)).size >= cfg.socialMinSenders;
+}
+
+function checkSocial(groupId, at = Date.now(), { history = null } = {}) {
   const cfg = proactiveConfig();
   const s = groupState(groupId);
   if (isMuted(groupId, at)) return { ok: false, reason: "muted" };
   if (humanize.isQuietHours(at)) return { ok: false, reason: "quiet_hours" };
+  if (history && !groupIsLively(history, at)) return { ok: false, reason: "grup_sepi" };
   s.social = s.social.filter((time) => at - time < 3_600_000);
   if (s.social.length >= cfg.socialMaxPerHour) return { ok: false, reason: "hourly_limit" };
   if (s.social.length && at - Math.max(...s.social) < cfg.socialCooldownMs) return { ok: false, reason: "cooldown" };
@@ -91,4 +104,4 @@ function reset() {
   state.clear();
 }
 
-module.exports = { checkHelp, checkSocial, isMuteRequest, isMuted, markHelp, markSocial, mute, proactiveConfig, reset, status, unmute };
+module.exports = { checkHelp, checkSocial, groupIsLively, isMuteRequest, isMuted, markHelp, markSocial, mute, proactiveConfig, reset, status, unmute };

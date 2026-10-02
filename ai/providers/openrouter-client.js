@@ -104,7 +104,9 @@ function classifyError(error) {
       return new OpenRouterError(`Error server OpenRouter (${status}): ${sanitizedMsg}`, {
         category: "provider_error",
         status,
-        retryable: true,
+        // Server tool (mis. openrouter:web_search) yang gagal tidak membaik bila payload
+        // sama dikirim ulang (2 Okt: 3× ±22 dtk); agent loop mengulang tanpa tool itu.
+        retryable: !/server tool/i.test(sanitizedMsg),
         cause: error,
         data: { status, message: sanitizedMsg },
       });
@@ -147,7 +149,9 @@ function createOpenRouterClient(options = {}) {
   const apiKey = options.apiKey !== undefined ? options.apiKey : (process.env.OPENROUTER_API_KEY || "");
   const proxyUrl = options.proxyUrl !== undefined ? options.proxyUrl : (process.env.OPENROUTER_PROXY_URL || "");
   const timeoutMs = options.timeoutMs ?? (Number(process.env.OPENROUTER_TIMEOUT_MS) || 30_000);
-  const maxRetries = Math.max(0, options.maxRetries ?? (Number(process.env.OPENROUTER_MAX_RETRIES) || 2));
+  // `Number("0") || 2` dulu membuat OPENROUTER_MAX_RETRIES=0 terbaca 2 (jebakan envNumber).
+  const envRetries = String(process.env.OPENROUTER_MAX_RETRIES ?? "").trim() === "" ? NaN : Number(process.env.OPENROUTER_MAX_RETRIES);
+  const maxRetries = Math.max(0, options.maxRetries ?? (Number.isFinite(envRetries) ? envRetries : 2));
   const sleepFn = options.sleepFn || defaultSleep;
   const onRetry = options.onRetry || null;
 

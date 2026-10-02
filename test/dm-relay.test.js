@@ -107,3 +107,26 @@ test("include_results: hasil media dipindah ke DM, tidak dikirim ke grup", { ski
     await mock.stop();
   }
 });
+
+// Kasus nyata 27 Sep: "buat jadi ungu dan kuning, tapi yang kuning kirim ke DM gw" →
+// semua hasil pindah ke DM, grup kosong, dan Grad mengklaim yang kuning terkirim.
+test("send_to_my_dm files: hanya file yang disebut ke DM, sisanya tetap ke grup; pembagian dilaporkan", async () => {
+  const { executeTool } = require("../ai/agent/tools");
+  const ungu = { name: "qr_ungu.png", path: "/x/out/qr_ungu.png", kind: "image" };
+  const kuning = { name: "qr_kuning.png", path: "/x/out/qr_kuning.png", kind: "image" };
+  const ctx = { dmRelay: { phone: REHAN, texts: [], moveResults: false, moveFiles: new Set() }, outbox: { media: [ungu] } };
+  const call = (args) => executeTool({ name: "send_to_my_dm", ok: true, arguments: args }, ctx).then((r) => JSON.parse(r.content).result);
+
+  const early = await call({ files: ["out/qr_kuning.png"] });
+  assert.match(early.error, /belum ada di hasil tugas ini: qr_kuning\.png.*Hasil yang ada: qr_ungu\.png/);
+  assert.equal(ctx.dmRelay.moveFiles.size, 0);
+
+  ctx.outbox.media.push(kuning);
+  const ok = await call({ text: "nih yang kuning", files: ["out/qr_kuning.png"] });
+  assert.deepEqual([ok.dm_files, ok.group_files], [["qr_kuning.png"], ["qr_ungu.png"]]);
+
+  const routed = groupAgent.splitRelayMedia({ media: ctx.outbox.media, dmRelay: ctx.dmRelay });
+  assert.deepEqual([routed.chat.map((m) => m.name), routed.dm.map((m) => m.name)], [["qr_ungu.png"], ["qr_kuning.png"]]);
+  assert.deepEqual(groupAgent.splitRelayMedia({ media: ctx.outbox.media, dmRelay: { ...ctx.dmRelay, moveResults: true } }).chat, [], "include_results tetap memindahkan semua");
+  assert.deepEqual(groupAgent.splitRelayMedia({ media: [ungu], dmRelay: null }).dm, []);
+});

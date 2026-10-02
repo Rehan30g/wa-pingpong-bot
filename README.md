@@ -15,7 +15,7 @@ Voice note ─► Gemini Flash Lite (telinga) ─► transkrip ─► Jev/GLM
 | Cari info terbaru & rangkum link | "@Grad harga iPhone 17 sekarang? bandingin sama 16" | `web` |
 | Dengar voice note | kirim VN "grad besok rapat jam berapa?" | `audio` |
 | Lihat gambar/video | reply foto "@Grad ini error apa?" | `media` |
-| Koleksi stiker sendiri | "@Grad simpan stiker ini", "kirim stiker dong", sesekali membalas pakai stiker | `stiker` |
+| Koleksi stiker sendiri | "@Grad simpan stiker ini", "kirim stiker dong", "hapus stiker itu" (owner/admin), sesekali membalas pakai stiker | `stiker` |
 | Pengingat & jadwal (sekali/berulang, WIT) | "ingetin grup besok jam 8 rapat", "tiap Senin jam 7 cariin jadwal bola" | `reminder` |
 | Ingat fakta & catatan | "inget ya aku alergi udang", "catat keputusan rapat tadi" | `memori` |
 | Edit video/GIF/audio (FFmpeg) | "jadiin stiker video ini, 3 detik pertama, tulis GAS", "ambil audionya jadi mp3" | `edit_media` |
