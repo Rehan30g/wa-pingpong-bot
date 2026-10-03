@@ -119,9 +119,17 @@ test("jalur bantuan: tidak dipanggil tapi ada pertanyaan terbuka → Grad memban
     assert.match(JSON.stringify(mock.state.chat[0].messages), /kamu TIDAK dipanggil\. Kamu masuk sendiri karena ada bantuan nyata/);
     assert.ok(mock.state.chat[0].tools.some((t) => t.type === "openrouter:web_search"), "bantuan boleh memakai web");
     assert.equal(sock.sent.at(-1).text, "Rapatnya besok jam 10 di ruang 2.");
-    const second = await groupAgent.processGroupMessage(args(sock, "terus tempatnya di mana ya?"));
-    assert.equal(second.action, "ignore", "cooldown bantuan 2 menit");
+    // Orang lain dengan pertanyaan terbuka baru: cooldown bantuan 2 menit.
+    const other = await groupAgent.processGroupMessage(args(sock, "ada yang tau parkirnya di mana?", { senderId: "628999000111", senderName: "Sari" }));
+    assert.equal(other.action, "ignore", "cooldown bantuan 2 menit");
     assert.equal(mock.state.chat.length, 1);
+    // Penanya yang sama melanjutkan ke Grad (lanjutan dialog, 2 Okt): tetap ditanggapi lewat GLM.
+    groupAgent.resetHistories();
+    groupAgent.remember(GROUP, { sender: "Kevin", senderId: "628222333444", text: "eh ada yang tau rapat besok jam berapa?", at: Date.now() - 20_000 });
+    groupAgent.remember(GROUP, { sender: "Grad", senderId: "BOT", isBot: true, text: "Rapatnya besok jam 10 di ruang 2.", at: Date.now() - 10_000 });
+    const followUp = await groupAgent.processGroupMessage(args(sock, "terus tempatnya di mana ya?"));
+    assert.equal(followUp.action, "reply");
+    assert.equal(mock.state.chat.length, 2);
   } finally {
     await mock.stop();
   }

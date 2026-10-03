@@ -144,3 +144,20 @@ test("gradzip: zip berpassword AES-256 & ZipCrypto dari sandbox, ikut terkirim s
   assert.equal(failed.ok, false);
   assert.ok(!failed.documents.length, "zip gagal tidak meninggalkan file untuk dikirim");
 });
+
+test("worker cadangan: setelah run, chat yang sama dapat worker yang Pyodide-nya sudah termuat (lebih cepat, isolasi sama)", opts, async () => {
+  const chatId = "120363000warm@g.us";
+  runner.stopWarmWorkers(); // cadangan milik tes sebelumnya (chat lain)
+  const first = await runner.runPython({ chatId, code: "print(21 * 2)" });
+  assert.equal(first.ok, true);
+  assert.equal(runner.warmCount(), 1, "cadangan disiapkan untuk folder kerja chat ini");
+  await new Promise((resolve) => setTimeout(resolve, 8_000)); // biarkan Pyodide cadangan selesai dimuat
+  const started = Date.now();
+  const second = await runner.runPython({ chatId, code: "import os\nprint(os.getcwd(), 6 * 7)" });
+  const warmMs = Date.now() - started;
+  assert.equal(second.ok, true);
+  assert.match(second.stdout, /\/work 42/);
+  assert.ok(warmMs < first.durationMs, `run hangat (${warmMs} ms) lebih cepat dari run dingin (${first.durationMs} ms)`);
+  runner.stopWarmWorkers();
+  assert.equal(runner.warmCount(), 0);
+});

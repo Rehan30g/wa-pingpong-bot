@@ -3,6 +3,7 @@ name: jadwal_sholat
 title: Jadwal sholat
 description: jadwal sholat/imsak hari ini atau tanggal tertentu di kota Indonesia (data Kemenag)
 requires: python
+web: false
 ---
 Pakai API myquran (data Kemenag, jam sudah waktu lokal kota tersebut) lewat run_python:
 ```

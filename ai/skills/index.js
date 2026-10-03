@@ -32,6 +32,8 @@ function parseSkill(raw, source) {
     title: meta.title || name,
     description: meta.description.slice(0, 200),
     requires: String(meta.requires || "").split(",").map((item) => item.trim()).filter(Boolean),
+    // `web: false` = data sudah dari API skill; web_search dicabut setelah skill dimuat.
+    web: String(meta.web || "").trim().toLowerCase() !== "false",
     body: body.slice(0, MAX_BODY),
     source,
   };

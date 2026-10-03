@@ -10,6 +10,7 @@ Panduan teknis lengkap proyek ada di AGENTS.md (dimuat otomatis di bawah). File 
 - **Lingkungan**: pengembangan & demo jalan di laptop Windows (`npm start`, Git Bash/PowerShell); deploy ke VPS hanya saat owner memutuskan. Jam = WIT (UTC+9).
 - **Bot yang sedang jalan** menyimpan riwayat obrolan aktif hanya di RAM — restart menghapusnya. Jangan menjalankan `npm start` kedua bila bot sudah jalan dengan sesi `auth/` yang sama (sesi WA saling tendang).
 - **Feature first**: setiap milestone ditutup dengan fitur yang aktif dan terasa di WhatsApp, bukan infrastruktur yang dimatikan. Status milestone ada di `Plan.md`.
+- **Backup**: data Grad di-backup otomatis tiap hari ke repo privat `Rehan30g/grad-backup` (lihat AGENTS.md bagian Backup). Kalau menambah file data baru yang penting, tambahkan ke `scripts/backup.sh`. Kalau pindah server, ikuti `AGENTS.md` di repo backup.
 
 ## Sebelum menyatakan selesai
 

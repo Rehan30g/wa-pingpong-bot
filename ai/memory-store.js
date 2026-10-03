@@ -378,6 +378,7 @@ function resetAllMemory() {
 }
 
 module.exports = {
+  getData,
   appendGroupCompactLog,
   canDirectMessage,
   deleteGroupMemory,

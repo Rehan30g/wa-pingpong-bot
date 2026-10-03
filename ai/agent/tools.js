@@ -143,6 +143,22 @@ TOOLS.react = {
   },
 };
 
+// Nama panggilan anggota grup (uji owner 3 Okt: "tag si bim", padahal di WA namanya "Bima -Sakti").
+TOOLS.remember_alias = {
+  description: "Simpan nama panggilan anggota grup supaya lain kali bisa dipanggil/ditag pakai nama itu, mis. setelah ada yang bilang 'bim itu Bima -Sakti'. member = nama di WhatsApp/riwayat atau nomornya; alias = nama panggilannya. Hanya untuk grup.",
+  parameters: {
+    type: "object",
+    properties: { member: { type: "string", maxLength: 60 }, alias: { type: "string", maxLength: 30 } },
+    required: ["member", "alias"],
+    additionalProperties: false,
+  },
+  timeoutMs: 8_000,
+  async handler({ member, alias }, ctx) {
+    if (!ctx.aliases) return { error: "nama panggilan hanya bisa disimpan di grup" };
+    return ctx.aliases.save({ member, alias });
+  },
+};
+
 // Lapisan kedua setelah Jev (owner 2 Okt): Jev sudah memutuskan menanggapi, tapi
 // GLM yang membaca isinya boleh menolak menjawab. Loop langsung berhenti dan
 // tidak ada apa pun yang terkirim (teks, stiker, reaction, maupun file).
@@ -489,6 +505,10 @@ TOOLS.use_skill = {
   async handler({ name }, ctx) {
     const skill = ctx.skills?.get(name);
     if (!skill) return { error: `skill '${name}' tidak ada atau fiturnya mati di chat ini`, available: ctx.skills?.names() || [] };
+    // Uji 3 Okt: resep cuaca melarang web_search tapi model tetap mencari (21 dtk). Ditegakkan di loop.
+    if (skill.web === false) ctx.disableWebSearch = true;
+    // Skill ber-Python: nyalakan Python sekarang, selagi model menulis kodenya (±5 dtk lebih cepat).
+    if (skill.requires.includes("python")) ctx.python?.prewarm?.();
     return { skill: skill.name, title: skill.title, instructions: skill.body };
   },
 };
@@ -505,7 +525,7 @@ const TOOL_FEATURE = { web_fetch: "web", listen_audio: "audio", watch_video: "me
   background_tasks: "latar",
   use_skill: "skill",
   read_document: "dokumen",
-  remember: "memori", recall: "memori", forget: "memori", note_write: "memori", note_read: "memori", note_list: "memori", summarize_history: "memori" };
+  remember_alias: "memori", remember: "memori", recall: "memori", forget: "memori", note_write: "memori", note_read: "memori", note_list: "memori", summarize_history: "memori" };
 
 function featureOn(ctx, feature) {
   return !ctx.features || ctx.features.has(feature);
@@ -518,6 +538,7 @@ function toolNamesFor(ctx = {}) {
     if (name === "react") return Boolean(ctx.reaction);
     // Tugas latar & jadwal harus selalu mengirim hasil; diam hanya untuk tanggapan langsung.
     if (name === "stay_silent") return ctx.canSilence !== false;
+    if (name === "remember_alias") return Boolean(ctx.aliases);
     if (name === "watch_video") return Boolean(ctx.watchVideo && ctx.hasVideo);
     // send_sticker juga ditawarkan bila ada stiker yang bisa disimpan lalu langsung dipakai.
     if (name === "send_sticker") return Boolean(ctx.stickers && (ctx.stickers.usable?.size || ctx.hasStickerMessages));

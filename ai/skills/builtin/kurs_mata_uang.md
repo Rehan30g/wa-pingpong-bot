@@ -3,6 +3,7 @@ name: kurs_mata_uang
 title: Kurs & konversi mata uang
 description: kurs terkini, konversi nominal antar mata uang, atau tren kurs beberapa hari/bulan
 requires: python
+web: false
 ---
 Pakai API gratis tanpa key lewat run_python (`import net`):
 - Kurs terkini (update harian): `net.get("https://open.er-api.com/v6/latest/USD").json()["rates"]["IDR"]`; ganti USD dengan kode mata uang asal.

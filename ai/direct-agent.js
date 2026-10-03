@@ -202,7 +202,7 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
     dm.glm && dm.glm !== "Belum ada memori DM." ? `Memori percakapan sebelumnya:\n${dm.glm}` : "",
     groupContext,
     conversation ? `Percakapan terakhir:\n${conversation}` : "(belum ada konteks)",
-    quotedText ? `Pesan yang dibalas: ${quotedText}` : "",
+    groupAgent.quotedLine(historySnapshot, quotedText),
     `Pesan terbaru dari ${latestMessage.sender}: ${latestMessage.text}`,
     mediaPart
       ? (media?.type === "video"
@@ -227,6 +227,7 @@ function buildDirectMessages({ phone, latestMessage, quotedText, media, historyS
         PERSONA,
         identity.selfKnowledge({ botName: cfg.botName, features, isDm: true, chatWithOwner: identity.isOwnerPhone(phone) }),
         "Kalau pengguna jelas memakai bahasa lain (mis. Inggris), ikuti bahasanya.",
+        groupAgent.SHORT_MESSAGE_RULE,
         "Jangan gunakan heading, tabel, code fence, atau link Markdown.",
         "Jangan pernah mengaku manusia; jangan membahas proses internal atau nama model.",
         canRelay ? "Kalau dia minta menyampaikan sesuatu ke grup, pakai tell_group: dikirim terang-terangan atas nama dia. Kalau dia minta kamu pura-pura, menyamar, atau mengaku itu idemu sendiri di grup, tolak santai dan tawarkan titip pesan atas nama dia." : "",
@@ -299,7 +300,7 @@ async function generateDirectReply({ handle = null, sendProgress = null, sock = 
       loadMedia: groupAgent.getMediaLoader(),
       stickers,
       features,
-      python: features.has("python") ? { run: ({ code }) => require("./sandbox/python-runner").runPython({ chatId: phoneJid(args.phone), code }) } : null,
+      python: features.has("python") ? { run: ({ code }) => require("./sandbox/python-runner").runPython({ chatId: phoneJid(args.phone), code }), prewarm: () => require("./sandbox/python-runner").prewarmChat(phoneJid(args.phone)) } : null,
       skills: features.has("skill") ? require("./skills").forFeatures(features) : null,
       documents: features.has("dokumen") ? groupAgent.makeDocumentReader({ chatId: phoneJid(args.phone), historyKey: key }) : null,
       outbox: { media: [] },
@@ -541,6 +542,7 @@ function processDirectMessage(args) {
     document: args.document,
     messageKey: args.message?.key,
     messageRef: args.message,
+    quotedText: args.quotedText,
   });
 
   const active = activeLoops.get(key);

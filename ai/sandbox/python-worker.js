@@ -105,24 +105,40 @@ net = _Net()
 sys.modules["net"] = net
 `;
 
-async function run(job) {
-  const { loadPyodide } = await import(pathToFileURL(path.join(job.pyodideDir, "pyodide.mjs")).href);
-  let stdout = "";
-  let stderr = "";
-  const cap = (current, text) => (current.length < job.maxOutput ? current + text : current);
+// Keluaran run yang sedang berjalan (pyodide dibuat sebelum job datang pada worker cadangan).
+const io = { stdout: "", stderr: "", max: 50_000 };
+const cap = (current, text) => (current.length < io.max ? current + text : current);
+
+async function boot({ pyodideDir, cacheDir, workdir }) {
+  const { loadPyodide } = await import(pathToFileURL(path.join(pyodideDir, "pyodide.mjs")).href);
   const pyodide = await loadPyodide({
-    indexURL: job.pyodideDir,
-    packageCacheDir: job.cacheDir,
+    indexURL: pyodideDir,
+    packageCacheDir: cacheDir,
     // Modul Python `js` hanya melihat objek kosong, bukan global Node.
     jsglobals: Object.create(null),
     env: { HOME: "/home/pyodide" },
-    stdout: (text) => { stdout = cap(stdout, `${text}\n`); },
-    stderr: (text) => { stderr = cap(stderr, `${text}\n`); },
+    stdout: (text) => { io.stdout = cap(io.stdout, `${text}\n`); },
+    stderr: (text) => { io.stderr = cap(io.stderr, `${text}\n`); },
   });
   pyodide.registerJsModule("grad_bridge", { request: (json) => bridgeRequest(json) });
   pyodide.FS.mkdirTree("/work");
-  pyodide.mountNodeFS("/work", job.workdir);
+  pyodide.mountNodeFS("/work", workdir);
   await pyodide.loadPackage("micropip", { messageCallback: () => {} });
+  return pyodide;
+}
+
+// Worker cadangan (`--warm <workdir> <pyodideDir> <cacheDir>`): Pyodide dimuat lebih dulu
+// selagi menunggu job, supaya run berikutnya di chat yang sama tidak menunggu ±5 dtk.
+const warmIndex = process.argv.indexOf("--warm");
+const warm = warmIndex >= 0 ? { workdir: process.argv[warmIndex + 1], pyodideDir: process.argv[warmIndex + 2], cacheDir: process.argv[warmIndex + 3] } : null;
+const warmBoot = warm ? boot(warm).catch(() => null) : null;
+
+async function run(job) {
+  io.stdout = "";
+  io.stderr = "";
+  io.max = job.maxOutput;
+  const preloaded = warm && warm.workdir === job.workdir ? await warmBoot : null;
+  const pyodide = preloaded || await boot(job);
   await pyodide.loadPackagesFromImports(job.code, { messageCallback: () => {} });
   // Wheel PyPI (qrcode, pypdf, python-docx, …) sudah dipilih runner sesuai import di kode.
   const install = job.install || { wheels: [], pyodide: [] };
@@ -152,7 +168,7 @@ async function run(job) {
   } catch (error) {
     // Traceback Python cukup baris terakhir yang relevan.
     const message = String(error?.message || error);
-    return { ok: false, stdout, stderr, error: message.split("\n").filter((line) => !line.includes("/lib/python3")).slice(-8).join("\n").slice(0, 2_000) };
+    return { ok: false, stdout: io.stdout, stderr: io.stderr, error: message.split("\n").filter((line) => !line.includes("/lib/python3")).slice(-8).join("\n").slice(0, 2_000) };
   }
-  return { ok: true, stdout, stderr, result };
+  return { ok: true, stdout: io.stdout, stderr: io.stderr, result };
 }

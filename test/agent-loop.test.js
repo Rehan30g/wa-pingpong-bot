@@ -179,6 +179,8 @@ test("kabar baik yang me-mention bot (Jev pilih heart, bukan ucapan terima kasih
     const mentioned = await groupAgent.processGroupMessage(groupArgs(sock, "@Grad aku lulus ujian!!"));
     assert.equal(mentioned.action, "reply");
     assert.equal(sock.sent.at(-1).text, "Selamat ya! Keren banget.");
+    // Riwayat dikosongkan: tanpa itu pesan ini lanjutan dialog dengan Grad (2 Okt) dan diteruskan ke GLM.
+    groupAgent.resetHistories();
     const notAddressed = await groupAgent.processGroupMessage(groupArgs(sock, "aku lulus ujian!!", { explicitMention: false }));
     assert.equal(notAddressed.action, "ignore", "tanpa mention tetap tidak mencuri heart untuk orang lain");
     assert.equal(mock.state.chat.length, 1);

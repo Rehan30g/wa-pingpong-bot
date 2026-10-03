@@ -49,7 +49,7 @@ function chatModelFor(tier, taskModel) {
 }
 
 // Tool lokal yang selesai seketika; tidak memicu pesan progres.
-const INSTANT_TOOLS = new Set(["react", "stay_silent", "tell_group", "send_sticker", "save_sticker", "remove_sticker", "send_to_my_dm", "start_background_task", "background_tasks", "schedule", "list_schedules", "cancel_schedule", "remember", "recall", "forget", "note_write", "note_read", "note_list", "summarize_history", "use_skill"]);
+const INSTANT_TOOLS = new Set(["react", "stay_silent", "remember_alias", "tell_group", "send_sticker", "save_sticker", "remove_sticker", "send_to_my_dm", "start_background_task", "background_tasks", "schedule", "list_schedules", "cancel_schedule", "remember", "recall", "forget", "note_write", "note_read", "note_list", "summarize_history", "use_skill"]);
 const PROGRESS_TEXTS = ["bentar ya", "sebentar, lagi kukerjain", "tunggu bentar ya", "oke, bentar ya"];
 const LONG_PROGRESS_TEXTS = ["masih aku kerjain ya, dikit lagi", "masih jalan nih, bentar lagi kelar"];
 const pick = (items) => items[Math.floor(Math.random() * items.length)];
@@ -265,6 +265,8 @@ async function runAgentLoop({
       const tier = toolCallsMade === 0 ? firstStepTier : "balanced";
       const stepModel = chatModelFor(tier, model);
       modelsUsed.add(stepModel);
+      // Skill ber-`web: false` sudah dimuat: data dari API skill, tanpa web_search.
+      if (ctx.disableWebSearch) tools = tools.filter((tool) => tool.type !== "openrouter:web_search");
       const ask = () => glm.chatCompletion({
         model: stepModel,
         messages,

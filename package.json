@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js test/foundation.test.js test/runtime-storage.test.js test/runtime-recovery.test.js test/runtime-lifecycle.test.js test/autonomous-task-loop.test.js test/media-web.test.js test/web-search.test.js test/headless-agent.test.js test/stickers.test.js test/agent-loop.test.js test/sticker-collection.test.js test/features.test.js test/dashboard.test.js test/schedules.test.js test/notebook.test.js test/proactive.test.js test/python-sandbox.test.js test/media-edit.test.js test/dm-relay.test.js test/background.test.js test/skills.test.js test/documents.test.js test/motion.test.js test/dm-group.test.js test/video-watch.test.js test/decency.test.js test/identity-models.test.js",
+    "test": "node --test test/bot.test.js test/ai.test.js test/agent.test.js test/foundation.test.js test/runtime-storage.test.js test/runtime-recovery.test.js test/runtime-lifecycle.test.js test/autonomous-task-loop.test.js test/media-web.test.js test/web-search.test.js test/headless-agent.test.js test/stickers.test.js test/agent-loop.test.js test/sticker-collection.test.js test/features.test.js test/dashboard.test.js test/schedules.test.js test/notebook.test.js test/proactive.test.js test/python-sandbox.test.js test/media-edit.test.js test/dm-relay.test.js test/background.test.js test/skills.test.js test/documents.test.js test/motion.test.js test/dm-group.test.js test/video-watch.test.js test/decency.test.js test/identity-models.test.js test/followup.test.js test/members.test.js test/memory-rewrite.test.js test/backup-monitor.test.js",
     "simulate:ai": "node scripts/simulate-ai.js",
     "simulate:burst": "node scripts/simulate-burst.js",
     "simulate:memory": "node scripts/simulate-memory.js",
@@ -20,6 +20,8 @@
     "simulate:decency": "node scripts/simulate-decency.js",
     "bench:providers": "node scripts/benchmark-providers.js",
     "simulate:ghost": "node scripts/simulate-ghost.js",
+    "simulate:followup": "node scripts/simulate-followup.js",
+    "memory:rewrite-preview": "node scripts/rewrite-memory.js",
     "simulate:documents": "node scripts/simulate-documents.js",
     "simulate:agent": "node scripts/simulate-agent-loop.js",
     "dashboard:link": "node scripts/dashboard-link.js",

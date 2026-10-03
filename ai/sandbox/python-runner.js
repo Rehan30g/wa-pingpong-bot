@@ -162,6 +162,82 @@ function listFiles(dir, prefix = "") {
  * Jalankan kode Python di folder kerja chat. Gambar yang disimpan ke `out/`
  * dikembalikan di `images` untuk dikirim ke chat asal.
  */
+// Worker cadangan per folder kerja (uji 3 Okt: cuaca Nabire 16 dtk, 2 run_python × ±5 dtk
+// hanya untuk menyalakan Pyodide). Isolasi sama: satu proses per run, izin fs sama persis;
+// cadangan hanya dipakai untuk folder kerja yang sama lalu dibuang, dan mati sendiri.
+const WARM_TTL_MS = 2 * 60_000;
+const WARM_MAX = 2;
+const warmWorkers = new Map(); // workdir -> { child, timer }
+
+function warmEnabled() {
+  return String(process.env.PYTHON_WARM_WORKER || "true").trim().toLowerCase() !== "false";
+}
+
+function spawnWorker(workdir, cfg, { warm = false } = {}) {
+  const pyDir = pyodideDir();
+  return fork(path.join(__dirname, "python-worker.js"), warm ? ["--warm", workdir, pyDir, cfg.cacheDir] : [], {
+    execArgv: [
+      "--permission",
+      `--allow-fs-read=${pyDir}`,
+      `--allow-fs-read=${cfg.cacheDir}`,
+      `--allow-fs-read=${__dirname}`,
+      `--allow-fs-read=${workdir}`,
+      `--allow-fs-write=${workdir}`,
+      `--max-old-space-size=${cfg.memoryMb}`,
+      ...jspiFlags(),
+    ],
+    env: {},
+    cwd: workdir,
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+    windowsHide: true,
+  });
+}
+
+function dropWarm(workdir) {
+  const item = warmWorkers.get(workdir);
+  if (!item) return;
+  warmWorkers.delete(workdir);
+  clearTimeout(item.timer);
+  if (!item.child.killed) item.child.kill();
+}
+
+function takeWarm(workdir) {
+  const item = warmWorkers.get(workdir);
+  if (!item) return null;
+  warmWorkers.delete(workdir);
+  clearTimeout(item.timer);
+  return item.child.exitCode === null && !item.child.killed ? item.child : null;
+}
+
+function prewarm(workdir, cfg) {
+  if (!warmEnabled() || warmWorkers.has(workdir)) return;
+  while (warmWorkers.size >= WARM_MAX) dropWarm(warmWorkers.keys().next().value);
+  try {
+    const child = spawnWorker(workdir, cfg, { warm: true });
+    child.stderr?.on("data", () => {});
+    child.stderr?.unref?.();
+    child.on("error", () => dropWarm(workdir));
+    child.on("exit", () => { if (warmWorkers.get(workdir)?.child === child) warmWorkers.delete(workdir); });
+    const timer = setTimeout(() => dropWarm(workdir), WARM_TTL_MS);
+    timer.unref?.();
+    child.unref?.();
+    child.channel?.unref?.();
+    warmWorkers.set(workdir, { child, timer });
+  } catch (error) {
+    console.warn("[PYTHON] Worker cadangan gagal disiapkan:", error.message);
+  }
+}
+
+/** Nyalakan worker cadangan untuk chat ini lebih awal (mis. saat skill ber-Python dimuat). */
+function prewarmChat(chatId, cfg = pythonConfig()) {
+  if (!isReady(cfg)) return;
+  prewarm(workspaceFor(chatId, cfg), cfg);
+}
+
+function stopWarmWorkers() {
+  for (const workdir of [...warmWorkers.keys()]) dropWarm(workdir);
+}
+
 async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeHttpRequest }) {
   if (!isReady(cfg)) return { ok: false, error: "sandbox Python belum disiapkan (owner: npm run python:setup)" };
   const source = String(code || "");
@@ -180,22 +256,9 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
   }
 
   const pyDir = pyodideDir();
-  const child = fork(path.join(__dirname, "python-worker.js"), [], {
-    execArgv: [
-      "--permission",
-      `--allow-fs-read=${pyDir}`,
-      `--allow-fs-read=${cfg.cacheDir}`,
-      `--allow-fs-read=${__dirname}`,
-      `--allow-fs-read=${workdir}`,
-      `--allow-fs-write=${workdir}`,
-      `--max-old-space-size=${cfg.memoryMb}`,
-      ...jspiFlags(),
-    ],
-    env: {},
-    cwd: workdir,
-    stdio: ["ignore", "ignore", "pipe", "ipc"],
-    windowsHide: true,
-  });
+  const child = takeWarm(workdir) || spawnWorker(workdir, cfg);
+  child.ref?.();
+  child.channel?.ref?.();
   let stderrTail = "";
   child.stderr.on("data", (chunk) => { stderrTail = (stderrTail + chunk).slice(-2_000); });
   const install = installPlan(source, cfg);
@@ -233,6 +296,8 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
     child.on("error", (error) => finish({ ok: false, error: error.message }));
     child.send({ type: "run", job: { code: source, pyodideDir: pyDir, cacheDir: cfg.cacheDir, workdir, install, helpers: helperModules(source), maxOutput: cfg.maxOutput } });
   });
+  // Chat ini kemungkinan menjalankan Python lagi sebentar lagi (tugas bertahap): siapkan cadangan.
+  prewarm(workdir, cfg);
 
   const changed = fs.readdirSync(outDir)
     .filter((name) => !before.has(name) || fs.statSync(path.join(outDir, name)).mtimeMs > before.get(name))
@@ -256,4 +321,4 @@ async function runPython({ chatId, code, cfg = pythonConfig(), requester = safeH
   return { ...result, images, documents, notSent, files: listFiles(workdir), requests, durationMs: Date.now() - started };
 }
 
-module.exports = { DOCUMENT_TYPES, WHEEL_GROUPS, documentsReady, installPlan, isReady, pythonConfig, runPython, workspaceFor };
+module.exports = { DOCUMENT_TYPES, WHEEL_GROUPS, documentsReady, installPlan, isReady, pythonConfig, prewarmChat, runPython, stopWarmWorkers, warmCount: () => warmWorkers.size, workspaceFor };

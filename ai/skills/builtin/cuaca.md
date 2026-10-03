@@ -3,8 +3,9 @@ name: cuaca
 title: Cuaca & prakiraan
 description: cuaca sekarang atau prakiraan beberapa hari di suatu kota
 requires: python
+web: false
 ---
-Pakai Open-Meteo (gratis, tanpa key) lewat run_python:
+Pakai Open-Meteo (gratis, tanpa key) lewat run_python. Geocoding dan prakiraan WAJIB dalam SATU run_python (tiap run butuh ±5 detik untuk menyalakan Python), dan cetak hasilnya sekaligus. Jangan tambah web_search kalau data Open-Meteo sudah ada; web_search hanya kalau Open-Meteo gagal.
 ```
 import net
 g = net.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": KOTA, "count": 1, "language": "id"}).json()["results"][0]

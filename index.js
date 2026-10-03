@@ -23,6 +23,8 @@ const groupAgent = require("./ai/group-agent");
 const directAgent = require("./ai/direct-agent");
 const memoryStore = require("./ai/memory-store");
 const identity = require("./ai/agent/identity");
+let memoryRewriteScheduled = false;
+let backupMonitorStarted = false;
 const scheduler = require("./ai/scheduler");
 const { extractVideoFrame } = require("./ai/media/video-frame");
 const { initGlobalLifecycle, getGlobalLifecycle } = require("./ai/runtime/lifecycle");
@@ -241,6 +243,20 @@ async function startBot() {
     if (connection === "open") {
       connectionOpen = true;
       console.log("[+] Bot terhubung!");
+      // Sekali per proses: tulis ulang memori lama dengan aturan ringkasan terbaru (latar belakang).
+      // Sekali per proses: pantau backup harian, kabari owner lewat DM bila gagal/terlewat.
+      if (!backupMonitorStarted) {
+        backupMonitorStarted = true;
+        require("./ai/backup-monitor").startBackupMonitor({ getSock: () => sock, ownerPhone: () => identity.ownerProfile()?.phone || null });
+      }
+      if (!memoryRewriteScheduled && groupAgent.isConfigured()) {
+        memoryRewriteScheduled = true;
+        require("./ai/memory/rewrite").scheduleMemoryRewrite({
+          glm: groupAgent.createChatGlm(),
+          model: groupAgent.config().chatModel,
+          learnNicknames: require("./ai/agent/members").learnNicknames,
+        });
+      }
       console.log("[i] Kirim /verify dari WhatsApp untuk menjadi owner.");
       startPresenceKeepAlive();
       stickerCurator.startCurationScheduler();
@@ -707,6 +723,15 @@ groupAgent.setGroupDirectory(async () => Promise.all(data.allowedGroups.map(asyn
   id,
   subject: (await getGroupMetadataSafe(id))?.subject || id,
 }))));
+// Daftar anggota grup untuk Grad ("siapa aja di grup ini?", tag orang yang belum pernah chat).
+require("./ai/agent/members").setGroupMembersProvider(async (groupId) => {
+  const metadata = await getGroupMetadataSafe(groupId);
+  return (metadata?.participants || []).map((participant) => {
+    const canonical = canonicalParticipantIdentity(participant);
+    const isPhone = /@s\.whatsapp\.net$/.test(canonical);
+    return { phone: isPhone ? canonical.split("@")[0] : null, lid: !isPhone, name: participant.name || participant.notify || null, admin: Boolean(participant.admin) };
+  });
+});
 // Tag orang: nomor → JID anggota di grup itu (grup LID memakai id LID).
 require("./ai/agent/mentions").setMentionJidResolver(async (groupId, phone) => {
   const metadata = await getGroupMetadataSafe(groupId);

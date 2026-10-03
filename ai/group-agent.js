@@ -18,6 +18,7 @@ const proactive = require("./agent/proactive");
 const decency = require("./agent/decency");
 const effort = require("./agent/effort");
 const identity = require("./agent/identity");
+const membersDirectory = require("./agent/members");
 const pythonRunner = require("./sandbox/python-runner");
 const skillLibrary = require("./skills");
 const { witParts } = require("./humanize");
@@ -638,15 +639,40 @@ function trimHistory(groupId) {
   return history;
 }
 
+// Pesan yang di-reply → entri riwayatnya (owner 2 Okt: "grad ga bisa lihat pesan yang
+// aku reply?"). Utamakan ID pesan WhatsApp (stanzaId), cadangan: teks yang sama persis.
+function quotedContextInfo(message) {
+  const content = message?.message || {};
+  for (const value of Object.values(content)) {
+    if (value?.contextInfo?.stanzaId) return value.contextInfo;
+    const inner = value?.message && Object.values(value.message).find((item) => item?.contextInfo?.stanzaId);
+    if (inner) return inner.contextInfo;
+  }
+  return null;
+}
+
+function findQuotedEntry(history = [], { message = null, quotedText = "" } = {}) {
+  const stanzaId = quotedContextInfo(message)?.stanzaId;
+  if (stanzaId) {
+    const byId = [...history].reverse().find((item) => item.message_key?.id === stanzaId);
+    if (byId) return byId;
+  }
+  const wanted = String(quotedText || "").trim();
+  if (!wanted) return null;
+  return [...history].reverse().find((item) => String(item.text || "").trim() === wanted) || null;
+}
+
 function remember(groupId, entry) {
   const history = histories.get(groupId) || [];
+  const quoted = entry.quotedText || entry.messageRef ? findQuotedEntry(history, { message: entry.messageRef, quotedText: entry.quotedText }) : null;
   const saved = {
     entry_id: ++entrySequence,
     sender: entry.sender || "Anggota",
     sender_id: entry.senderId || "nomor-tidak-diketahui",
     is_bot: Boolean(entry.isBot),
     text: String(entry.text || "").slice(0, 1_500),
-    reply_to_bot: Boolean(entry.replyToBot),
+    reply_to_bot: Boolean(entry.replyToBot || quoted?.is_bot),
+    reply_to_entry: quoted?.entry_id ?? null,
     mentioned_bot: Boolean(entry.mentionedBot),
     has_image: Boolean(entry.hasImage),
     has_video: Boolean(entry.hasVideo),
@@ -714,6 +740,36 @@ function clearConversation(groupId) {
 function resetGroupContext(groupId) {
   clearConversation(groupId);
   memoryStore.deleteGroupMemory(groupId);
+}
+
+// Lanjutan dialog dengan Grad (owner 2 Okt, kasus "Gile" → "MAHAL" → "Tau ga" → "Ha"
+// setelah Grad menjawab harga HP): pesan tepat setelah pesan Grad, ATAU pesan beruntun
+// dari orang yang sama dalam AGENT_DIALOGUE_WINDOW_MIN menit setelah Grad menjawab.
+function dialogueWindowMs() {
+  return Math.max(0, envNumber("AGENT_DIALOGUE_WINDOW_MIN", 3)) * 60_000;
+}
+
+function continuesBotDialogue(history = []) {
+  const latest = history.at(-1);
+  if (!latest || latest.is_bot) return false;
+  if (history.at(-2)?.is_bot) return true;
+  let index = history.length - 2;
+  while (index >= 0 && !history[index].is_bot) {
+    if (history[index].sender_id !== latest.sender_id) return false;
+    index--;
+  }
+  const bot = history[index];
+  if (!bot) return false;
+  const gap = Number(latest.at) - Number(bot.at);
+  return Number.isFinite(gap) && gap >= 0 && gap <= dialogueWindowMs();
+}
+
+// Orang yang tadi dijawab Grad: pengirim manusia terakhir sebelum pesan Grad terakhir.
+function lastAnsweredSender(history = []) {
+  let index = history.length - 2;
+  while (index >= 0 && !history[index].is_bot) index--;
+  for (index -= 1; index >= 0; index--) if (!history[index].is_bot) return history[index].sender_id;
+  return null;
 }
 
 function formatIdentity(entry) {
@@ -785,6 +841,8 @@ async function compactGroupMemory(groupId, { glmClient = null } = {}) {
           // Kasus 2 Okt (grup Ghost hunter emas): ±20 butir "belum selesai" remeh membuat Grad mengungkit hal basi, dan kutipan mesum ikut masuk prompt.
           "Hal belum selesai maksimal 5 butir yang benar-benar penting (janji, pertanyaan ke bot yang belum terjawab, keputusan tertunda); buang yang remeh atau sekadar 'makna kata X'.",
           "Jangan menyalin kata atau kutipan kasar, seksual, atau menghina; tulis netral (mis. 'sempat ada candaan tidak senonoh').",
+          // Belajar tanpa bicara (owner 3 Okt): nama panggilan untuk tag ("tag si dim").
+          "nicknames berisi nama panggilan yang JELAS dipakai member untuk menyapa/menyebut anggota lain (mis. Dimas dipanggil 'dim'), dengan phone orang yang dipanggil. Bukti kuat: nama dipakai bersama tag @Nama orang itu, atau saat membalas/menyahut orang itu. Jangan masukkan nama WhatsApp-nya sendiri, kata biasa ('bos', 'bang', 'kak' saja), ejekan kasar, atau yang ragu; kosongkan kalau tidak ada.",
           "Jika tidak ada informasi orang atau hubungan yang layak disimpan, kirim array kosong.",
         ].join(" "),
       },
@@ -840,8 +898,17 @@ async function compactGroupMemory(groupId, { glmClient = null } = {}) {
                 additionalProperties: false,
               },
             },
+            nicknames: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { phone: { type: "string" }, nickname: { type: "string" } },
+                required: ["phone", "nickname"],
+                additionalProperties: false,
+              },
+            },
           },
-          required: ["glm_memory", "jev_context", "people", "relationships"],
+          required: ["glm_memory", "jev_context", "people", "relationships", "nicknames"],
           additionalProperties: false,
         },
       },
@@ -887,6 +954,12 @@ async function compactGroupMemory(groupId, { glmClient = null } = {}) {
   for (const relation of Array.isArray(parsed.relationships) ? parsed.relationships : []) {
     if (!relation?.a || !relation?.b) continue;
     memoryStore.setRelationship(relation.a, relation.b, { summary: relation.summary, updated_at_wit: timestamp, merge: true, sourceChatId: groupId });
+  }
+
+  // Nama panggilan yang terlihat di obrolan disimpan diam-diam (dipakai untuk tag).
+  if (!String(groupId).startsWith("dm:")) {
+    const learned = await membersDirectory.learnNicknames(groupId, parsed.nicknames);
+    if (learned.length) console.log(`[ANGGOTA] Belajar ${learned.length} nama panggilan dari obrolan grup ${usageTracker.maskChat(groupId)}`);
   }
 
   const current = histories.get(groupId) || [];
@@ -1078,6 +1151,16 @@ function mediaContentPart(media) {
 }
 
 // Arahan saat bot masuk sendiri tanpa dipanggil (M5).
+// Kasus 2 Okt: "Gile", "MAHAL", "Tau ga" (reply ke jawaban harga), "Ha" dibaca satu-satu;
+// Grad bertanya "tau apa nih?" dan membaca "Ha" sebagai tertawa.
+const SHORT_MESSAGE_RULE = "Pesan pendek atau ambigu ('ha', 'hah', 'gile', 'anjir', 'tau ga', 'serius?', 'masa') tafsirkan dulu dari pesan yang di-reply dan obrolan barusan: biasanya itu reaksi ke hal terakhir yang dibahas, termasuk jawabanmu sendiri. 'ha'/'hah' = kaget atau tidak percaya, BUKAN tertawa. Tanggapi reaksinya secara nyambung (mis. setelah kamu menyebut harga mahal, 'gile' = kaget harganya). Tanya klarifikasi hanya kalau konteksnya benar-benar kosong, dan tetap singkat.";
+
+// Uji 3 Okt: "tuh yosua dengar grad bilang apa" (membicarakan Grad ke orang lain) dibalas 2/2.
+const ABOUT_ME_RULE = "Namamu disebut belum tentu kamu diajak bicara: kalimat yang ditujukan ke member lain dan cuma membicarakanmu ('tuh Yos dengar kata grad', 'kata grad kemarin…, bener ga menurutmu Ani?', 'nah kan grad aja setuju') bukan untukmu. Untuk itu panggil stay_silent, atau paling banyak reaction singkat; jangan ikut menimpali.";
+
+// Lanjutan dialog yang dinilai Jev tidak perlu dibalas: GLM yang memutuskan.
+const FOLLOW_UP_HINT = "Pesan terbaru melanjutkan obrolan denganmu tapi belum tentu butuh balasan. Kalau perlu ditanggapi (reaksi ke jawabanmu, pertanyaan lanjutan, koreksi, ledekan ke kamu), balas singkat dan nyambung atau beri reaction. Kalau sudah beralih atau ditujukan ke orang lain (menyebut/menyapa member lain), walaupun membahas jawabanmu, panggil stay_silent.";
+
 const PROACTIVE_HINTS = {
   help: "PENTING: kamu TIDAK dipanggil. Kamu masuk sendiri karena ada bantuan nyata yang bisa kamu berikan. Bantu sesingkat mungkin dan langsung ke inti, seperti member yang kebetulan tahu. Kalau ternyata sudah terjawab, tidak jelas, atau kamu tidak yakin, balas KOSONG (tanpa teks sama sekali).",
   decency: decency.NUDGE_HINT,
@@ -1096,10 +1179,22 @@ function historyStamp(at, now = Date.now()) {
   return `[${pad(p.day)}/${pad(p.month)} ${clock}] `;
 }
 
+// Keterangan pesan yang di-reply untuk prompt: siapa pengirimnya dan nomor entrinya.
+function quotedLine(historySnapshot = [], quotedText = "") {
+  const latest = historySnapshot.at(-1);
+  const target = Number.isInteger(latest?.reply_to_entry) ? historySnapshot.find((item) => item.entry_id === latest.reply_to_entry) : null;
+  const text = quotedText || target?.text || "";
+  if (!text && !latest?.reply_to_bot) return "";
+  const who = target ? (target.is_bot ? `PESANMU SENDIRI #${target.entry_id}` : `dari ${target.sender}, #${target.entry_id}`) : latest?.reply_to_bot ? "PESANMU SENDIRI" : "";
+  return `Pesan terbaru me-reply${who ? ` (${who})` : ""}: ${text}${target?.is_bot ? "\nArtinya pesan terbaru adalah tanggapan langsung atas pesanmu itu: baca keduanya bersama." : ""}`;
+}
+
 function historyLine(item) {
   const media = item.media_kind ? ` [media:${item.media_kind}${item.media_format ? `/${item.media_format}` : ""}]` : "";
   const audio = item.audio ? " [audio tersimpan]" : "";
-  return `#${item.entry_id} ${historyStamp(item.at)}${formatIdentity(item)}: ${item.text}${media}${audio}`;
+  // "↩#12" = membalas pesan #12 (pesanmu sendiri bila #12 dari Grad).
+  const reply = Number.isInteger(item.reply_to_entry) ? ` ↩#${item.reply_to_entry}` : item.reply_to_bot ? " ↩pesanmu" : "";
+  return `#${item.entry_id} ${historyStamp(item.at)}${formatIdentity(item)}${reply}: ${item.text}${media}${audio}`;
 }
 
 function buildChatMessages({
@@ -1116,6 +1211,8 @@ function buildChatMessages({
   proactiveMode = null,
   canReact = false,
   busyWith = null,
+  followUp = false,
+  membersLine = "",
 }) {
   const cfg = config();
   const conversation = historySnapshot.map(historyLine).join("\n");
@@ -1143,7 +1240,7 @@ function buildChatMessages({
     "Konteks percakapan grup:",
     `Memori terperinci sebelumnya (ringkasan obrolan lebih lama, waktunya tidak pasti):\n${memorySnapshot.glm}`,
     conversation ? `Riwayat aktif (jam WIT di depan tiap pesan):\n${conversation}` : "(belum ada konteks)",
-    quotedText ? `Pesan yang dibalas: ${quotedText}` : "",
+    quotedLine(historySnapshot, quotedText),
     `Pesan terbaru dari ${latestMessage.sender}: ${latestMessage.text}`,
     mediaPart
       ? (media.type === "video"
@@ -1156,6 +1253,8 @@ function buildChatMessages({
     hasStickers ? `Koleksi stiker yang boleh kamu pakai di chat ini (id — makna [mood] · kapan · frekuensi):\n${stickerIndex}` : "",
     rememberedFacts.length ? `Hal yang kamu ingat di chat ini (pakai bila relevan):\n${rememberedFacts.join("\n")}` : "",
     PROACTIVE_HINTS[proactiveMode] || "",
+    followUp ? FOLLOW_UP_HINT : "",
+    membersLine,
     proactiveMode !== "decency" ? decency.promptNote(decency.lewdContext(historySnapshot)) : "",
     humorBrake(historySnapshot),
     proactiveMode ? "" : sharedDmFactsFor(historySnapshot),
@@ -1171,7 +1270,8 @@ function buildChatMessages({
         identity.selfKnowledge({ botName: cfg.botName, features }),
         "Kalau pengguna jelas memakai bahasa lain (mis. Inggris), ikuti bahasanya.",
         "Jangan gunakan heading, tabel, code fence, atau link Markdown.",
-        "Jika maksud pesan ambigu, tanyakan klarifikasi paling pendek; jangan menebak-nebak beberapa kemungkinan sekaligus.",
+        SHORT_MESSAGE_RULE,
+        ABOUT_ME_RULE,
         "Jangan pernah mengaku manusia.",
         "Gunakan nomor telepon sebagai identitas utama: nomor sama adalah orang yang sama meski namanya berubah; nama sama dengan nomor berbeda adalah orang berbeda.",
         "Jangan mengulang pertanyaan pengguna. Jangan menjelaskan lebih banyak daripada yang diminta.",
@@ -1234,7 +1334,7 @@ function createChatGlm() {
  * sendProgress dipakai untuk pesan "bentar ya" ke chat asal.
  */
 // groupId = kunci riwayat/memori; chatId = JID tujuan kirim (beda untuk DM: "dm:<no>" vs "<no>@s.whatsapp.net").
-async function generateReply({ groupId, chatId = groupId, isDm = false, latestMessage, quotedText, media, historySnapshot, memorySnapshot, handle = null, sendProgress = null, proactiveMode = null, background = false, loopOverrides = null, requestRef = null, sock = null, busyWith = null, firstStepTier = "fast" }) {
+async function generateReply({ groupId, chatId = groupId, isDm = false, latestMessage, quotedText, media, historySnapshot, memorySnapshot, handle = null, sendProgress = null, proactiveMode = null, background = false, loopOverrides = null, requestRef = null, sock = null, busyWith = null, firstStepTier = "fast", followUp = false }) {
   const cfg = config();
   const toolsDisabled = usageTracker.dailyBudgetLeft() <= 0;
   const snapshot = historySnapshot || getHistory(groupId);
@@ -1255,11 +1355,14 @@ async function generateReply({ groupId, chatId = groupId, isDm = false, latestMe
     resolvePerson: personResolver(groupId),
     groupMemory: () => (isDm ? memoryStore.getDmMemory(memoryStore.normalizePhone(chatId)).glm : getGroupMemory(groupId).glm),
   }) : null;
+  // Daftar anggota grup (metadata WA + nama yang diingat); bukan untuk DM.
+  const members = isDm ? [] : await membersDirectory.groupMembers(chatId);
+  const membersLine = isDm || proactiveMode === "decency" ? "" : membersDirectory.membersPromptLine(members, { isOwnerPhone: identity.isOwnerPhone });
   // Reaction hanya ke pesan pemicu; tugas latar, jadwal, dan mode bantuan tidak bereaksi.
   const reaction = requestRef?.key && !background && proactiveMode !== "help" && proactiveMode !== "decency" && latestMessage.sender_id !== "SCHEDULER" ? { emoji: null } : null;
   const result = await runAgentLoop({
     config: loopOverrides ? { ...loopConfig(), ...loopOverrides } : loopConfig(),
-    messages: buildChatMessages({ groupId, latestMessage, quotedText, media, historySnapshot: snapshot, memorySnapshot, toolsDisabled, stickerIndex: stickers?.index || "", features, rememberedFacts: notes?.promptFacts() || [], proactiveMode, canReact: Boolean(reaction), busyWith }),
+    messages: buildChatMessages({ groupId, latestMessage, quotedText, media, historySnapshot: snapshot, memorySnapshot, toolsDisabled, stickerIndex: stickers?.index || "", features, rememberedFacts: notes?.promptFacts() || [], proactiveMode, canReact: Boolean(reaction), busyWith, followUp, membersLine }),
     glm: createChatGlm(),
     model: cfg.chatModel,
     handle,
@@ -1281,7 +1384,8 @@ async function generateReply({ groupId, chatId = groupId, isDm = false, latestMe
       compactMemory: () => getGroupMemory(groupId).glm,
       allowEmpty: Boolean(proactiveMode),
       canSilence: !background && latestMessage.sender_id !== "SCHEDULER",
-      python: features.has("python") ? { run: ({ code }) => pythonRunner.runPython({ chatId, code }) } : null,
+      aliases: !isDm && features.has("memori") && !proactiveMode ? { save: (args) => membersDirectory.rememberAlias(chatId, args) } : null,
+      python: features.has("python") ? { run: ({ code }) => pythonRunner.runPython({ chatId, code }), prewarm: () => pythonRunner.prewarmChat(chatId) } : null,
       skills: features.has("skill") ? skillLibrary.forFeatures(features) : null,
       documents: features.has("dokumen") ? makeDocumentReader({ chatId, historyKey: groupId }) : null,
       outbox: { media: [] },
@@ -1398,7 +1502,7 @@ async function evaluateGroupMessage(
   // panggilan langsung tidak dihitung lanjutan dialog, supaya setelah menegur Grad
   // tidak terus menanggapi tiap pesan berikutnya.
   const lewd = decency.lewdContext(historySnapshot);
-  const inBotDialogue = Boolean(historyBefore[historyBefore.length - 2]?.is_bot) && !(lewd.latest && !directlyAddressed);
+  const inBotDialogue = continuesBotDialogue(historyBefore) && !(lewd.latest && !directlyAddressed);
 
   // Ucapan terima kasih yang jelas untuk bot minimal diberi acknowledgment,
   // tetapi ucapan untuk anggota lain tidak boleh "dicuri" oleh bot.
@@ -1444,10 +1548,16 @@ async function evaluateGroupMessage(
     return { action: "ignore", muted: true, decision };
   }
 
+  // Lanjutan dialog yang dinilai Jev "diam" tetap diteruskan ke GLM: GLM yang membaca
+  // isinya memilih membalas, reaction, atau stay_silent (dulu "Gile"/"MAHAL" setelah
+  // jawaban Grad, dan koreksi angka Dimas, berakhir tanpa tanggapan).
+  // Hanya untuk orang yang tadi dijawab Grad; orang lain yang menyela tetap mengikuti Jev.
+  const dialogueFollowUp = decision.action === "ignore" && inBotDialogue && !directlyAddressed && lastAnsweredSender(historyBefore) === historyBefore.at(-1)?.sender_id;
   const shouldReply =
     (decision.action === "reply" &&
       (decision.confidence >= cfg.replyConfidence || directlyAddressed || inBotDialogue)) ||
-    (decision.action === "ignore" && directlyAddressed);
+    (decision.action === "ignore" && directlyAddressed) ||
+    dialogueFollowUp;
 
   const emoji = REACTIONS[decision.action];
   const directReaction = (directlyAddressed || inBotDialogue) && decision.confidence >= cfg.directReactConfidence;
@@ -1510,6 +1620,7 @@ async function evaluateGroupMessage(
         sock,
         busyWith: busyWith && !busyWith.aborted ? { requester: busyWith.requesterName, request: busyWith.request } : null,
         firstStepTier: effort.firstStepTier(decision),
+        followUp: dialogueFollowUp,
         requestRef: message?.key ? message : null,
         // Jev menilai cukup reaction (ack) → jangan pernah "bentar ya" sebelum sekadar 👍.
         sendProgress: proactiveMode || REACTIONS[decision.jevAction] ? null : async (progressText) => {
@@ -1634,6 +1745,7 @@ function processGroupMessage(args) {
     document: args.document,
     messageKey: args.message?.key,
     messageRef: args.message,
+    quotedText: args.quotedText,
   });
 
   // Rem M5: "grad diem dulu" / "jangan nimbrung" → jalur proaktif mati beberapa jam
@@ -1734,6 +1846,11 @@ function queueEvaluation(args, { entry, scheduledEpoch, lane = "main", active = 
 
 module.exports = {
   pickFailureText,
+  SHORT_MESSAGE_RULE,
+  continuesBotDialogue,
+  findQuotedEntry,
+  quotedLine,
+  createChatGlm,
   buildChatMessages,
   decideAction,
   historyStamp,
